@@ -1,0 +1,13 @@
+# 构建产物
+/target
+
+# 运行时数据（数据库、密钥、程序包）—— 只在 NAS 上，不进仓库
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# 部署口令（compose 里写 ADMIN_TOKEN: ${ADMIN_TOKEN} 时用这个文件）
+.env
+
+.DS_Store
