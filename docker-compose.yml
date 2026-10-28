@@ -1,0 +1,25 @@
+services:
+  updates:
+    # 镜像名跟原 Python 版保持一致：NAS 上只需要 docker compose pull && up -d，
+    # 不用改端口、不用改卷映射，替换是原地完成的。
+    image: ghcr.io/wukaibo98/beikeshi-updates:latest
+    container_name: bks-updates
+    restart: unless-stopped
+    ports:
+      - "50205:8080"
+    environment:
+      # 管理页口令。不设就登不进管理页（清单和下载照常可用）
+      ADMIN_TOKEN: "换成一个你自己记得住的口令"
+      # 客户端拿清单时用的地址：内网一条、公网一条，客户端会自动挑
+      LAN_BASE: "http://192.168.124.3:50205"
+      PUBLIC_BASE: "https://bks.beikeshi.cn:54321"
+      CHANNEL: "stable"
+    volumes:
+      # 数据库、密钥、程序包都在这一个目录里，备份就备份它
+      - ./data:/data
+    healthcheck:
+      # scratch 镜像里没有 shell/curl，所以用二进制自己的子命令去探活
+      test: ["CMD", "/bks-updates", "--health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
