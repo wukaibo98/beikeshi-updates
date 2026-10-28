@@ -3,9 +3,10 @@
 > 写给下一个接手的人/智能体。读完这份，你能不改错地把这套发版链路继续用下去。
 > 实现细节见 [DEV.md](DEV.md)，部署与发版流程见 [README.md](README.md)。
 
-**当前状态：服务端 v0.1.0 代码完成，本机 curl 冒烟全通过，`cargo build --release` 0 warning。
-但镜像从未构建过（开发机没有 docker），NAS 上跑的**仍然是 Python 版** —— 所以第一件待办
-是"推上去让 Actions 出镜像，再在 NAS 上原地替换"。**
+**当前状态：服务端 v0.1.0 代码完成，本机 curl 冒烟全通过，`cargo build --release` 0 warning，
+镜像**本地构建并跑通了完整流程**（3.66MB，容器内内存 4.5MiB）。
+但 **ghcr 上还没有镜像**（Actions 首次构建在最后 push 一步被拒，原因与解法见 §2 第 7 条），
+NAS 上跑的**仍然是 Python 版** —— 第一件待办还是"让镜像真正上到 ghcr，再在 NAS 上原地替换"。**
 
 ---
 
@@ -52,9 +53,20 @@ target/release/bks-updates --version                               # bks-updates
 
 ## 2. 环境注意事项（先读，能少踩坑）
 
-1. **开发机没有 docker**，所以 `docker build` / `docker compose` 在这里跑不了。
-   镜像只能靠 **GitHub Actions** 构建（推 main 自动触发，或 Actions 页面手动 dispatch）。
-   本地验证一律是"跑二进制 + curl"。
+1. **本机有 Docker Desktop（Intel Mac，x86_64），能本地构建镜像**，但 **Docker Hub 直连被拦**
+   （`load metadata for docker.io/library/rust:1-alpine` → `DeadlineExceeded`）。
+   换镜像源即可，不用改 Dockerfile：
+
+   ```bash
+   docker build --platform linux/amd64 \
+     --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine \
+     -t bks-updates:local .
+   ```
+
+   实测 1 分 16 秒出镜像，**3.66MB**；容器跑起来内存 **4.5MiB**。
+   日常改代码的验证还是"跑二进制 + curl"更快，不必每次都构建镜像。
+   注册表 `docker.m.daocloud.io` 可用（`dockerproxy.net`、`docker.1panel.live` 也通）。
+   注意：本地构建**只是产出镜像**，要让它出现在 ghcr 上仍得走 Actions 或 `docker push`（见 §6.1）。
 2. **`cargo` 不在 PATH**，用 `~/.cargo/bin/cargo`。`clippy` 没装（`cargo clippy` 会报
    toolchain 里没有），想用先 `rustup component add clippy`。
 3. **不要拿真数据目录做实验**。真数据在 NAS 上（`./data`，通过卷挂进容器）；
@@ -170,9 +182,14 @@ NAS（飞牛 OS）
 
 ### 6.1 P0 — 让这套 Rust 服务真的跑起来
 
-- [ ] 推仓库到 GitHub（若还没推），确认 Actions 的 `docker` workflow 跑绿；
-- [ ] 去 **Packages** 看 `beikeshi-updates` 这个包，如果归属还指着已删除的旧仓库，
-      点 `Connect repository` 指到新仓库（否则后续 push 会被拒）；
+- [x] ~~推仓库到 GitHub~~ 已推（`wukaibo98/beikeshi-updates`，公开）；
+- [x] ~~本地构建镜像~~ 已通（`docker build --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine`，
+      3.66MB，容器内跑通登录/上传/清单/下载，见 §8）；
+- [ ] **让镜像真正上到 ghcr**：孤儿包已删，重跑 Actions（`docker` workflow → Re-run / 或空提交触发
+      `src/**` 变更）。跑通后 `docker pull ghcr.io/wukaibo98/beikeshi-updates:latest` 能拉到才算完；
+      也可以本地 `docker tag bks-updates:local ghcr.io/wukaibo98/beikeshi-updates:latest` +
+      `docker login ghcr.io`（用带 `write:packages` 的 PAT）+ `docker push`；
+- [ ] 同一个包以后要能被 Actions 覆盖：首次成功 push 之后不要再删包，否则会重演 §2 第 7 条的 403；
 - [ ] NAS 上改 `docker-compose.yml` 的 `ADMIN_TOKEN`（现在还是占位串），
       `docker compose pull && docker compose up -d`；
 - [ ] 切完立刻验：
@@ -257,7 +274,28 @@ NAS（飞牛 OS）
 | `BIND=127.0.0.1:18080 --health` | 退出码 0（不设 BIND 时去连 8080 → 1，符合设计） |
 | `cargo build --release --offline` | 0 warning；`cargo check` 0 error |
 
-**没做**：镜像构建（本机无 docker）、NAS 实机部署、真机自动更新（客户端侧）。
+#### 镜像构建与容器内验证（同一天稍晚，Docker Desktop 装好后补测）
+
+```bash
+docker build --platform linux/amd64 \
+  --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine \
+  -t bks-updates:local .            # 1 分 16 秒
+```
+
+| 用例 | 结果 |
+|---|---|
+| 镜像体积 | **3.66MB**（`docker history` 里二进制层 2.35MB，其余是 config/元数据） |
+| 容器启动 | `docker run -d -p 18081:8080 -e ADMIN_TOKEN=test123 ...` 立刻 Up |
+| `GET /health` | 200 `ok` |
+| `GET /latest.json` | 404（空库） |
+| 登录 + 上传（假包） | 303 / 303，回显 `已发布 网页版 v0.2.0（0.05 MB，程序）` |
+| `GET /latest.json?client=web` | 200，`lan_url` / `public_url` / sha256 / size 齐全 |
+| 下载并比对 sha256 | 与上传文件一致（`sort -u` 后只剩一个 hash） |
+| `docker exec bks-local /bks-updates --health` | 退出码 0（scratch 无 shell，直接 exec 二进制可行） |
+| `docker exec bks-local /bks-updates --version` | `bks-updates 0.1.0` |
+| `docker stats` | 内存 **4.49MiB** / 7.7GiB |
+
+**没做**：ghcr 推送（Actions 被 403 拦，包已删待重跑）、NAS 实机部署、真机自动更新（客户端侧）。
 
 ### 更早（Python 版，2026-10-25）
 
@@ -274,7 +312,7 @@ NAS（飞牛 OS）
 - [ ] 知道 **404 是语义不是故障**
 - [ ] 知道页面模板只能用 `%%占位%%`，不能用 `format!`
 - [ ] 知道仓库名必须叫 `beikeshi-updates`（镜像名从 `github.repository` 来）
-- [ ] 知道本机没有 docker，镜像只能靠 Actions
+- [ ] 知道本机**有** docker 但 Docker Hub 被拦，构建要带 `--build-arg RUST_IMAGE=...`
 - [ ] 知道客户端里的两个更新地址在本仓库之外（`../beikeshi-cs-web`）
 - [ ] 提交前 `git status` 确认 `target/`、`data/`、`*.db`、`.env` 没进仓库
 - [ ] 口令/密钥不写进仓库；`ADMIN_TOKEN` 走环境变量

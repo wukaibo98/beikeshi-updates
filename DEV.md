@@ -227,7 +227,8 @@ scratch 镜像里**没有 shell、没有 curl、没有 wget**，所以：
 否则 cargo 认为源码没变会复用空壳（踩过，表现为"镜像里的程序什么都不做"）。
 
 ```dockerfile
-FROM rust:1-alpine AS build
+ARG RUST_IMAGE=rust:1-alpine        # 基础镜像留成参数，国内换源用（见下）
+FROM ${RUST_IMAGE} AS build
 RUN apk add --no-cache musl-dev    # rusqlite bundled 要 C 编译器
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
@@ -240,13 +241,33 @@ ENTRYPOINT ["/bks-updates"]
 
 alpine + musl 产出**完全静态**的二进制，才能放进 scratch。
 
+`RUST_IMAGE` 是给国内环境留的口子：**直连 Docker Hub 会被拦**
+（`load metadata for docker.io/library/rust:1-alpine` → `DeadlineExceeded`），
+换镜像源即可，不用改文件：
+
+```bash
+# 本机实测：Intel Mac / Docker Desktop / 1 分 16 秒
+docker build --platform linux/amd64 \
+  --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine \
+  -t bks-updates:local .
+
+docker images bks-updates:local      # 3.66MB（其中二进制 2.35MB）
+docker run -d --name bks-local -p 18081:8080 \
+  -e ADMIN_TOKEN=test123 -e LAN_BASE=http://127.0.0.1:18081 \
+  -v /tmp/bks-data:/data bks-updates:local
+docker exec bks-local /bks-updates --health; echo $?   # 0
+docker stats --no-stream bks-local                     # 内存 4.5MiB
+```
+
+容器里跑完整流程（登录 → 上传 → 读清单 → 下载）也已实测通过，见 HANDOVER §8。
+
 镜像名由 workflow 的 `IMAGE: ${{ github.repository }}` 决定，即
 `ghcr.io/wukaibo98/beikeshi-updates`。**所以仓库名必须叫 `beikeshi-updates`**，
 否则 compose 里写死的镜像名对不上（这也是这个仓库沿用旧名字的原因）。
 
 ## 9. 改完代码怎么验证
 
-本机没有 docker（见 HANDOVER），所以日常验证是"跑二进制 + curl"：
+日常验证是"跑二进制 + curl"（比构建镜像快得多，也不需要 docker）：
 
 ```bash
 cargo build --release

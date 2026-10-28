@@ -4,7 +4,11 @@
 # 结果：镜像里只有一个 1.8MB 的可执行文件，整镜像约 4MB。
 # 对比原来的 Python 版（基础镜像 45MB + 依赖 15MB），这是这次重写最实在的收益。
 
-FROM rust:1-alpine AS build
+# 基础镜像走参数，默认还是 Docker Hub（GitHub Actions 上就是这样）。
+# 国内直连 Docker Hub 会被拦，本地构建时换一个镜像源即可，不用改文件：
+#   docker build --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine .
+ARG RUST_IMAGE=rust:1-alpine
+FROM ${RUST_IMAGE} AS build
 
 # rusqlite 用 bundled 特性自带 SQLite 源码，需要 C 编译器
 RUN apk add --no-cache musl-dev

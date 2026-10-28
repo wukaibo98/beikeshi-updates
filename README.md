@@ -1,7 +1,7 @@
 # 贝可施更新分发服务
 
 给「贝可施客服小工具」发版本、发安装包的小服务。**一个静态二进制 + 一个 SQLite 文件**，
-没有别的依赖：NAS 上不用装运行时，镜像里只有一个 1.8MB 的可执行文件。
+没有别的依赖：NAS 上不用装运行时，镜像里只有一个 2MB 出头的可执行文件（整镜像 3.66MB）。
 
 ```bash
 GET /latest.json?client=web      # 客户端拿清单
@@ -29,7 +29,7 @@ GET /admin                       # 管理页：上传 / 发布 / 回滚 / 删除
 | | Python 版 | 现在 |
 |---|---|---|
 | 运行时依赖 | 基础镜像 45MB + fastapi/uvicorn 等 15MB | 无（静态二进制，镜像里只有一个文件） |
-| 镜像体积 | ~60MB | **~4MB** |
+| 镜像体积 | ~60MB | **3.66MB**（实测） |
 | 内存占用 | 60~80MB | ~5MB |
 | 启动 | 1~2 秒（import 一堆包） | <50ms |
 | NAS 上要装的东西 | Python 运行时 + 依赖 | 什么都不用 |
@@ -192,6 +192,26 @@ cargo run -- --version
 ```
 
 冒烟要点见 [DEV.md §9](DEV.md#9-改完代码怎么验证)，一条条 curl 过去大概两分钟。
+
+### 本地构建镜像（国内要换镜像源）
+
+Docker Hub 直连会被拦，`FROM rust:1-alpine` 会卡在 `DeadlineExceeded`。
+基础镜像留了 build-arg，换源不用改文件：
+
+```bash
+docker build --platform linux/amd64 \
+  --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine \
+  -t bks-updates:local .
+
+docker run -d --name bks-local -p 18081:8080 \
+  -e ADMIN_TOKEN=test123 -e LAN_BASE=http://127.0.0.1:18081 \
+  -v /tmp/bks-data:/data bks-updates:local
+
+docker exec bks-local /bks-updates --health; echo $?    # 0
+```
+
+实测：Intel Mac 上 1 分 16 秒出镜像，**3.66MB**；跑起来内存 **4.5MiB**。
+（scratch 镜像里没有 shell，探活直接 `docker exec <容器> /bks-updates --health`。）
 
 ## 目录
 
