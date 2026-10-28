@@ -243,7 +243,7 @@ multipart 逐字段读：
 
 数字列整列都是数字时写成数字单元格（Excel 里能直接求和）；文本一律左对齐；
 sheet 名过 31 字符要截断，并清掉 `[]:*?/\` 这些 xlsx 禁用的字符。
-依赖 `rust_xlsxwriter`（纯 Rust，能静态编进 musl，镜像从 3.66MB 涨到约 4.4MB）。
+依赖 `rust_xlsxwriter`（纯 Rust，能静态编进 musl，镜像实测从 3.66MB 涨到 **4.92MB**）。
 
 ## 5. 管理页模板
 
