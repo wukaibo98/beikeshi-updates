@@ -143,6 +143,7 @@ git fetch origin main && git reset --hard origin/main
 | 8 | 2026-10-28 下午 | **去掉旧 Python 版**：管理页删掉客户端下拉与「两条版本线」提示，服务端只认 `client=web`，其它一律 404；旧记录打「旧版·已停发」、不可切回。顺手把管理页时间从 UTC 改成本地（`TZ_OFFSET`，默认 +480） |
 | 9 | 2026-10-28 15:52 | **上 NAS**：SSH 装部署公钥 → `compose pull && up -d` → healthy。分发链路至此真机可用 |
 | 10 | 2026-10-28 晚 | **表单收集 v0.2.0**（服务端一半）：4 张表、姓名登录、`edit_token`、模板乐观锁、提交幂等+快照、管理页、xlsx 导出；补上第一批单测（12 项） |
+| 11 | 2026-10-28 22:25 | **v0.2.0 上 NAS**：停容器 → 备份 db/密钥 → `compose pull && up -d` → healthy。库里 4 张 form 表自动建好，自测数据已清干净（0 模板 / 0 用户 / 0 提交） |
 
 ---
 
@@ -213,6 +214,8 @@ NAS（飞牛 OS）
 - [x] ~~NAS 部署~~ 已完成（2026-10-28 15:52），`/health` 200、管理页能登录、能看到历史版本；
 - [x] ~~老库迁移~~ 实测：拿一份只有 `releases` 表的老库启动，四张 form 表自动建好，`releases` 数据原样保留；
 - [ ] NAS 上 `ADMIN_TOKEN` 换成真口令（compose 里现在是部署时填的那个，改完要重启容器）；
+- [x] ~~v0.2.0 上 NAS~~ 已完成（2026-10-28 22:25），容器内 `--version` 0.2.0；
+- [ ] 去 `/admin/forms` 最下面把客服姓名加进去（**姓名必须与本人说的完全一致**），加完客户端才能登录；
 
 ### 6.2 P0 — 把网页版客户端发上去
 
@@ -270,6 +273,8 @@ NAS（飞牛 OS）
 | 容器起不来 | `docker logs bks-updates`；最常见是 `/data` 权限（卷挂载目录不可写）或 8080 被占 |
 | healthcheck 一直 unhealthy | 容器里 `BIND` 必须与实际监听一致；`--health` 是 TCP 连自己 |
 | 拉镜像 403 / not found | ghcr 包归属不对（见 §6.1 第二条），或包被设成私有而 NAS 没 `docker login` |
+| 手工改库报 "readonly database" | `data/` 是 root:644，`吴凯波` 账号写不了。要么停容器后借 `ugreen/lucky:v3` 的 root shell 改权限（`docker run --rm --entrypoint /bin/sh -v .../data:/d ugreen/lucky:v3 -c "chmod 777 /d"`），要么别手工改 |
+| 手工改库后发现表没了 | **别删 `updates.db-wal`**：WAL 模式下建表/写入先落在 wal 里，删掉等于丢掉最近所有变更。真要改就先停容器让 SQLite 正常 checkpoint |
 | 镜像里的程序"什么都不做" | Dockerfile 的 `touch src/main.rs` 丢了，cargo 复用了空壳 `main` 的缓存 |
 | 表单登录 403 | 姓名不在 `form_users` 或被停用；去 `/admin/forms` 最下面的名单里加（**姓名要完全一致**，含空格） |
 | 模板保存 409 | 乐观锁：别人/别的机器先改了。刷新拿到新 `version` 再存；**库不会被改**，不会静默覆盖 |
