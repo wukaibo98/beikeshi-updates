@@ -4,9 +4,9 @@
 > 实现细节见 [DEV.md](DEV.md)，部署与发版流程见 [README.md](README.md)。
 
 **当前状态：服务端 v0.1.0 代码完成，本机 curl 冒烟全通过，`cargo build --release` 0 warning，
-镜像**本地构建并跑通了完整流程**（3.66MB，容器内内存 4.5MiB）。
-但 **ghcr 上还没有镜像**（Actions 首次构建在最后 push 一步被拒，原因与解法见 §2 第 7 条），
-NAS 上跑的**仍然是 Python 版** —— 第一件待办还是"让镜像真正上到 ghcr，再在 NAS 上原地替换"。**
+本地构建镜像跑通了完整流程（3.66MB，容器内内存 4.5MiB），**镜像也已经上到 ghcr**
+（`ghcr.io/wukaibo98/beikeshi-updates:latest`，双架构，匿名可拉，已实测能跑）。
+剩下的就是 NAS 实机替换与客户端发版 —— 见 §6。**
 
 ---
 
@@ -94,9 +94,8 @@ target/release/bks-updates --version                               # bks-updates
      https://api.github.com/user/packages/container/beikeshi-updates     # 204 就对了
    ```
 
-   已按这个办法处理过（包已删除）。**注意：包被删掉了，镜像目前不存在，
-   NAS 上 `docker compose pull` 会失败 —— 必须先成功跑一次构建。**
-   以后再遇到同样的 403，八成还是包归属问题。
+   已按这个办法处理过（包删掉后重跑 run #2 成功，镜像已在 ghcr 上，见 §8）。
+   以后再遇到同样的 403，八成还是包归属问题（比如又删了一次仓库）。
 8. 管理页口令 `ADMIN_TOKEN` 目前写在 compose 里（明文、会进仓库）。**接手后第一件事**
    建议挪到不进仓库的 `.env`，见 §6 待办。
 
@@ -185,11 +184,12 @@ NAS（飞牛 OS）
 - [x] ~~推仓库到 GitHub~~ 已推（`wukaibo98/beikeshi-updates`，公开）；
 - [x] ~~本地构建镜像~~ 已通（`docker build --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine`，
       3.66MB，容器内跑通登录/上传/清单/下载，见 §8）；
-- [ ] **让镜像真正上到 ghcr**：孤儿包已删，重跑 Actions（`docker` workflow → Re-run / 或空提交触发
-      `src/**` 变更）。跑通后 `docker pull ghcr.io/wukaibo98/beikeshi-updates:latest` 能拉到才算完；
-      也可以本地 `docker tag bks-updates:local ghcr.io/wukaibo98/beikeshi-updates:latest` +
-      `docker login ghcr.io`（用带 `write:packages` 的 PAT）+ `docker push`；
-- [ ] 同一个包以后要能被 Actions 覆盖：首次成功 push 之后不要再删包，否则会重演 §2 第 7 条的 403；
+- [x] **镜像已上 ghcr**（2026-10-28 14:45）：删掉孤儿包后重跑 Actions（run #2，`66f83533`）成功。
+      `ghcr.io/wukaibo98/beikeshi-updates:latest`
+      digest `sha256:8c6ffcfa2c2cc6b4bb079883c1098349ce26b0ca06a8742b57985b640df410e4`，
+      清单里有 `linux/amd64` + `linux/arm64` 两套。本机**匿名** `docker pull` 验证通过（3.68MB），
+      跑起来 `/health` 200、`--version` 0.1.0；
+- [ ] **同一个包以后要能被 Actions 覆盖**：首次成功 push 之后不要再删包，否则会重演 §2 第 7 条的 403；
 - [ ] NAS 上改 `docker-compose.yml` 的 `ADMIN_TOKEN`（现在还是占位串），
       `docker compose pull && docker compose up -d`；
 - [ ] 切完立刻验：
@@ -295,7 +295,20 @@ docker build --platform linux/amd64 \
 | `docker exec bks-local /bks-updates --version` | `bks-updates 0.1.0` |
 | `docker stats` | 内存 **4.49MiB** / 7.7GiB |
 
-**没做**：ghcr 推送（Actions 被 403 拦，包已删待重跑）、NAS 实机部署、真机自动更新（客户端侧）。
+**没做**：NAS 实机部署、真机自动更新（客户端侧）。
+
+#### ghcr 上的镜像（14:45，Actions run #2 成功）
+
+| 项 | 值 |
+|---|---|
+| 地址 | `ghcr.io/wukaibo98/beikeshi-updates:latest` |
+| digest | `sha256:8c6ffcfa2c2cc6b4bb079883c1098349ce26b0ca06a8742b57985b640df410e4` |
+| 架构 | `linux/amd64` + `linux/arm64`（另有两个 attestation manifest） |
+| 体积 | 本机拉 amd64 变体 3.68MB |
+| 匿名拉取 | 通过（包是 public，NAS 上不用 `docker login`） |
+| 跑起来 | `/health` 200、`--version` → `bks-updates 0.1.0` |
+
+第一次（run #1）编译成功后 push 被拒，原因是旧仓库留下的同名孤儿包；删包后重跑即成功。
 
 ### 更早（Python 版，2026-10-25）
 
