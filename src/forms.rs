@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::Form;
+use std::net::SocketAddr;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -243,9 +244,17 @@ fn bad(code: StatusCode, msg: impl Into<String>) -> Response {
 pub struct LoginReq {
     #[serde(default)]
     name: String,
+    /// 客户端机器标识（可选）。概览页按 IP + 它聚合，能区分同一 IP 下的多台机器
+    #[serde(default)]
+    client_id: String,
 }
 
-pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Response {
+pub async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<LoginReq>,
+) -> Response {
     let name = req.name.trim();
     if name.is_empty() {
         return bad(StatusCode::BAD_REQUEST, "请填写姓名");
@@ -262,6 +271,18 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> 
         // 不在名单里 / 已停用：同一句提示，不告诉对方"有这个人但停用了"
         return bad(StatusCode::FORBIDDEN, "姓名不在名单里，请联系管理员");
     };
+
+    {
+        let conn = state.conn.lock().unwrap();
+        db::record_activity(
+            &conn,
+            "login",
+            &user.name,
+            &crate::peer_ip(&headers, Some(addr)),
+            &req.client_id,
+            "",
+        );
+    }
 
     let (token, exp) = state.auth.issue_form_token(user.id, FORM_TOKEN_TTL);
     ok(json!({
@@ -449,6 +470,7 @@ pub struct SubmitReq {
 pub async fn submit(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<SubmitReq>,
 ) -> Response {
     let Some(user) = current_user(&state, &headers) else {
@@ -492,6 +514,19 @@ pub async fn submit(
 
     let created = {
         let conn = state.conn.lock().unwrap();
+        let tpl_name = db::form_template_by_id(&conn, req.template_id)
+            .ok()
+            .flatten()
+            .map(|t| t.name)
+            .unwrap_or_default();
+        db::record_activity(
+            &conn,
+            "submit",
+            &user.name,
+            &crate::peer_ip(&headers, Some(addr)),
+            &req.client_id,
+            &tpl_name,
+        );
         db::form_submit_insert(
             &conn,
             &db::NewSubmission {
@@ -573,10 +608,6 @@ pub struct AdminQuery {
     pub from: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
-    #[serde(default)]
-    pub ok: Option<String>,
-    #[serde(default)]
-    pub err: Option<String>,
 }
 
 impl AdminQuery {
@@ -610,14 +641,8 @@ fn parse_date(s: Option<&str>, end_of_day: bool) -> Option<i64> {
     Some(dt.assume_utc().unix_timestamp())
 }
 
-pub async fn admin_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<AdminQuery>,
-) -> Response {
-    if !crate::is_admin(&headers, &state) {
-        return axum::response::Html(crate::html::LOGIN.replace("%%ERROR%%", "")).into_response();
-    }
+/// 三块内容，供 `admin::page` 拼进标签页。鉴权在调用方做过了。
+pub fn panes(state: &AppState, q: &AdminQuery) -> (String, String, String) {
 
     let (from, to) = q.range();
     let filter = db::SubmissionFilter {
@@ -629,7 +654,7 @@ pub async fn admin_page(
         offset: 0,
     };
 
-    let (rows_html, total, subtitle, tpl_rows, user_rows, tpl_opts, user_opts) = {
+    let (rows_html, total, tpl_rows, user_rows, tpl_opts, user_opts) = {
         let conn = state.conn.lock().unwrap();
 
         let rows = db::form_submissions(&conn, &filter).unwrap_or_default();
@@ -732,14 +757,7 @@ pub async fn admin_page(
             "全部人",
         );
 
-        let subtitle = format!(
-            "{} 个模板 · {} 人可填 · 共 {} 条提交",
-            templates.len(),
-            users.len(),
-            total
-        );
-
-        (rows_html, total, subtitle, tpl_rows, user_rows, tpl_opts, user_opts)
+        (rows_html, total, tpl_rows, user_rows, tpl_opts, user_opts)
     };
 
     // 导出链接带上当前筛选，所见即所得
@@ -759,20 +777,55 @@ pub async fn admin_page(
     }
     export.push_str(&parts.join("&"));
 
-    let body = html::FORMS
-        .replace("%%SUBTITLE%%", &crate::escape(&subtitle))
-        .replace("%%FLASH%%", &crate::flash(q.ok, q.err))
-        .replace("%%ROWS%%", &rows_html)
-        .replace("%%TOTAL%%", &total.to_string())
-        .replace("%%TPLROWS%%", &tpl_rows)
-        .replace("%%USERROWS%%", &user_rows)
-        .replace("%%TPLFILTER%%", &tpl_opts)
-        .replace("%%USERFILTER%%", &user_opts)
-        .replace("%%FROM%%", &crate::escape(q.from.as_deref().unwrap_or("")))
-        .replace("%%TO%%", &crate::escape(q.to.as_deref().unwrap_or("")))
-        .replace("%%EXPORT%%", &crate::escape(&export));
+    let register = format!(
+        r##"<div class="card">
+    <h2>提交记录<span class="muted">共 {} 条，最多显示最近 50 条</span></h2>
+    <form method="get" action="/admin" class="row" style="margin-bottom:12px">
+      <input type="hidden" name="tab" value="register">
+      <select name="template">{tpl_opts}</select>
+      <select name="user">{user_opts}</select>
+      <label>从 <input type="date" name="from" value="{from}"></label>
+      <label>到 <input type="date" name="to" value="{to}"></label>
+      <button type="submit">筛选</button>
+      <a class="primary" href="{export}">导出 xlsx</a>
+    </form>
+    <table>
+      <tr><th>填写时间</th><th>模板</th><th>提交人</th><th>内容</th></tr>
+      {rows_html}
+    </table>
+  </div>"##,
+        total,
+        from = crate::escape(q.from.as_deref().unwrap_or("")),
+        to = crate::escape(q.to.as_deref().unwrap_or("")),
+        export = crate::escape(&export),
+    );
 
-    axum::response::Html(body).into_response()
+    let templates = format!(
+        r##"<div class="card">
+    <h2>模板<span class="muted">在客户端「模板管理」里编辑，这里只读；改坏了可以在这里停用</span></h2>
+    <table>
+      <tr><th>名称</th><th>版本</th><th>字段</th><th>更新时间</th><th>状态</th><th>操作</th></tr>
+      {tpl_rows}
+    </table>
+  </div>"##
+    );
+
+    let users = format!(
+        r##"<div class="card">
+    <h2>用户（谁能填表）</h2>
+    <form method="post" action="/admin/users/save" class="row" style="margin-bottom:12px">
+      <input type="text" name="name" placeholder="中文姓名" required>
+      <button type="submit">添加</button>
+      <span class="muted">必须和客服本人说的完全一致；不在名单里的人登录会失败</span>
+    </form>
+    <table>
+      <tr><th>姓名</th><th>状态</th><th>操作</th></tr>
+      {user_rows}
+    </table>
+  </div>"##
+    );
+
+    (register, templates, users)
 }
 
 fn select_options(items: &[(String, String)], selected: Option<&str>, all_label: &str) -> String {
@@ -816,14 +869,14 @@ pub async fn user_save(
     Form(form): Form<UserSaveForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("请先登录");
+        return redirect_err("users", "请先登录");
     }
     let name = form.name.trim().to_string();
     if name.is_empty() {
-        return redirect_err("姓名不能为空");
+        return redirect_err("users", "姓名不能为空");
     }
     if name.chars().count() > 20 {
-        return redirect_err("姓名最多 20 个字");
+        return redirect_err("users", "姓名最多 20 个字");
     }
 
     let result = {
@@ -831,12 +884,12 @@ pub async fn user_save(
         db::form_user_save(&conn, form.id, &name)
     };
     match result {
-        Ok(_) => redirect_ok(&format!("已保存「{name}」")),
+        Ok(_) => redirect_ok("users", &format!("已保存「{name}」")),
         Err(e) => {
             if e.to_string().contains("UNIQUE") {
-                redirect_err("已经有同名的人了")
+                redirect_err("users", "已经有同名的人了")
             } else {
-                redirect_err(&format!("保存失败：{e}"))
+                redirect_err("users", &format!("保存失败：{e}"))
             }
         }
     }
@@ -855,7 +908,7 @@ pub async fn user_toggle(
     Form(form): Form<UserToggleForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("请先登录");
+        return redirect_err("users", "请先登录");
     }
     let enabled = matches!(form.enabled.as_deref(), Some("1") | Some("true"));
     let result = {
@@ -863,8 +916,33 @@ pub async fn user_toggle(
         db::form_user_toggle(&conn, form.id, enabled)
     };
     match result {
-        Ok(()) => redirect_ok(if enabled { "已启用" } else { "已停用" }),
-        Err(e) => redirect_err(&format!("操作失败：{e}")),
+        Ok(()) => redirect_ok("users", if enabled { "已启用" } else { "已停用" }),
+        Err(e) => redirect_err("users", &format!("操作失败：{e}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UserDeleteForm {
+    id: i64,
+}
+
+/// 删人。历史提交**不动** —— `user_name` 是冗余存的，删了人记录还认得出是谁填的。
+pub async fn user_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UserDeleteForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("users", "请先登录");
+    }
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        db::form_user_delete(&conn, form.id)
+    };
+    match result {
+        Ok(true) => redirect_ok("users", "已删除；他填过的登记保留不变"),
+        Ok(false) => redirect_err("users", "没有这个人"),
+        Err(e) => redirect_err("users", &format!("删除失败：{e}")),
     }
 }
 
@@ -884,7 +962,7 @@ pub async fn admin_template_toggle(
     Form(form): Form<TemplateToggleForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("请先登录");
+        return redirect_err("templates", "请先登录");
     }
     let is_active = matches!(form.is_active.as_deref(), Some("1") | Some("true"));
     let result = {
@@ -892,8 +970,11 @@ pub async fn admin_template_toggle(
         db::form_template_toggle(&conn, form.id, is_active)
     };
     match result {
-        Ok(()) => redirect_ok(if is_active { "模板已启用" } else { "模板已停用，客户端下次拉取就不再显示" }),
-        Err(e) => redirect_err(&format!("操作失败：{e}")),
+        Ok(()) => redirect_ok(
+            "templates",
+            if is_active { "模板已启用" } else { "模板已停用，客户端下次拉取就不再显示" },
+        ),
+        Err(e) => redirect_err("templates", &format!("操作失败：{e}")),
     }
 }
 
@@ -905,11 +986,11 @@ pub async fn export(
     Query(q): Query<AdminQuery>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("请先登录");
+        return redirect_err("register", "请先登录");
     }
     if q.template.is_none() {
         // 跨模板并排导，列会稀疏得没法看 —— 一次只导一个模板
-        return redirect_err("导出请先选一个模板（一次只导一个）");
+        return redirect_err("register", "导出请先选一个模板（一次只导一个）");
     }
     let (from, to) = q.range();
     let filter = db::SubmissionFilter {
@@ -933,13 +1014,13 @@ pub async fn export(
     };
 
     if rows.is_empty() {
-        return redirect_err("这个筛选下没有记录可导出");
+        return redirect_err("register", "这个筛选下没有记录可导出");
     }
 
     let table = crate::xlsx::build_table(&rows, state.cfg.tz_offset_min);
     let bytes = match crate::xlsx::write_xlsx(&table, &sheet_name) {
         Ok(b) => b,
-        Err(e) => return redirect_err(&format!("生成表格失败：{e}")),
+        Err(e) => return redirect_err("register", &format!("生成表格失败：{e}")),
     };
 
     let filename = format!(
@@ -987,17 +1068,19 @@ fn url_encode(s: &str) -> String {
 
 /* ------------------------------------------------------------ 跳转 */
 
-fn redirect_ok(msg: &str) -> Response {
-    redirect_with("ok", msg)
+/// 管理页的操作都重定向回带标签的地址：加人回名单、停用模板回模板、
+/// 导出出错回登记 —— 不然一操作就跳回概览，还得再点一次。
+fn redirect_ok(tab: &str, msg: &str) -> Response {
+    redirect_with(tab, "ok", msg)
 }
 
-fn redirect_err(msg: &str) -> Response {
-    redirect_with("err", msg)
+fn redirect_err(tab: &str, msg: &str) -> Response {
+    redirect_with(tab, "err", msg)
 }
 
-fn redirect_with(kind: &str, msg: &str) -> Response {
+fn redirect_with(tab: &str, kind: &str, msg: &str) -> Response {
     axum::response::Redirect::to(&format!(
-        "/admin/forms?{}={}",
+        "/admin?tab={tab}&{}={}",
         kind,
         url_encode(msg)
     ))

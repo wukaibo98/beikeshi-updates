@@ -10,7 +10,7 @@ GET /admin                       # 管理页：上传 / 发布 / 回滚 / 删除
 GET /admin/forms                 # 表单收集：提交记录 / 名单 / 导出 xlsx
 ```
 
-当前服务端版本 **0.2.0**（跟客户端版本无关）。跑在 NAS 上，镜像
+当前服务端版本 **0.3.0**（跟客户端版本无关）。跑在 NAS 上，镜像
 `ghcr.io/wukaibo98/beikeshi-updates:latest`，容器内端口 8080，NAS 映射到 **50205**；
 公网经 Lucky 反代到 `https://bks.beikeshi.cn:54321`。
 
@@ -147,13 +147,31 @@ GET /latest.json?client=python → 404「未知客户端：python」
 3. 每条提交都冻结一份字段定义快照（`template_snapshot`）。
    模板改了以后，导出的列按提交自带的快照取 —— 这条不守，历史数据会串列且没法修。
 
+### 管理页是标签页
+
+`GET /admin` 一次返回全部内容，页面上有五个标签（切标签不刷新，URL 会同步成
+`?tab=`）：
+
+| `?tab=` | 内容 |
+|---|---|
+| `overview` | **谁在连服务器**（最近活动：谁/机器、IP、最后动作、时间）+ 概况数字 + 地址 |
+| `versions` | 发布新版本 + 版本列表 |
+| `register` | 提交记录（按模板/人/日期筛选）+ 导出 xlsx |
+| `templates` | 模板只读清单 + 应急停用开关 |
+| `users` | 谁能填表：添加 / 停用 / 改名 / **删除** |
+
+旧地址 `/admin/forms` 会 302 到 `?tab=register`，书签不会失效。
+
 ### 表单收集（管理页，沿用 admin Cookie）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/forms` | 提交记录（可筛选）/ 模板清单（只读）/ 用户名单 |
+| GET | `/admin?tab=register` | 提交记录（可筛选） |
+| GET | `/admin?tab=templates` | 模板清单（只读） |
+| GET | `/admin?tab=users` | 用户名单 |
 | POST | `/admin/users/save` | 加人 / 改名。**加人必须有界面**，否则新人用不了等于只有你能维护 |
 | POST | `/admin/users/toggle` | 停用 / 启用（停用后登录失败，历史提交保留） |
+| POST | `/admin/users/delete` | 删除。**历史提交不动**（记录里冗余存了姓名，删了人还认得出是谁填的） |
 | POST | `/admin/forms/template/toggle` | 模板应急开关：改坏了可以在这里停掉，客户端下次拉取就不再显示 |
 | GET | `/admin/forms/export.xlsx` | 导出，**必须先选模板**：一次只导一个模板，否则列会稀疏得没法看 |
 
@@ -168,6 +186,17 @@ GET /latest.json?client=python → 404「未知客户端：python」
 | `PUBLIC_BASE` | 空 | 公网访问前缀，用来拼 `public_url` |
 | `CHANNEL` | `stable` | 写进清单的 `channel` 字段 |
 | `TZ_OFFSET` | `480` | 管理页显示时间用的时区偏移（分钟）。默认 +8 小时；scratch 镜像没有 tzdata，只能靠它 |
+
+### "谁在连服务器"是怎么来的
+
+客户端每次**检查更新**（`/latest.json`）和**表单登录 / 提交**都会在服务端记一笔
+（`activity` 表：动作、姓名、IP、机器标识、时间）。概览页按「IP + 机器标识」聚合成
+一台机器，只显示最后一次动作；15 分钟内有动作的标绿点「在线」。
+
+- **没有心跳**，所以这不是真正的在线状态 —— 时间一律如实显示"N 分钟前"。
+- IP 优先取 `X-Forwarded-For`（Lucky 反代后面的真实 IP），没有再用连接的地址。
+- 只留 7 天，自动清理。
+- 客户端还没传机器标识（要等客户端那一半做完），现在主要靠 IP 区分。
 
 ## 部署
 

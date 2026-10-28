@@ -292,7 +292,17 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
             client_id         TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_sub_tpl  ON form_submissions(template_id, client_time);
-        CREATE INDEX IF NOT EXISTS idx_sub_user ON form_submissions(user_id, client_time);",
+        CREATE INDEX IF NOT EXISTS idx_sub_user ON form_submissions(user_id, client_time);
+        CREATE TABLE IF NOT EXISTS activity (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind      TEXT NOT NULL,
+            who       TEXT NOT NULL DEFAULT '',
+            ip        TEXT NOT NULL DEFAULT '',
+            client_id TEXT NOT NULL DEFAULT '',
+            detail    TEXT NOT NULL DEFAULT '',
+            at        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_activity_at ON activity(at);",
     )
 }
 
@@ -622,4 +632,105 @@ pub fn form_submissions_count(conn: &Connection, f: &SubmissionFilter) -> rusqli
     }
     let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     conn.query_row(&sql, refs.as_slice(), |r| r.get(0))
+}
+
+/* ==================================================== 最近活动（概览页用） */
+
+/// 谁在连服务器。不是"在线状态"——没有心跳，只能记"最后一次请求是什么时候、
+/// 从哪个 IP、干了什么"。概览页据此显示"最近活动"，15 分钟内有动作的标在线。
+#[derive(Debug, Clone)]
+pub struct Activity {
+    pub kind: String,
+    pub who: String,
+    pub ip: String,
+    pub client_id: String,
+    pub detail: String,
+    pub at: i64,
+}
+
+pub fn activity_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "login" => "登录",
+        "submit" => "提交登记",
+        _ => "检查更新",
+    }
+}
+
+/// 记一条。`who` 为空表示还没登录（只在检查更新）。
+pub fn record_activity(
+    conn: &Connection,
+    kind: &str,
+    who: &str,
+    ip: &str,
+    client_id: &str,
+    detail: &str,
+) {
+    let _ = conn.execute(
+        "INSERT INTO activity (kind, who, ip, client_id, detail, at) VALUES (?, ?, ?, ?, ?, ?)",
+        params![kind, who, ip, client_id, detail, now()],
+    );
+    // 顺手清掉 7 天前的：这张表只服务于"最近谁在连"，留历史没意义还会一直长
+    let _ = conn.execute("DELETE FROM activity WHERE at < ?", params![now() - 7 * 86400]);
+}
+
+/// 按"机器"聚合（同一 IP + 客户端标识算一台），每台只留最近一条。
+///
+/// SQLite 保证 `MAX(at)` 那一行对应的其它列跟着取那一行的值，
+/// 所以不用窗口函数也能拿到"最后一次动作是什么"。
+pub fn recent_activity(conn: &Connection, since: i64, limit: i64) -> Vec<Activity> {
+    let mut stmt = match conn.prepare(
+        "SELECT kind, who, ip, client_id, detail, MAX(at) AS at
+           FROM activity
+          WHERE at >= ?
+          GROUP BY ip, client_id
+          ORDER BY at DESC
+          LIMIT ?",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![since, limit], |r| {
+        Ok(Activity {
+            kind: r.get(0)?,
+            who: r.get(1)?,
+            ip: r.get(2)?,
+            client_id: r.get(3)?,
+            detail: r.get(4)?,
+            at: r.get(5)?,
+        })
+    })
+    .and_then(|rows| rows.collect())
+    .unwrap_or_default()
+}
+
+/// 概览页顶部那几个数字。
+#[derive(Default)]
+pub struct FormStats {
+    pub templates: i64,
+    pub users: i64,
+    pub submissions: i64,
+    pub submissions_today: i64,
+}
+
+pub fn form_stats(conn: &Connection) -> FormStats {
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    let day_start = (now() / 86400) * 86400 - 8 * 3600; // 按北京时间算"今天"
+    FormStats {
+        templates: count("SELECT COUNT(*) FROM form_templates WHERE is_active = 1"),
+        users: count("SELECT COUNT(*) FROM form_users WHERE enabled = 1"),
+        submissions: count("SELECT COUNT(*) FROM form_submissions"),
+        submissions_today: conn
+            .query_row(
+                "SELECT COUNT(*) FROM form_submissions WHERE client_time >= ?",
+                params![day_start],
+                |r| r.get(0),
+            )
+            .unwrap_or(0),
+    }
+}
+
+/// 删人。历史提交**不动** —— `user_name` 是冗余存的，删了人记录还认得出是谁填的。
+pub fn form_user_delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute("DELETE FROM form_users WHERE id = ?", params![id])?;
+    Ok(changed == 1)
 }

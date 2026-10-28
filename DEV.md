@@ -2,7 +2,7 @@
 
 > 面向改这个服务的人。部署与日常发版见 [README.md](README.md)，交接要点与待办见 [HANDOVER.md](HANDOVER.md)。
 
-**服务端 v0.2.0 ｜ Rust 1.75+ / axum 0.8 / rusqlite(bundled) / tokio ｜ 静态二进制 → scratch 镜像**
+**服务端 v0.3.0 ｜ Rust 1.75+ / axum 0.8 / rusqlite(bundled) / tokio ｜ 静态二进制 → scratch 镜像**
 **代码 1172 行（main 327 / admin 389 / db 206 / html 159 / auth 91）**
 
 ---
@@ -245,6 +245,41 @@ multipart 逐字段读：
 sheet 名过 31 字符要截断，并清掉 `[]:*?/\` 这些 xlsx 禁用的字符。
 依赖 `rust_xlsxwriter`（纯 Rust，能静态编进 musl，镜像实测从 3.66MB 涨到 **4.92MB**）。
 
+### 4.9 管理页是标签页（v0.3 起）
+
+`/admin` 一次渲染五个 `<section>`，切标签由页面里 20 行内联 JS 切 `hidden`：
+
+```js
+// 标签本身是 <a href="/admin?tab=x">，没有 JS 时点它照样整页跳转
+// 有 JS 时 preventDefault + 切 hidden + history.replaceState 同步 URL
+```
+
+为什么不做成"点标签发请求拿一段"：内容量很小（提交记录最多 50 条），
+一次渲染完省掉来回；而且筛选本来就要走 URL（`GET /admin?tab=register&template=1`），
+URL 已经是状态的唯一来源，没必要再来一份。
+
+三个细节：
+
+- **`.pane[hidden]{display:none!important}`** —— 不加 `!important`，
+  任何 `display:flex` 之类的规则都会让 `hidden` 失效，五个标签会叠在一起。
+- **未知 `tab=` 回落到 `overview`**，不报错。
+- **每个 POST 操作重定向时都带 `tab=`**（加人回 `users`、停用模板回 `templates`、
+  导出出错回 `register`），否则一操作就跳回概览，还得再点一次。
+
+### 4.10 "谁在连服务器"
+
+`activity` 表记录每一次有意义的行为：`check`（检查更新）/ `login` / `submit`。
+字段是 `kind / who / ip / client_id / detail / at`。
+
+- **IP**：`peer_ip()` 优先读 `X-Forwarded-For` 第一个（Lucky 反代后面的真实 IP），
+  没有再用 `ConnectInfo<SocketAddr>` —— 所以 `serve` 必须换成
+  `into_make_service_with_connect_info::<SocketAddr>()`，否则拿不到。
+- **聚合**：按 `(ip, client_id)` 分组取 `MAX(at)`。SQLite 保证 `MAX()` 那一行对应的
+  其它列跟着取那一行的值，所以不用窗口函数也能拿到"最后一次动作是什么"。
+- **在线判定**：`now - at < 15 分钟`。**没有心跳**，这只是"最近有请求"，
+  页面上一律如实显示"N 分钟前"，不假装在实时在线。
+- **只留 7 天**，每次写入顺手清理（这张表只服务于"现在谁在连"，留历史没意义）。
+
 ## 5. 管理页模板
 
 `html.rs` 里两个 `&'static str`（`LOGIN` / `ADMIN`），用 `%%KEY%%` 占位：
@@ -446,6 +481,10 @@ python3 -c "import zipfile;print(zipfile.ZipFile('out.xlsx').namelist()[:3])"
 | 提交不存快照 | 同上。快照是这套设计里最不能妥协的一条 |
 | 把 `duplicate` 当错误返回 | 客户端只有看到成功才清队列，一直重试会让"待上传"永远清不掉 |
 | 允许保存离线编辑的模板 | 模板是全局配置，离线改会分叉成两套 —— 断网时保存按钮应置灰 |
+| `.pane[hidden]` 不加 `!important` | 被别的 display 规则盖掉，五个标签会同时显示 |
+| 忘了 `into_make_service_with_connect_info` | `ConnectInfo<SocketAddr>` 提取失败，运行期直接 500 |
+| 只信 `ConnectInfo` 的 IP | 反代后面拿到的是 Lucky 的地址，全都一样，概览页等于没用 |
+| 删人时把历史提交一起删 | 记录里冗余存了 `user_name`，只需删人；连提交一起删等于毁账 |
 | 把清单发给旧客户端 | 旧 Python 客户端没有 `client` 校验，会拿新版 exe 把自己替换掉 —— 所以缺参数一律 404 |
 | `ALTER TABLE` 那段别删 | NAS 上的库是旧版建的，靠它补列 |
 | Location 头塞中文 | 只能 ASCII；跳转消息一律百分号编码（`admin.rs::encode`） |

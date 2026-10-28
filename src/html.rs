@@ -33,85 +33,6 @@ button:hover{background:#335915}
   %%ERROR%%
 </div></body></html>"##;
 
-pub const ADMIN: &str = r##"<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>贝可施更新分发</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;background:#F4F7EE;color:#232B1C;
-  font:14px/1.6 "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif}
-.wrap{max-width:820px;margin:0 auto;padding:28px 20px 60px}
-h1{font-size:19px;color:#24400D;margin:0 0 2px}
-.sub{font-size:12px;color:#66705C;margin-bottom:18px}
-.card{background:#fff;border:1px solid #E2E8D8;border-radius:14px;padding:18px 20px;margin-bottom:16px}
-.card h2{font-size:13px;margin:0 0 14px;color:#24400D;font-weight:500}
-label{display:block;font-size:12px;color:#66705C;margin:10px 0 4px}
-input[type=text],input[type=password],select,textarea{width:100%;border:1px solid #D8E0CC;
-  border-radius:8px;background:#F8FAF3;padding:8px 10px;font:inherit;font-size:13px;outline:none}
-input[type=file]{font-size:12px}
-textarea{resize:vertical;min-height:56px}
-button{font:inherit;font-size:13px;height:34px;padding:0 16px;border:0;border-radius:8px;
-  background:#3E6B1B;color:#fff;cursor:pointer}
-button:hover{background:#335915}
-button.ghost{background:transparent;border:1px solid #D8E0CC;color:#66705C;height:28px;padding:0 10px;font-size:12px}
-button.ghost:hover{border-color:#3E6B1B;color:#3E6B1B}
-button.danger{background:transparent;border:1px solid #F0C0BC;color:#A32D2D;height:28px;padding:0 10px;font-size:12px}
-button.danger:hover{background:#FDF4F3}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{font-weight:500;color:#66705C;font-size:12px;text-align:left;padding:6px 8px;border-bottom:1px solid #EFF3E7}
-td{padding:8px;border-bottom:1px solid #EFF3E7;vertical-align:top}
-code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
-.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;background:#E7EDDC;color:#3E6B1B}
-.tag.py{background:#EEF1F6;color:#3A5A8C}
-.muted{color:#98A08F;font-size:12px}
-.flash{background:#EAF3DE;color:#27500A;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
-.err{background:#FCEBEB;color:#791F1F;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
-.row{display:flex;gap:6px;flex-wrap:wrap}
-.top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-</style></head>
-<body><div class="wrap">
-  <div class="top">
-    <div>
-      <h1>贝可施更新分发</h1>
-      <div class="sub">%%SUBTITLE%%</div>
-    </div>
-    <div class="row">
-      <a class="ghost" style="display:inline-flex;align-items:center;height:28px;padding:0 10px;border:1px solid #D8E0CC;border-radius:8px;color:#66705C;text-decoration:none;font-size:12px" href="/admin/forms">表单收集</a>
-      <form method="post" action="/admin/logout"><button class="ghost" type="submit">退出</button></form>
-    </div>
-  </div>
-  %%FLASH%%
-  <div class="card">
-    <h2>发布新版本</h2>
-    <form method="post" action="/admin/upload" enctype="multipart/form-data">
-      <label>版本号（形如 1.2.0）</label>
-      <input type="text" name="version" placeholder="1.2.0" required>
-      <label>更新说明（会显示在客户端，一句话）</label>
-      <textarea name="notes" placeholder="修复赠品折合"></textarea>
-      <label>程序文件（exe，上传后自动算 sha256）</label>
-      <input type="file" name="file" accept=".exe" required>
-      <div style="margin-top:14px"><button type="submit">上传并发布</button></div>
-    </form>
-  </div>
-  <div class="card">
-    <h2>版本列表</h2>
-    <table>
-      <tr><th>版本</th><th>大小</th><th>下载</th><th>发布时间</th><th>操作</th></tr>
-      %%ROWS%%
-    </table>
-  </div>
-  <div class="card">
-    <h2>客户端检查</h2>
-    <table>
-      <tr><th>累计检查次数</th><td>%%CHECKS%%</td></tr>
-      <tr><th>内网地址</th><td><code>%%LAN%%</code></td></tr>
-      <tr><th>公网地址</th><td><code>%%PUBLIC%%</code></td></tr>
-      <tr><th>客户端清单</th><td><code>%%MANIFEST%%</code></td></tr>
-    </table>
-  </div>
-</div></body></html>"##;
-
 pub fn row(
     id: i64,
     version: &str,
@@ -154,94 +75,6 @@ pub fn row(
 }
 
 /* ============================================================ 表单收集页 */
-
-pub const FORMS: &str = r##"<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>表单收集 · 贝可施更新分发</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;background:#F4F7EE;color:#232B1C;
-  font:14px/1.6 "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif}
-.wrap{max-width:1000px;margin:0 auto;padding:28px 20px 60px}
-h1{font-size:19px;color:#24400D;margin:0 0 2px}
-.sub{font-size:12px;color:#66705C;margin-bottom:18px}
-.card{background:#fff;border:1px solid #E2E8D8;border-radius:14px;padding:18px 20px;margin-bottom:16px}
-.card h2{font-size:13px;margin:0 0 14px;color:#24400D;font-weight:500}
-input[type=text],input[type=date],select{border:1px solid #D8E0CC;border-radius:8px;background:#F8FAF3;
-  padding:6px 8px;font:inherit;font-size:13px;outline:none}
-button{font:inherit;font-size:13px;height:30px;padding:0 14px;border:0;border-radius:8px;
-  background:#3E6B1B;color:#fff;cursor:pointer}
-button:hover{background:#335915}
-button.ghost{background:transparent;border:1px solid #D8E0CC;color:#66705C;height:28px;padding:0 10px;font-size:12px}
-button.ghost:hover{border-color:#3E6B1B;color:#3E6B1B}
-button.danger{background:transparent;border:1px solid #F0C0BC;color:#A32D2D;height:28px;padding:0 10px;font-size:12px}
-button.danger:hover{background:#FDF4F3}
-a.ghost{display:inline-flex;align-items:center;height:28px;padding:0 12px;border-radius:8px;
-  background:#3E6B1B;color:#fff;text-decoration:none;font-size:12px}
-a.ghost:hover{background:#335915}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{font-weight:500;color:#66705C;font-size:12px;text-align:left;padding:6px 8px;border-bottom:1px solid #EFF3E7}
-td{padding:8px;border-bottom:1px solid #EFF3E7;vertical-align:top}
-code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
-.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;background:#E7EDDC;color:#3E6B1B}
-.tag.off{background:#EFEFEA;color:#98A08F}
-.muted{color:#98A08F;font-size:12px}
-.flash{background:#EAF3DE;color:#27500A;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
-.err{background:#FCEBEB;color:#791F1F;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.kv{font-size:12px}
-.kv b{font-weight:500;color:#66705C}
-</style></head>
-<body><div class="wrap">
-  <div class="top">
-    <div>
-      <h1>表单收集</h1>
-      <div class="sub">%%SUBTITLE%%</div>
-    </div>
-    <a class="ghost" href="/admin">返回分发</a>
-  </div>
-  %%FLASH%%
-
-  <div class="card">
-    <h2>提交记录</h2>
-    <form method="get" action="/admin/forms" class="row" style="margin-bottom:12px">
-      <select name="template">%%TPLFILTER%%</select>
-      <select name="user">%%USERFILTER%%</select>
-      <label>从 <input type="date" name="from" value="%%FROM%%"></label>
-      <label>到 <input type="date" name="to" value="%%TO%%"></label>
-      <button type="submit">筛选</button>
-      <a class="ghost" href="%%EXPORT%%">导出 xlsx</a>
-    </form>
-    <div class="muted" style="margin-bottom:8px">共 %%TOTAL%% 条，最多显示最近 50 条</div>
-    <table>
-      <tr><th>填写时间</th><th>模板</th><th>提交人</th><th>内容</th></tr>
-      %%ROWS%%
-    </table>
-  </div>
-
-  <div class="card">
-    <h2>模板（在客户端「模板管理」里编辑，这里只读）</h2>
-    <table>
-      <tr><th>名称</th><th>版本</th><th>字段数</th><th>更新时间</th><th>状态</th><th>操作</th></tr>
-      %%TPLROWS%%
-    </table>
-  </div>
-
-  <div class="card">
-    <h2>用户（谁能填表）</h2>
-    <form method="post" action="/admin/users/save" class="row" style="margin-bottom:12px">
-      <input type="text" name="name" placeholder="中文姓名" required>
-      <button type="submit">添加</button>
-      <span class="muted">必须和客服本人说的姓名完全一致；不在名单里的人登录会失败</span>
-    </form>
-    <table>
-      <tr><th>姓名</th><th>状态</th><th>操作</th></tr>
-      %%USERROWS%%
-    </table>
-  </div>
-</div></body></html>"##;
 
 /// 一条提交记录：时间 / 模板 / 人 / 内容（按字段顺序拼成"标签：值"）。
 pub fn form_submission_row(
@@ -318,8 +151,203 @@ pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
 <form method="post" action="/admin/users/save" style="display:inline">
 <input type="hidden" name="id" value="{id}">
 <input type="text" name="name" value="{name}" style="width:120px">
-<button class="ghost" type="submit">改名</button></form></div></td></tr>"#,
+<button class="ghost" type="submit">改名</button></form>
+<form method="post" action="/admin/users/delete" style="display:inline"
+  onsubmit="return confirm('删除「{name}」？\n\n他填过的登记会保留（记录里已经存了姓名），只是这个人不能再登录了。')">
+<input type="hidden" name="id" value="{id}">
+<button class="danger" type="submit">删除</button></form></div></td></tr>"#,
         name = crate::escape(name),
         want = if enabled { 0 } else { 1 },
+    )
+}
+
+/* ================================================ 标签页外壳（v0.3 起） */
+
+pub const PAGE: &str = r##"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>贝可施更新分发</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#F4F7EE;color:#232B1C;
+  font:14px/1.6 "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:19px;color:#24400D;margin:0 0 2px}
+.sub{font-size:12px;color:#66705C;margin-bottom:16px}
+.card{background:#fff;border:1px solid #E2E8D8;border-radius:14px;padding:18px 20px;margin-bottom:14px}
+.card h2{font-size:13px;margin:0 0 14px;color:#24400D;font-weight:500}
+.card h2 .muted{font-weight:400;margin-left:8px}
+label{font-size:12px;color:#66705C}
+input[type=text],input[type=password],input[type=date],select,textarea{
+  border:1px solid #D8E0CC;border-radius:8px;background:#F8FAF3;padding:6px 8px;
+  font:inherit;font-size:13px;outline:none}
+textarea{width:100%;resize:vertical;min-height:56px}
+input[type=file]{font-size:12px}
+button{font:inherit;font-size:13px;height:30px;padding:0 14px;border:0;border-radius:8px;
+  background:#3E6B1B;color:#fff;cursor:pointer}
+button:hover{background:#335915}
+button.ghost{background:transparent;border:1px solid #D8E0CC;color:#66705C;height:28px;padding:0 10px;font-size:12px}
+button.ghost:hover{border-color:#3E6B1B;color:#3E6B1B}
+button.danger{background:transparent;border:1px solid #F0C0BC;color:#A32D2D;height:28px;padding:0 10px;font-size:12px}
+button.danger:hover{background:#FDF4F3}
+a.ghost{display:inline-flex;align-items:center;height:28px;padding:0 12px;border-radius:8px;
+  border:1px solid #D8E0CC;color:#66705C;text-decoration:none;font-size:12px}
+a.ghost:hover{border-color:#3E6B1B;color:#3E6B1B}
+a.primary{display:inline-flex;align-items:center;height:30px;padding:0 14px;border-radius:8px;
+  background:#3E6B1B;color:#fff;text-decoration:none;font-size:13px}
+a.primary:hover{background:#335915}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{font-weight:500;color:#66705C;font-size:12px;text-align:left;padding:6px 8px;border-bottom:1px solid #EFF3E7}
+td{padding:8px;border-bottom:1px solid #EFF3E7;vertical-align:top}
+code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;background:#E7EDDC;color:#3E6B1B}
+.tag.off{background:#EFEFEA;color:#98A08F}
+.tag.py{background:#EEF1F6;color:#3A5A8C}
+.muted{color:#98A08F;font-size:12px}
+.flash{background:#EAF3DE;color:#27500A;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
+.err{background:#FCEBEB;color:#791F1F;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.kv{font-size:12px}
+.kv b{font-weight:500;color:#66705C}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.stat{background:#F6F9F0;border-radius:10px;padding:12px 14px}
+.stat .n{font-size:22px;font-weight:500;color:#24400D;line-height:1.2}
+.stat .k{font-size:12px;color:#66705C}
+
+.tabs{display:flex;gap:6px;background:#EDF2E3;border-radius:12px;padding:6px;
+  margin-bottom:14px;overflow-x:auto}
+.tab{flex:none;display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 16px;
+  border-radius:10px;font-size:13px;color:#5F5E5A;text-decoration:none;white-space:nowrap}
+.tab:hover{color:#24400D}
+.tab.on{background:#fff;color:#24400D;font-weight:500;border:1px solid #CBD9B4}
+.badge{font-size:11px;padding:0 6px;border-radius:20px;background:#DCE7C8;color:#3E6B1B;line-height:16px}
+.tab.on .badge{background:#E7EDDC}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.dot.on{background:#4E8B22}
+.dot.off{background:#C9CFC0}
+.pane[hidden]{display:none!important}
+</style></head>
+<body><div class="wrap">
+  <div class="top">
+    <div>
+      <h1>贝可施更新分发</h1>
+      <div class="sub">%%SUBTITLE%%</div>
+    </div>
+    <form method="post" action="/admin/logout"><button class="ghost" type="submit">退出</button></form>
+  </div>
+  %%FLASH%%
+  <nav class="tabs">%%TABS%%</nav>
+  <section class="pane" data-pane="overview" %%HIDE_OVERVIEW%%>%%PANE_OVERVIEW%%</section>
+  <section class="pane" data-pane="versions" %%HIDE_VERSIONS%%>%%PANE_VERSIONS%%</section>
+  <section class="pane" data-pane="register" %%HIDE_REGISTER%%>%%PANE_REGISTER%%</section>
+  <section class="pane" data-pane="templates" %%HIDE_TEMPLATES%%>%%PANE_TEMPLATES%%</section>
+  <section class="pane" data-pane="users" %%HIDE_USERS%%>%%PANE_USERS%%</section>
+</div>
+<script>
+(function () {
+  var tabs = document.querySelectorAll(".tab");
+  var panes = document.querySelectorAll(".pane");
+  function show(name) {
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].classList.toggle("on", tabs[i].getAttribute("data-tab") === name);
+    }
+    for (var j = 0; j < panes.length; j++) {
+      panes[j].hidden = panes[j].getAttribute("data-pane") !== name;
+    }
+    var u = new URL(location.href);
+    u.searchParams.set("tab", name);
+    history.replaceState(null, "", u);
+  }
+  for (var k = 0; k < tabs.length; k++) {
+    tabs[k].addEventListener("click", function (e) {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+      e.preventDefault();
+      show(this.getAttribute("data-tab"));
+    });
+  }
+})();
+</script>
+</body></html>"##;
+
+pub const TABS: [(&str, &str); 5] = [
+    ("overview", "概览"),
+    ("versions", "版本"),
+    ("register", "登记"),
+    ("templates", "模板"),
+    ("users", "名单"),
+];
+
+/// 标签栏。用 `<a href="?tab=">` 而不是按钮 —— 没有 JS 时点它也能整页跳转。
+pub fn tabs(active: &str, counts: &[(&str, i64); 5]) -> String {
+    TABS.iter()
+        .zip(counts.iter())
+        .map(|((key, label), (_, count))| {
+            let on = if *key == active { " on" } else { "" };
+            let badge = if *count > 0 {
+                format!(r#"<span class="badge">{count}</span>"#)
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<a class="tab{on}" href="/admin?tab={key}" data-tab="{key}">{label}{badge}</a>"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// 概览里"谁在连服务器"的一行。
+///
+/// 没有心跳，所以"在线"只是"最近 15 分钟内有请求"。时间一律如实显示"N 分钟前"，
+/// 不假装在实时在线。
+pub fn activity_row(act: &crate::db::Activity, now: i64, tz_offset_min: i32) -> String {
+    let online = now - act.at < 15 * 60;
+    let dot = if online { "on" } else { "off" };
+    let status = if online { "在线" } else { "离线" };
+    let who = if act.who.is_empty() {
+        r#"<span class="muted">未登录</span>"#.to_string()
+    } else {
+        crate::escape(&act.who)
+    };
+    let machine = if act.client_id.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<br><span class="muted">{}</span>"#, crate::escape(&act.client_id))
+    };
+    let ago = ago_text(now - act.at);
+    format!(
+        r#"<tr><td><span class="dot {dot}"></span>{who}{machine}</td>
+<td><code>{ip}</code></td>
+<td>{kind}{detail}</td>
+<td>{time}<br><span class="muted">{ago} · {status}</span></td></tr>"#,
+        ip = crate::escape(&act.ip),
+        kind = crate::db::activity_kind_label(&act.kind),
+        detail = if act.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", crate::escape(&act.detail))
+        },
+        time = crate::admin::short_time(act.at, tz_offset_min),
+    )
+}
+
+fn ago_text(secs: i64) -> String {
+    if secs < 60 {
+        "刚刚".to_string()
+    } else if secs < 3600 {
+        format!("{} 分钟前", secs / 60)
+    } else if secs < 86400 {
+        format!("{} 小时前", secs / 3600)
+    } else {
+        format!("{} 天前", secs / 86400)
+    }
+}
+
+/// 概览顶部那几个数字。
+pub fn stat(key: &str, value: i64) -> String {
+    format!(
+        r#"<div class="stat"><div class="n">{value}</div><div class="k">{key}</div></div>"#,
+        key = crate::escape(key)
     )
 }

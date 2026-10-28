@@ -7,7 +7,7 @@ use axum::Form;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::{db, flash, html, is_admin, AppState, Flash};
+use crate::{db, html, is_admin, AppState};
 
 const MAX_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
 
@@ -18,21 +18,127 @@ pub struct LoginForm {
 
 /* ------------------------------------------------------------ 页面 */
 
+/// 五个标签页的统一入口：`概览 / 版本 / 登记 / 模板 / 名单`。
+///
+/// 所有内容**一次渲染完**，切标签由页面里 20 行 JS 切 `hidden`（不刷新），
+/// URL 用 `replaceState` 同步，所以刷新和书签都能回到同一个标签。
+/// 标签本身是 `<a href="?tab=">`，没有 JS 时点它照样整页跳转。
+#[derive(Deserialize)]
+pub struct PageQuery {
+    #[serde(default)]
+    pub tab: Option<String>,
+    #[serde(default)]
+    pub template: Option<i64>,
+    #[serde(default)]
+    pub user: Option<i64>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub ok: Option<String>,
+    #[serde(default)]
+    pub err: Option<String>,
+}
+
+impl PageQuery {
+    fn tab(&self) -> &str {
+        let t = self.tab.as_deref().unwrap_or("overview").trim();
+        if html::TABS.iter().any(|(k, _)| *k == t) {
+            t
+        } else {
+            "overview"
+        }
+    }
+}
+
 pub async fn page(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(f): Query<Flash>,
+    Query(q): Query<PageQuery>,
 ) -> Response {
     if !is_admin(&headers, &state) {
         return Html(html::LOGIN.replace("%%ERROR%%", "")).into_response();
     }
 
-    let (rows, subtitle, checks) = {
-        let conn = state.conn.lock().unwrap();
-        let releases = db::list_all(&conn).unwrap_or_default();
-        let now = db::current(&conn).ok().flatten();
-        let (count, last_at) = db::checks_info(&conn);
+    let active = q.tab().to_string();
+    let tz = state.cfg.tz_offset_min;
 
+    let (overview, versions, counts, subtitle) = {
+        let conn = state.conn.lock().unwrap();
+
+        /* ---- 概览：谁在连服务器 ---- */
+        let now = db::now();
+        let acts = db::recent_activity(&conn, now - 7 * 86400, 50);
+        let act_rows = if acts.is_empty() {
+            r#"<tr><td colspan="4" class="muted">还没有客户端连过。客户端启动后会检查更新，那时这里就会出现。</td></tr>"#.to_string()
+        } else {
+            acts.iter().map(|a| html::activity_row(a, now, tz)).collect::<Vec<_>>().join("")
+        };
+
+        let stats = db::form_stats(&conn);
+        let stat_cards = [
+            html::stat("启用模板", stats.templates),
+            html::stat("可填人数", stats.users),
+            html::stat("登记总数", stats.submissions),
+            html::stat("今日登记", stats.submissions_today),
+        ]
+        .join("");
+
+        let current = db::current(&conn).ok().flatten();
+        let (check_count, last_at) = db::checks_info(&conn);
+        let checks = if last_at > 0 {
+            format!("{check_count} 次 · 最近 {}", short_time(last_at, tz))
+        } else {
+            format!("{check_count} 次")
+        };
+
+        let lan = if state.cfg.lan_base.is_empty() {
+            "（未配置）".to_string()
+        } else {
+            state.cfg.lan_base.clone()
+        };
+        let public = if state.cfg.public_base.is_empty() {
+            "（未配置）".to_string()
+        } else {
+            state.cfg.public_base.clone()
+        };
+        let manifest = if state.cfg.lan_base.is_empty() {
+            "/latest.json?client=web".to_string()
+        } else {
+            format!("{}/latest.json?client=web", state.cfg.lan_base)
+        };
+
+        let overview = format!(
+            r##"<div class="card">
+    <h2>谁在连服务器<span class="muted">15 分钟内有动作的标在线；没有心跳，只能记最后一次请求</span></h2>
+    <table>
+      <tr><th>谁 / 机器</th><th>IP</th><th>最后动作</th><th>时间</th></tr>
+      {act_rows}
+    </table>
+  </div>
+  <div class="card">
+    <h2>概况</h2>
+    <div class="grid">{stat_cards}</div>
+    <table style="margin-top:14px">
+      <tr><th>当前发布</th><td>{current_version}</td></tr>
+      <tr><th>累计检查</th><td>{checks}</td></tr>
+      <tr><th>内网地址</th><td><code>{lan}</code></td></tr>
+      <tr><th>公网地址</th><td><code>{public}</code></td></tr>
+      <tr><th>客户端清单</th><td><code>{manifest}</code></td></tr>
+    </table>
+  </div>"##,
+            current_version = match &current {
+                Some(r) => format!("v{} · {}", crate::escape(&r.version), crate::escape(&r.notes)),
+                None => r#"<span class="muted">还没有发布任何版本</span>"#.to_string(),
+            },
+            lan = crate::escape(&lan),
+            public = crate::escape(&public),
+            manifest = crate::escape(&manifest),
+        );
+
+        /* ---- 版本 ---- */
+        let releases = db::list_all(&conn).unwrap_or_default();
         let rows: String = releases
             .iter()
             .map(|r| {
@@ -40,10 +146,10 @@ pub async fn page(
                     r.id,
                     &r.version,
                     &r.notes,
-                    r.client != db::CLIENT, // legacy：已停发的旧版记录
+                    r.client != db::CLIENT,
                     r.size,
                     r.downloads,
-                    &short_time(r.created_at, state.cfg.tz_offset_min),
+                    &short_time(r.created_at, tz),
                     r.is_current,
                 )
             })
@@ -54,49 +160,75 @@ pub async fn page(
         } else {
             rows
         };
+        let versions = format!(
+            r##"<div class="card">
+    <h2>发布新版本</h2>
+    <form method="post" action="/admin/upload" enctype="multipart/form-data">
+      <label>版本号（形如 1.2.0）</label>
+      <input type="text" name="version" placeholder="1.2.0" style="width:240px" required>
+      <label>更新说明（会显示在客户端，一句话）</label>
+      <textarea name="notes" placeholder="修复赠品折合"></textarea>
+      <label>程序文件（exe，上传后自动算 sha256）</label>
+      <input type="file" name="file" accept=".exe" required>
+      <div style="margin-top:14px"><button type="submit">上传并发布</button></div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>版本列表</h2>
+    <table>
+      <tr><th>版本</th><th>大小</th><th>下载</th><th>发布时间</th><th>操作</th></tr>
+      {rows}
+    </table>
+  </div>"##
+        );
 
-        let subtitle = match now {
-            Some(r) => format!("当前发布 v{}（{} 个版本在册）", r.version, releases.len()),
-            None => "还没有发布任何版本".to_string(),
-        };
+        let counts: [(&str, i64); 5] = [
+            ("overview", 0),
+            ("versions", releases.len() as i64),
+            ("register", stats.submissions),
+            ("templates", stats.templates),
+            ("users", stats.users),
+        ];
 
-        let checks = if last_at > 0 {
-            format!("{count} 次 · 最近 {}", short_time(last_at, state.cfg.tz_offset_min))
-        } else {
-            format!("{count} 次")
-        };
+        let subtitle = format!(
+            "{} · {} 个模板 · {} 人可填 · {} 条登记",
+            match &current {
+                Some(r) => format!("当前发布 v{}", r.version),
+                None => "还没有发布任何版本".to_string(),
+            },
+            stats.templates,
+            stats.users,
+            stats.submissions
+        );
 
-        (rows, subtitle, checks)
+        (overview, versions, counts, subtitle)
     };
 
-    let manifest_hint = if state.cfg.lan_base.is_empty() {
-        "/latest.json?client=web".to_string()
-    } else {
-        format!("{}/latest.json?client=web", state.cfg.lan_base)
+    // 登记 / 模板 / 名单三段在 forms.rs（业务归业务，页面只是拼装）
+    let fq = crate::forms::AdminQuery {
+        template: q.template,
+        user: q.user,
+        from: q.from.clone(),
+        to: q.to.clone(),
     };
+    let (register, templates, users) = crate::forms::panes(&state, &fq);
 
-    let body = html::ADMIN
+    let hide = |pane: &str| if pane == active { "" } else { "hidden" };
+
+    let body = html::PAGE
         .replace("%%SUBTITLE%%", &crate::escape(&subtitle))
-        .replace("%%FLASH%%", &flash(f.ok, f.err))
-        .replace("%%ROWS%%", &rows)
-        .replace("%%CHECKS%%", &crate::escape(&checks))
-        .replace(
-            "%%LAN%%",
-            &crate::escape(if state.cfg.lan_base.is_empty() {
-                "（未配置）"
-            } else {
-                &state.cfg.lan_base
-            }),
-        )
-        .replace(
-            "%%PUBLIC%%",
-            &crate::escape(if state.cfg.public_base.is_empty() {
-                "（未配置）"
-            } else {
-                &state.cfg.public_base
-            }),
-        )
-        .replace("%%MANIFEST%%", &crate::escape(&manifest_hint));
+        .replace("%%FLASH%%", &crate::flash(q.ok.clone(), q.err.clone()))
+        .replace("%%TABS%%", &crate::html::tabs(&active, &counts))
+        .replace("%%HIDE_OVERVIEW%%", hide("overview"))
+        .replace("%%HIDE_VERSIONS%%", hide("versions"))
+        .replace("%%HIDE_REGISTER%%", hide("register"))
+        .replace("%%HIDE_TEMPLATES%%", hide("templates"))
+        .replace("%%HIDE_USERS%%", hide("users"))
+        .replace("%%PANE_OVERVIEW%%", &overview)
+        .replace("%%PANE_VERSIONS%%", &versions)
+        .replace("%%PANE_REGISTER%%", &register)
+        .replace("%%PANE_TEMPLATES%%", &templates)
+        .replace("%%PANE_USERS%%", &users);
 
     Html(body).into_response()
 }

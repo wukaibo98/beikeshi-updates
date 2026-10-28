@@ -20,10 +20,11 @@ mod xlsx;
 #[cfg(test)]
 mod tests;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -58,16 +59,29 @@ struct ClientQuery {
     client: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct Flash {
-    ok: Option<String>,
-    err: Option<String>,
+/// 客户端 IP。Lucky 反代后面真实 IP 在 `X-Forwarded-For` 里；
+/// 直连时才用 `ConnectInfo`（容器内看到的是反代的地址，记下来没意义）。
+pub fn peer_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> String {
+    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = value.split(',').next() {
+            let first = first.trim();
+            if !first.is_empty() {
+                return first.chars().take(64).collect();
+            }
+        }
+    }
+    addr.map(|a| a.ip().to_string()).unwrap_or_default()
 }
 
 /* ------------------------------------------------------------ 对外接口 */
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// 旧地址 `/admin/forms` 现在是「登记」标签，重定向过去，别让书签失效。
+async fn redirect_forms() -> axum::response::Redirect {
+    axum::response::Redirect::to("/admin?tab=register")
 }
 
 /// 版本清单。只服务新版客户端（`client=web`）。
@@ -77,6 +91,8 @@ async fn health() -> &'static str {
 /// 拿到清单就会把 `bkstools-*.exe` 当自己的新版下载下来替换掉自己。
 async fn latest(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<ClientQuery>,
 ) -> Response {
     let client = query.client.unwrap_or_default().trim().to_lowercase();
@@ -94,6 +110,15 @@ async fn latest(
     let release = {
         let conn = state.conn.lock().unwrap();
         db::bump_checks(&conn);
+        // 谁在连：每次检查更新都记一笔，概览页据此显示"最近活动"
+        db::record_activity(
+            &conn,
+            "check",
+            "",
+            &peer_ip(&headers, Some(addr)),
+            "",
+            "",
+        );
         db::current(&conn).ok().flatten()
     };
 
@@ -261,7 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/upload", post(admin::upload))
         .route("/admin/publish/{id}", post(admin::publish))
         .route("/admin/delete/{id}", post(admin::delete))
-        .route("/admin/forms", get(forms::admin_page))
+        .route("/admin/forms", get(redirect_forms))
+        .route("/admin/users/delete", post(forms::user_delete))
         .route("/admin/forms/template/toggle", post(forms::admin_template_toggle))
         .route("/admin/forms/export.xlsx", get(forms::export))
         .route("/admin/users/save", post(forms::user_save))
@@ -277,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("监听 {bind}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
