@@ -91,9 +91,9 @@ GH_TOKEN=ghp_xxx python3 ~/AI/WorkBuddy/tools/gh_push.py . <owner>/<repo> "提�
 git fetch origin main && git reset --hard origin/main
 ```
 
-> 当前状态（2026-10-28）：远端有两个提交（`5db9ec31` 初始化仓库 → `546c2788` 正文），
-> 是本机走 API 推的；本地只有一个同名内容的提交。**内容完全一致，只是历史没对齐**，
-> 按上面两行收一次即可。
+> 当前状态（2026-10-28 13:56）：网络恢复后已 `git fetch && git reset --hard origin/main`，
+> **本地与远端一致**（`eabbe62`）。以后正常 `git push` 就行；再遇到 443 不通就还走 `gh_push.py`，
+> 等通了按上面两行收一次。
 
 ---
 
