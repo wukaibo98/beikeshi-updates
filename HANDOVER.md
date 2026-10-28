@@ -66,8 +66,25 @@ target/release/bks-updates --version                               # bks-updates
 6. **NAS 上镜像名写死**在 `docker-compose.yml` 里：`ghcr.io/wukaibo98/beikeshi-updates`。
    而 workflow 用 `${{ github.repository }}` 生成镜像名 —— **仓库名必须是 `beikeshi-updates`**，
    改名会导致 Actions 推的镜像和 compose 拉的不一致。
-7. 新仓库第一次推完，**去 ghcr 检查包归属**：旧仓库（同名）已被删除，同名包可能变成"孤儿"，
-   需要在包设置里 `Connect repository` 指到新仓库，否则 Actions 推的时候可能 403。
+7. **ghcr 包归属的坑（已经踩过一次，2026-10-28）**：旧仓库删了以后，同名包
+   `beikeshi-updates` 成了"孤儿"，还指着已不存在的仓库。首次构建到最后的 push 步骤直接失败：
+
+   ```
+   ERROR: failed to push ghcr.io/wukaibo98/beikeshi-updates:latest:
+          denied: permission_denied: write_package
+   ```
+
+   编译本身是成功的（17 分钟，双架构 QEMU），只是没有写这个包的权限。
+   解法：把这个孤儿包删掉，重跑一次构建（新包会归属当前仓库就正常了）：
+
+   ```bash
+   curl -X DELETE -H "Authorization: Bearer <PAT 需要 delete:packages 权限>" \
+     https://api.github.com/user/packages/container/beikeshi-updates     # 204 就对了
+   ```
+
+   已按这个办法处理过（包已删除）。**注意：包被删掉了，镜像目前不存在，
+   NAS 上 `docker compose pull` 会失败 —— 必须先成功跑一次构建。**
+   以后再遇到同样的 403，八成还是包归属问题。
 8. 管理页口令 `ADMIN_TOKEN` 目前写在 compose 里（明文、会进仓库）。**接手后第一件事**
    建议挪到不进仓库的 `.env`，见 §6 待办。
 
