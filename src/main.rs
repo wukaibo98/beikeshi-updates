@@ -34,6 +34,9 @@ pub struct Config {
     pub lan_base: String,
     pub public_base: String,
     pub channel: String,
+    /// 管理页显示时间用的时区偏移（分钟）。scratch 镜像里没有 tzdata，
+    /// `OffsetDateTime` 拿到的"本地时间"永远是 UTC，所以这里自己给一个偏移。
+    pub tz_offset_min: i32,
 }
 
 #[derive(Clone)]
@@ -60,30 +63,31 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// 版本清单。`client` 决定看哪条版本线，默认 python（旧客户端不带参数）。
+/// 版本清单。只服务新版客户端（`client=web`）。
+///
+/// 旧 Python 版已停发：不带 `client` 或带 `python` 一律 404。
+/// **不能把新版的清单发给它** —— 旧客户端的更新逻辑里没有 client 校验，
+/// 拿到清单就会把 `bkstools-*.exe` 当自己的新版下载下来替换掉自己。
 async fn latest(
     State(state): State<AppState>,
     Query(query): Query<ClientQuery>,
 ) -> Response {
-    let client = query
-        .client
-        .unwrap_or_else(|| "python".into())
-        .trim()
-        .to_lowercase();
+    let client = query.client.unwrap_or_default().trim().to_lowercase();
 
-    if !db::CLIENTS.contains(&client.as_str()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            no_store(),
-            Json(json!({ "error": format!("未知客户端：{client}") })),
-        )
+    if client != db::CLIENT {
+        let message = if client.is_empty() {
+            "旧版客户端已停止发布，请换用新版".to_string()
+        } else {
+            format!("未知客户端：{client}")
+        };
+        return (StatusCode::NOT_FOUND, no_store(), Json(json!({ "error": message })))
             .into_response();
     }
 
     let release = {
         let conn = state.conn.lock().unwrap();
         db::bump_checks(&conn);
-        db::current(&conn, &client).ok().flatten()
+        db::current(&conn).ok().flatten()
     };
 
     let Some(release) = release else {
@@ -224,6 +228,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .trim_end_matches('/')
             .to_string(),
         channel: env_or("CHANNEL", "stable"),
+        // 默认 +8 小时：这服务只在中国的 NAS 上跑；要改别的时区就设 TZ_OFFSET
+        tz_offset_min: env_or("TZ_OFFSET", "480").parse().unwrap_or(480),
     };
 
     if cfg.admin_token.is_empty() {

@@ -82,11 +82,6 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
   <div class="card">
     <h2>发布新版本</h2>
     <form method="post" action="/admin/upload" enctype="multipart/form-data">
-      <label>客户端（两条版本线互相独立）</label>
-      <select name="client">
-        <option value="web">网页版（C# + WebView2）</option>
-        <option value="python">Python 版（旧）</option>
-      </select>
       <label>版本号（形如 1.2.0）</label>
       <input type="text" name="version" placeholder="1.2.0" required>
       <label>更新说明（会显示在客户端，一句话）</label>
@@ -99,7 +94,7 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
   <div class="card">
     <h2>版本列表</h2>
     <table>
-      <tr><th>版本</th><th>客户端</th><th>大小</th><th>下载</th><th>发布时间</th><th>操作</th></tr>
+      <tr><th>版本</th><th>大小</th><th>下载</th><th>发布时间</th><th>操作</th></tr>
       %%ROWS%%
     </table>
   </div>
@@ -109,7 +104,7 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
       <tr><th>累计检查次数</th><td>%%CHECKS%%</td></tr>
       <tr><th>内网地址</th><td><code>%%LAN%%</code></td></tr>
       <tr><th>公网地址</th><td><code>%%PUBLIC%%</code></td></tr>
-      <tr><th>网页版清单</th><td><code>%%MANIFEST%%</code></td></tr>
+      <tr><th>客户端清单</th><td><code>%%MANIFEST%%</code></td></tr>
     </table>
   </div>
 </div></body></html>"##;
@@ -118,23 +113,26 @@ pub fn row(
     id: i64,
     version: &str,
     notes: &str,
-    client: &str,
+    legacy: bool,
     size: i64,
     downloads: i64,
     created_at: &str,
     is_current: bool,
 ) -> String {
-    let tag = if is_current {
+    // 旧版记录即使库里还留着 is_current=1（老库迁移来的），也不该显示"当前"——
+    // 它已经发不出去了，标个「当前」只会让人以为客户端还在收它
+    let tag = if is_current && !legacy {
         r#" <span class="tag">当前</span>"#
     } else {
         ""
     };
-    let client_tag = if client == "python" {
-        format!(r#"<span class="tag py">{}</span>"#, db_label(client))
+    // 库里还留着已停发的 Python 版历史记录：给个标记，但不再提供"发布"按钮
+    let legacy_tag = if legacy {
+        r#" <span class="tag py">旧版·已停发</span>"#
     } else {
-        format!(r#"<span class="tag">{}</span>"#, db_label(client))
+        ""
     };
-    let publish = if is_current {
+    let publish = if is_current || legacy {
         String::new()
     } else {
         format!(
@@ -142,8 +140,7 @@ pub fn row(
         )
     };
     format!(
-        r#"<tr><td><b>{version}</b>{tag}<br><span class="muted">{notes}</span></td>
-<td>{client_tag}</td>
+        r#"<tr><td><b>{version}</b>{tag}{legacy_tag}<br><span class="muted">{notes}</span></td>
 <td>{size:.2} MB</td>
 <td>{downloads}</td>
 <td>{created_at}</td>
@@ -151,8 +148,4 @@ pub fn row(
         notes = if notes.is_empty() { "—" } else { notes },
         size = size as f64 / 1024.0 / 1024.0,
     )
-}
-
-fn db_label(client: &str) -> &'static str {
-    crate::db::label(client)
 }

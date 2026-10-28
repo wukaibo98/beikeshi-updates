@@ -45,7 +45,7 @@ admin.rs  ── GET  /admin            页面渲染（未登录 → 登录页�
           ├─ POST /admin/upload    流式落盘 + sha256 + 入库
           ├─ POST /admin/publish/{id}  回滚
           └─ POST /admin/delete/{id}   删除
-db.rs     ── 两张表的全部 SQL；表结构与 Python 版兼容（多 client 列）
+db.rs     ── 两张表的全部 SQL；表结构与 Python 版兼容（client 列只标记旧记录）
 auth.rs   ── HMAC-SHA256 签名 Cookie；常数时间比较
 html.rs   ── 登录页 / 管理页模板（`%%占位%%`）
 ```
@@ -69,9 +69,9 @@ CREATE TABLE releases (
     notes      TEXT DEFAULT '',           -- 更新说明（会显示在客户端更新条）
     created_at INTEGER NOT NULL,          -- Unix 秒
     downloads  INTEGER DEFAULT 0,
-    is_current INTEGER DEFAULT 0,         -- 1 = 该 client 线上当前对外发布的版本
+    is_current INTEGER DEFAULT 0,         -- 1 = 当前对外发布的版本（只有一条线）
     package    TEXT DEFAULT 'portable',   -- installer / portable
-    client     TEXT DEFAULT 'python'      -- python / web
+    client     TEXT DEFAULT 'python'      -- 仅用于标记历史：'web' = 在发，其它 = 旧版已停发
 );
 
 CREATE TABLE checks (                     -- 单行表：客户端检查次数的累计
@@ -83,11 +83,13 @@ CREATE TABLE checks (                     -- 单行表：客户端检查次数�
 
 几条语义要记牢：
 
-- **`is_current` 是"每个 client 各有一行是 1"**，不是全表唯一。
-  所有更新它的 SQL 都必须带 `WHERE client = ?`（`insert_release` / `publish` / `delete` 三处）。
-  漏了这个条件 = 发布网页版会把 Python 版顶下线，老客服再也收不到更新。
-- **`filename` 由服务端拼**，不采信上传上来的名字；前缀按 client 分流：
-  `python → BeikeshiCS-<版本>.exe`，`web → bkstools-<版本>.exe`。
+- **只有一条版本线**：`db::CLIENT = "web"`。`is_current` 只对这条线有意义，
+  更新它的 SQL 仍带 `WHERE client = ?` —— 库里还有已停发的 `python` 老记录，
+  不加条件会把它们的历史标记一起清掉（图上不明显，回滚时才发现）。
+- **旧记录不能被切回当前**：`db::publish` 返回三态（`Published` / `NotFound` / `Legacy`），
+  命中旧版就直接拒。放开了会出现"当前版本指向一个谁也拿不到的线上"，
+  等于所有客户端停止收更新。
+- **`filename` 由服务端拼**，不采信上传上来的名字，固定 `bkstools-<版本>.exe`。
 - **老库升级靠两行 `ALTER TABLE ... ADD COLUMN`**（`package` / `client`），
   失败就说明列已存在，用 `let _ =` 忽略。**别删**，NAS 上那份库是旧版建的。
 - `journal_mode = WAL` + `synchronous = NORMAL`：读不挡写，二十个客服同时查更新不互相等；
@@ -95,15 +97,20 @@ CREATE TABLE checks (                     -- 单行表：客户端检查次数�
 
 ## 4. 接口实现细节
 
-### 4.1 `GET /latest.json?client=`
+### 4.1 `GET /latest.json?client=web`
 
 ```
-client 缺省 → "python"（旧客户端不传参数）
-client 不在 ["python","web"] → 400 {"error":"未知客户端：xx"}
-按 (is_current=1, client=?) 取一行；没有 → 404 {"error":"还没有发布任何版本"}
+client 缺省  → 404 {"error":"旧版客户端已停止发布，请换用新版"}
+client ≠ web → 404 {"error":"未知客户端：xx"}
+client = web → 按 (is_current=1, client='web') 取一行；没有 → 404 {"error":"还没有发布任何版本"}
 拼 windows_x64: {size, sha256, lan_url?, public_url?}
 响应头一律 Cache-Control: no-store
 ```
+
+**对旧客户端回 404 是刻意设计**，不是懒：旧 Python 客户端的更新逻辑里没有
+`client` 校验，一旦把新版的清单发给它，它会把 `bkstools-*.exe` 当自己的新版下载下来、
+替换掉自己（两个包都是 `.exe`，它分辨不出来）。404 让它在自己那边显示
+"服务器还没有发布版本"，安静地不更新，是最安全的结局。
 
 三个容易出事的点：
 
@@ -137,12 +144,12 @@ client 不在 ["python","web"] → 400 {"error":"未知客户端：xx"}
 multipart 逐字段读：
   version → 先校验格式（≥2 段，每段纯数字），不对立刻拒
   notes   → 原样存
-  client  → 小写，缺省 python
+  client  → 已废弃，收到也丢掉（老表单还带着这个字段）
   file    → 流式写到 packages/.upload-<时间戳>.tmp，边写边算 sha256
             超过 300MB 中止并删临时文件；0 字节拒绝
   → rename 到最终文件名（服务端拼）
   → detect_package() 判断 installer / portable
-  → insert_release()：同一 client 的旧 is_current 清 0，新记录置 1
+  → insert_release()：本线的旧 is_current 清 0，新记录置 1
   → 303 重定向回 /admin?ok=<百分号编码的中文消息>
   → 任何一步失败：删掉已落盘的文件，303 到 /admin?err=...
 ```
@@ -154,9 +161,9 @@ multipart 逐字段读：
 
 ### 4.4 `POST /admin/publish/{id}` / `delete/{id}`
 
-- publish：先 `UPDATE ... is_current=0 WHERE client=?`，再把自己置 1；
+- publish：先 `UPDATE ... is_current=0 WHERE client='web'`，再把自己置 1；命中旧版记录直接拒绝；
   这就是"回滚"——不需要额外的版本序列号。
-- delete：删记录 → 删文件 → 如果删的是当前版本，把**同 client** 最新的一条顶上来
+- delete：删记录 → 删文件 → 如果删的是当前版本，把**本线**最新的一条顶上来
   （`ORDER BY id DESC LIMIT 1`）。所以删掉最新版等于"回退到上一个版本"，
   但列表里那条记录还在（可以再切回来，前提是文件还在 —— 注意删记录会删文件，
   所以"再切回来"只对没删过的记录成立）。
@@ -175,6 +182,13 @@ multipart 逐字段读：
 - `secret.key` 在 `DATA_DIR` 里，首次启动随机生成；删了 = 所有人重新登录。
 - `SameSite=Lax` 而不是 `Strict`：管理员从别处点链接跳过来时还能保持登录。
 - 口令比较是常数时间（`constant_time_eq`），避免按响应时间猜口令。
+
+## 4.6 页面上的时间
+
+库里存 Unix 秒（UTC）。scratch 镜像里没有 tzdata，`OffsetDateTime` 的"本地时间"
+永远是 UTC，直接显示会差 8 小时（刚发的版本看着像早上 7 点发的）。
+所以管理页显示时间时自己加偏移：`TZ_OFFSET`（分钟，默认 480 = 北京时间），
+见 `admin.rs::short_time`。清单里的 `published_at` 仍然输出标准 RFC3339 UTC，不动。
 
 ## 5. 管理页模板
 
@@ -281,41 +295,46 @@ target/release/bks-updates &
 H=http://127.0.0.1:18080
 
 curl -s $H/health                                   # ok
-curl -s -w " %{http_code}\n" $H/latest.json          # 404 {"error":"还没有发布任何版本"}
-curl -s -w " %{http_code}\n" "$H/latest.json?client=xx"   # 400 未知客户端
+curl -s -w " %{http_code}\n" $H/latest.json                 # 404 旧版客户端已停止发布
+curl -s -w " %{http_code}\n" "$H/latest.json?client=python"  # 404 未知客户端：python
+curl -s -w " %{http_code}\n" "$H/latest.json?client=web"     # 404 还没有发布任何版本（空库）
 
 curl -s -o /dev/null -w "%{http_code}\n" -X POST -d token=wrong $H/admin/login   # 401
 curl -s -c jar -o /dev/null -w "%{http_code}\n" -X POST -d token=test123 $H/admin/login  # 303
 
-# 上传（client=web 的话包名会是 bkstools-<版本>.exe）
+# 上传（包名固定 bkstools-<版本>.exe）
 curl -s -b jar -o /dev/null -w "%{redirect_url}\n" -X POST \
-  -F client=web -F version=0.2.0 -F "notes=测试" -F file=@fake.exe $H/admin/upload
+  -F version=0.2.0 -F "notes=测试" -F file=@fake.exe $H/admin/upload
 
 curl -s "$H/latest.json?client=web" | python3 -m json.tool    # 看 size/sha256/两个 url
-curl -s "$H/latest.json"            # python 线应该还是 404（两条线互不影响）
+curl -s "$H/latest.json"            # 仍是 404：旧客户端拿不到新版清单
 curl -s -o got.exe "$H/packages/bkstools-0.2.0.exe" && shasum -a 256 got.exe fake.exe
 
 curl -s -o /dev/null -w "%{http_code}\n" "$H/packages/..%2F..%2Fsecret.key"  # 400
 curl -s -o /dev/null -w "%{http_code}\n" "$H/packages/secret.key"            # 404
 
-curl -s -b jar $H/admin | grep -c "当前"        # 两条线各一个"当前"
+curl -s -b jar $H/admin | grep -c 'name="client"'   # 0：客户端下拉已经删掉
+curl -s -b jar $H/admin | grep -c "当前"            # 1：只有一条线，只有一个"当前"
 ```
 
 清单（2026-10-28 实测全部通过）：
 
 - [x] `/health` → 200 `ok`
-- [x] 未发版 `/latest.json` → 404 + `error` 字段
-- [x] 未知 client → 400
+- [x] 未发版 `/latest.json?client=web` → 404 + `error` 字段
+- [x] 不带参数 / `client=python` → 404（旧客户端拿不到新版清单，不会误替换自己）
 - [x] 错口令 → 401；对口令 → 303 + `bks_admin` Cookie
-- [x] 上传 → 303 `已发布 网页版 v0.2.0（0.20 MB，安装包）`（假文件里放了 Inno 标记，判对了）
+- [x] 上传（不带 client 字段）→ 303 `已发布 v0.2.0（0.03 MB，程序）`
 - [x] 清单字段完整；`lan_url` / `public_url` 按 `LAN_BASE` / `PUBLIC_BASE` 拼对
 - [x] 下载内容 sha256 与上传文件一致（`sort -u` 后只剩一个 hash）
 - [x] 路径穿越：编码的 `../` → 400；白名单内但不存在的名字 → 404
-- [x] 上传 python 线 1.1.2 后，两条线各自返回自己的当前版本
-- [x] `publish/1` 把 web 切回 0.2.0，python 线不受影响
-- [x] `delete` 当前版本后，同 client 最新一条（0.3.0）自动顶上，被删的文件从磁盘消失
+- [x] 管理页没有客户端下拉、没有「两条版本线」提示，表头是 版本/大小/下载/发布时间/操作
+- [x] 手工往库里插一条 `client='python', is_current=1` 的老记录：清单仍返回 0.2.0；
+      管理页给它打「旧版·已停发」且不显示"当前"、没有"发布"按钮；
+      `POST /admin/publish/<它>` → `v1.1.2 是已停发的旧版客户端记录，不能切回`
+- [x] `delete` 当前版本后，本线最新一条自动顶上，被删的文件从磁盘消失
+- [x] 管理页时间按 `TZ_OFFSET`（默认 +480）显示，15:20 的版本不会再显示成 07:20
 - [x] `--version` 输出 `bks-updates 0.1.0`；`BIND=... --health` 退出码 0
-- [x] `cargo build --release` 0 warning
+- [x] `cargo build --release` 0 warning；`docker build` 出的镜像在容器里复验一遍同样通过
 
 ## 10. 踩过的坑（改这里前必读）
 
@@ -323,7 +342,8 @@ curl -s -b jar $H/admin | grep -c "当前"        # 两条线各一个"当前"
 |---|---|
 | 404 ≠ 故障 | 没发版时 `/latest.json` 返回 404 是给客户端**语义化**用的。并进通用异常后，客户端会报"内外网都连不上"，排查方向全错 |
 | `format!` 渲染 HTML | 页面里满是 CSS 花括号，会当占位符解析 → 500。统一 `%%占位%%` + `replace` |
-| `is_current` 更新漏 client 条件 | 发布一条线会把另一条线顶下线，客户端从此收不到更新 |
+| `is_current` 更新漏 client 条件 | 库里还有旧版记录，不加条件会把它们的历史标记也清掉，回滚时才发现 |
+| 把清单发给旧客户端 | 旧 Python 客户端没有 `client` 校验，会拿新版 exe 把自己替换掉 —— 所以缺参数一律 404 |
 | `ALTER TABLE` 那段别删 | NAS 上的库是旧版建的，靠它补列 |
 | Location 头塞中文 | 只能 ASCII；跳转消息一律百分号编码（`admin.rs::encode`） |
 | 上传失败不删文件 | `packages/` 会攒孤儿文件，且 `/packages/{name}` 还能下到它们（虽然清单里没有） |

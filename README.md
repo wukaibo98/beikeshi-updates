@@ -36,21 +36,25 @@ GET /admin                       # 管理页：上传 / 发布 / 回滚 / 删除
 
 接口、环境变量、镜像名、数据库表结构**全部保持兼容**，NAS 上原地替换即可。
 
-## 最重要的一件事：两条版本线
+## 只服务新版客户端
 
-客户端分两种，它们的版本**完全独立**，靠清单里的 `client` 字段区分：
+**旧 Python 版已停发**，服务端只有一条版本线：
 
 ```
-GET /latest.json               → Python 版（旧客户端，不传参数，默认就是它）
-GET /latest.json?client=web    → 网页版（C# + WebView2 客户端）
+GET /latest.json?client=web    → 正常返回清单
+GET /latest.json               → 404「旧版客户端已停止发布，请换用新版」
+GET /latest.json?client=python → 404「未知客户端：python」
 ```
 
-不分开会出大事：网页版客户端看到 Python 版的清单，会把 Python 的 exe 当成"新版本"
-下载下来覆盖自己 —— 两个包都是 `.exe`，客户端光看文件辨不出来。所以：
+为什么对旧客户端回 404 而不是把新版的清单发给它：**旧客户端的更新逻辑里没有
+`client` 校验**，拿到清单就会把 `bkstools-*.exe` 当成自己的新版下载下来、
+替换掉自己。所以宁可让它显示"服务器还没有发布版本"（它就会安静地不更新），
+也不要把新版的包喂给一个已经不维护的程序。
 
-- 服务端按 client 分别维护"当前版本"，发布网页版**不会**顶掉 Python 版；
-- 客户端还会自己校验清单里的 `client` 是否等于期望值，不等就拒绝安装（双保险）；
-- 包文件名带前缀：`BeikeshiCS-1.1.2.exe`（Python 版）/ `bkstools-0.2.0.exe`（网页版）。
+- 上传统一按一条线走，文件名固定 `bkstools-<版本>.exe`（不再有 `BeikeshiCS-` 前缀）；
+- 清单里的 `client` 字段仍然是 `web`，新版客户端会校验它（对不上就拒绝安装，双保险）；
+- 库里还留着已停发的 Python 版历史记录，管理页给它们打「旧版·已停发」标记：
+  不能切回、也不占"当前版本"的位置，只供查历史 / 删掉。
 
 ## 接口
 
@@ -59,7 +63,7 @@ GET /latest.json?client=web    → 网页版（C# + WebView2 客户端）
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 探活，返回 `ok` |
-| GET | `/latest.json?client=` | 版本清单，**每次现生成**（发布/回滚后立刻生效） |
+| GET | `/latest.json?client=web` | 版本清单，**每次现生成**（发布/回滚后立刻生效）；其它取值一律 404 |
 | GET | `/packages/{filename}` | 下载程序包，顺带给该版本累加下载计数 |
 
 清单格式（客户端只认这个）：
@@ -95,7 +99,7 @@ GET /latest.json?client=web    → 网页版（C# + WebView2 客户端）
 | GET | `/admin` | 管理页；未登录时显示登录页 |
 | POST | `/admin/login` | 表单 `token=...`，对就发 7 天有效的签名 Cookie；错返回 401 |
 | POST | `/admin/logout` | 退出 |
-| POST | `/admin/upload` | multipart：`client` / `version` / `notes` / `file`，**上传即发布** |
+| POST | `/admin/upload` | multipart：`version` / `notes` / `file`，**上传即发布** |
 | POST | `/admin/publish/{id}` | 把某个历史版本切回"当前"（回滚） |
 | POST | `/admin/delete/{id}` | 删除版本（连文件一起删；删的若是当前版本，自动把同客户端最新的一条顶上来） |
 
@@ -112,6 +116,7 @@ GET /latest.json?client=web    → 网页版（C# + WebView2 客户端）
 | `LAN_BASE` | 空 | 内网访问前缀，用来拼 `lan_url` |
 | `PUBLIC_BASE` | 空 | 公网访问前缀，用来拼 `public_url` |
 | `CHANNEL` | `stable` | 写进清单的 `channel` 字段 |
+| `TZ_OFFSET` | `480` | 管理页显示时间用的时区偏移（分钟）。默认 +8 小时；scratch 镜像没有 tzdata，只能靠它 |
 
 ## 部署
 
@@ -142,10 +147,10 @@ environment:
 ### 数据迁移（从 Python 版换过来）
 
 **直接沿用原来的 `data/` 目录就行。** 启动时会自动给 `releases` 表补上 `client` 列，
-历史记录全部归到 `python` 线，老客户端继续能更新，什么都不用做。
+老记录全部落成 `python` 线，在管理页里显示为「旧版·已停发」，不会被当成当前版本。
 
-这个路径实测过：旧库里有 Python 版 v1.1.2，换成本服务启动后 `/latest.json` 正常返回
-1.1.2，`/latest.json?client=web` 返回 404（网页版还没发过）—— 两条线互不影响。
+实测过：旧库里有 Python 版 v1.1.2，换成本服务启动后 `/latest.json?client=web` 返回 404
+（新版还没发过），`/latest.json` 返回「旧版客户端已停止发布」—— 老记录不会漏给新版客户端。
 
 ### 备份
 
@@ -160,7 +165,7 @@ data/packages/      程序包（丢了客户端下载会 404，但清单还在�
 ## 日常发版流程
 
 1. 打开 `http://<NAS>:50205/admin`，口令登录；
-2. 选客户端（Python 版 / 网页版）、填版本号（形如 `0.2.0`）、写更新说明、选文件，提交；
+2. 填版本号（形如 `0.2.0`）、写更新说明、选文件，提交（不再选客户端，只有一条线）；
    - 版本号格式不对会被拒绝；
    - 文件超过 300MB 会被拒绝；
    - 程序包的文件名由服务端拼（`bkstools-<版本>.exe`），不采信上传的文件名；
@@ -225,7 +230,7 @@ docker exec bks-local /bks-updates --health; echo $?    # 0
 src/
 ├─ main.rs    配置、路由、清单生成、下载、健康检查
 ├─ admin.rs   管理页、登录、上传、发布、删除
-├─ db.rs      SQLite 存取（表结构与 Python 版兼容，多了 client 列）
+├─ db.rs      SQLite 存取（表结构与 Python 版兼容，client 列只用于标记旧记录）
 ├─ auth.rs    口令校验与 Cookie 签名
 └─ html.rs    管理页 / 登录页模板
 Dockerfile                     多阶段构建 → scratch，镜像里只有一个二进制

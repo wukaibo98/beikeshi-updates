@@ -1,20 +1,17 @@
 //! SQLite 存取层。
 //!
-//! 表结构跟原 Python 版逐字兼容（多了 `client` 列），所以 NAS 上那份现成的
+//! 表结构跟原 Python 版逐字兼容（`client` 列还在），所以 NAS 上那份现成的
 //! updates.db 可以直接拿来用 —— 迁移只加列，不动数据。
+//!
+//! **现在只有一条版本线**：旧 Python 版已停发，新的上传、发布、清单都固定用
+//! `CLIENT`。`client` 列留着只为给历史记录打「旧版」标记，以及对旧库做兼容。
 
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-pub const CLIENTS: [&str; 2] = ["python", "web"];
-
-pub fn label(client: &str) -> &'static str {
-    match client {
-        "web" => "网页版",
-        _ => "Python 版",
-    }
-}
+/// 唯一在发布的客户端标识。清单里的 `client` 字段也是它。
+pub const CLIENT: &str = "web";
 
 #[derive(Debug, Clone)]
 pub struct Release {
@@ -95,11 +92,11 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// 某个客户端当前发布的版本。
-pub fn current(conn: &Connection, client: &str) -> rusqlite::Result<Option<Release>> {
+/// 当前对外发布的版本（只有一条线）。
+pub fn current(conn: &Connection) -> rusqlite::Result<Option<Release>> {
     conn.query_row(
         "SELECT * FROM releases WHERE is_current = 1 AND client = ? ORDER BY id DESC LIMIT 1",
-        params![client],
+        params![CLIENT],
         Release::from_row,
     )
     .optional()
@@ -116,10 +113,10 @@ pub fn find(conn: &Connection, id: i64) -> rusqlite::Result<Option<Release>> {
         .optional()
 }
 
-/// 插入新版本，并把**同一客户端**的旧版本取消"当前"标记。
+/// 插入新版本，并把本线的旧版本取消"当前"标记。
 ///
-/// 这里必须按 client 收窄：两条版本线互不干扰，发布网页版不该把
-/// Python 版的当前版本顶掉。
+/// 条件里仍然带 `client = CLIENT`：库里还留着已停发的 Python 版历史记录，
+/// 不加这个条件会把它们的历史标记一起清掉（图上看不出来，回滚时会踩）。
 pub fn insert_release(
     conn: &Connection,
     version: &str,
@@ -128,37 +125,44 @@ pub fn insert_release(
     sha256: &str,
     notes: &str,
     package: &str,
-    client: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute("UPDATE releases SET is_current = 0 WHERE client = ?", params![client])?;
+    conn.execute(
+        "UPDATE releases SET is_current = 0 WHERE client = ?",
+        params![CLIENT],
+    )?;
     conn.execute(
         "INSERT INTO releases (version, filename, size, sha256, notes, created_at, downloads, is_current, package, client)
          VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)",
-        params![
-            version,
-            filename,
-            size,
-            sha256,
-            notes,
-            now(),
-            package,
-            client
-        ],
+        params![version, filename, size, sha256, notes, now(), package, CLIENT],
     )?;
     Ok(())
 }
 
-pub fn publish(conn: &Connection, id: i64) -> rusqlite::Result<Option<Release>> {
-    let Some(rel) = find(conn, id)? else { return Ok(None) };
-    conn.execute(
-        "UPDATE releases SET is_current = 0 WHERE client = ?",
-        params![rel.client],
-    )?;
-    conn.execute("UPDATE releases SET is_current = 1 WHERE id = ?", params![id])?;
-    Ok(Some(rel))
+/// 发布/回滚的结果。分成「成功」「没这条」「这条是已停发的旧版」三种：
+/// 旧版记录不能被切回当前，否则会把新版顶下线、而新版又只能从 web 线取，
+/// 结果就是所有人收不到更新。
+pub enum PublishResult {
+    Published(Release),
+    NotFound,
+    Legacy(Release),
 }
 
-/// 删除一条记录；如果删的正好是"当前版本"，把同客户端最新的一条提上来。
+pub fn publish(conn: &Connection, id: i64) -> rusqlite::Result<PublishResult> {
+    let Some(rel) = find(conn, id)? else {
+        return Ok(PublishResult::NotFound);
+    };
+    if rel.client != CLIENT {
+        return Ok(PublishResult::Legacy(rel));
+    }
+    conn.execute(
+        "UPDATE releases SET is_current = 0 WHERE client = ?",
+        params![CLIENT],
+    )?;
+    conn.execute("UPDATE releases SET is_current = 1 WHERE id = ?", params![id])?;
+    Ok(PublishResult::Published(rel))
+}
+
+/// 删除一条记录；如果删的正好是"当前版本"，把本线最新的一条提上来。
 pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<Option<Release>> {
     let Some(rel) = find(conn, id)? else { return Ok(None) };
     conn.execute("DELETE FROM releases WHERE id = ?", params![id])?;
@@ -166,7 +170,7 @@ pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<Option<Release>> {
         let fallback: Option<i64> = conn
             .query_row(
                 "SELECT id FROM releases WHERE client = ? ORDER BY id DESC LIMIT 1",
-                params![rel.client],
+                params![CLIENT],
                 |r| r.get(0),
             )
             .optional()?;

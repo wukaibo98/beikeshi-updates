@@ -30,8 +30,7 @@ pub async fn page(
     let (rows, subtitle, checks) = {
         let conn = state.conn.lock().unwrap();
         let releases = db::list_all(&conn).unwrap_or_default();
-        let py = db::current(&conn, "python").ok().flatten();
-        let web = db::current(&conn, "web").ok().flatten();
+        let now = db::current(&conn).ok().flatten();
         let (count, last_at) = db::checks_info(&conn);
 
         let rows: String = releases
@@ -41,36 +40,28 @@ pub async fn page(
                     r.id,
                     &r.version,
                     &r.notes,
-                    &r.client,
+                    r.client != db::CLIENT, // legacy：已停发的旧版记录
                     r.size,
                     r.downloads,
-                    &short_time(r.created_at),
+                    &short_time(r.created_at, state.cfg.tz_offset_min),
                     r.is_current,
                 )
             })
             .collect::<Vec<_>>()
             .join("");
         let rows = if rows.is_empty() {
-            r#"<tr><td colspan="6" class="muted">暂无版本</td></tr>"#.to_string()
+            r#"<tr><td colspan="5" class="muted">暂无版本</td></tr>"#.to_string()
         } else {
             rows
         };
 
-        let mut parts = Vec::new();
-        if let Some(r) = py {
-            parts.push(format!("Python 版 v{}", r.version));
-        }
-        if let Some(r) = web {
-            parts.push(format!("网页版 v{}", r.version));
-        }
-        let subtitle = if parts.is_empty() {
-            "还没有发布任何版本".to_string()
-        } else {
-            parts.join(" · ")
+        let subtitle = match now {
+            Some(r) => format!("当前发布 v{}（{} 个版本在册）", r.version, releases.len()),
+            None => "还没有发布任何版本".to_string(),
         };
 
         let checks = if last_at > 0 {
-            format!("{count} 次 · 最近 {}", short_time(last_at))
+            format!("{count} 次 · 最近 {}", short_time(last_at, state.cfg.tz_offset_min))
         } else {
             format!("{count} 次")
         };
@@ -158,7 +149,6 @@ pub async fn upload(
 
     let mut version = String::new();
     let mut notes = String::new();
-    let mut client = String::from("python");
     let mut saved: Option<(String, i64, String)> = None;
     let mut error: Option<String> = None;
 
@@ -175,13 +165,7 @@ pub async fn upload(
         match field.name().unwrap_or("") {
             "version" => version = field.text().await.unwrap_or_default().trim().to_string(),
             "notes" => notes = field.text().await.unwrap_or_default().trim().to_string(),
-            "client" => {
-                client = field.text().await.unwrap_or_default().trim().to_lowercase();
-                if client.is_empty() {
-                    client = "python".into();
-                }
-            }
-            "file" => match save_upload(&state, field, &version, &client).await {
+            "file" => match save_upload(&state, field, &version).await {
                 Ok(info) => saved = Some(info),
                 Err(msg) => {
                     error = Some(msg);
@@ -189,6 +173,7 @@ pub async fn upload(
                 }
             },
             _ => {
+                // 老表单还会带 client 字段，直接丢掉：现在只有一条版本线
                 let _ = field.bytes().await;
             }
         }
@@ -210,9 +195,7 @@ pub async fn upload(
 
     let result = {
         let conn = state.conn.lock().unwrap();
-        db::insert_release(
-            &conn, &version, &filename, size, &sha, &notes, &package, &client,
-        )
+        db::insert_release(&conn, &version, &filename, size, &sha, &notes, &package)
     };
 
     if let Err(e) = result {
@@ -222,28 +205,25 @@ pub async fn upload(
 
     let kind = if package == "installer" { "安装包" } else { "程序" };
     redirect_ok(&format!(
-        "已发布 {} v{}（{:.2} MB，{}）",
-        db::label(&client),
+        "已发布 v{}（{:.2} MB，{}）",
         version,
         size as f64 / 1024.0 / 1024.0,
         kind
     ))
 }
 
-/// 流式落盘 + 边写边算 sha256。文件名按客户端和版本生成，不用原始文件名
+/// 流式落盘 + 边写边算 sha256。文件名按版本生成，不用原始文件名
 /// （避免中文、空格和奇怪字符带来的麻烦）。
 async fn save_upload(
     state: &AppState,
     mut field: axum::extract::multipart::Field<'_>,
     version: &str,
-    client: &str,
 ) -> Result<(String, i64, String), String> {
     if version.is_empty() || !valid_version(version) {
         return Err("版本号格式不对，应形如 1.2.0".into());
     }
 
-    let prefix = if client == "python" { "BeikeshiCS" } else { "bkstools" };
-    let filename = format!("{prefix}-{version}.exe");
+    let filename = format!("bkstools-{version}.exe");
     let temp = state.cfg.pkg_dir.join(format!(".upload-{}.tmp", db::now()));
     let mut file = tokio::fs::File::create(&temp)
         .await
@@ -299,8 +279,12 @@ pub async fn publish(
     };
 
     match result {
-        Ok(Some(r)) => redirect_ok(&format!("已切回 {} v{}", db::label(&r.client), r.version)),
-        Ok(None) => redirect_err("没有这个版本"),
+        Ok(db::PublishResult::Published(r)) => redirect_ok(&format!("已切回 v{}", r.version)),
+        Ok(db::PublishResult::Legacy(r)) => redirect_err(&format!(
+            "v{} 是已停发的旧版客户端记录，不能切回",
+            r.version
+        )),
+        Ok(db::PublishResult::NotFound) => redirect_err("没有这个版本"),
         Err(e) => redirect_err(&format!("操作失败：{e}")),
     }
 }
@@ -374,15 +358,23 @@ fn encode(text: &str) -> String {
     out
 }
 
-fn short_time(ts: i64) -> String {
+/// 页面上显示的时间。库里存的是 Unix 秒（UTC），这里按 `tz_offset_min` 换成当地时间 ——
+/// scratch 镜像里没有 tzdata，`OffsetDateTime` 的"本地时间"永远是 UTC，
+/// 直接显示会差 8 小时（"刚发布的版本"看着像早上 7 点发的）。
+fn short_time(ts: i64, tz_offset_min: i32) -> String {
+    let offset = time::UtcOffset::from_whole_seconds(tz_offset_min.saturating_mul(60))
+        .unwrap_or(time::UtcOffset::UTC);
     match time::OffsetDateTime::from_unix_timestamp(ts) {
-        Ok(t) => format!(
-            "{:02}-{:02} {:02}:{:02}",
-            t.month() as u8,
-            t.day(),
-            t.hour(),
-            t.minute()
-        ),
+        Ok(t) => {
+            let t = t.to_offset(offset);
+            format!(
+                "{:02}-{:02} {:02}:{:02}",
+                t.month() as u8,
+                t.day(),
+                t.hour(),
+                t.minute()
+            )
+        }
         Err(_) => "—".into(),
     }
 }
