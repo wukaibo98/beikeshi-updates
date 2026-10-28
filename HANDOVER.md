@@ -210,8 +210,9 @@ NAS（飞牛 OS）
 
 ### 6.3 P1 — 安全与备份
 
-- [ ] `ADMIN_TOKEN` 挪出 compose：加 `.env`（`.gitignore` 已排除），compose 用
-      `ADMIN_TOKEN: ${ADMIN_TOKEN}`；已泄露过的口令要换掉；
+- [x] `ADMIN_TOKEN` 已挪出 compose（2026-10-28）：改成 `${ADMIN_TOKEN:?...}` + `.env.example`，
+      `.env` 在 `.gitignore` 里；本机用这套 compose 起过一整套（拉镜像 → healthy → 上传 → 读清单）验证通过。
+      **NAS 上那份旧 compose 里的明文口令要顺手改掉**；
 - [ ] NAS 上给 `data/` 加定时备份（`updates.db` + `secret.key` + `packages/` 三样就够）；
 - [ ] 考虑在 Lucky 上给 `/admin` 加 IP 白名单或 basic auth（登录接口现在没有频率限制）。
 

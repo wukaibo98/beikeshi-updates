@@ -115,23 +115,29 @@ GET /latest.json?client=web    → 网页版（C# + WebView2 客户端）
 
 ## 部署
 
+把 `docker-compose.yml` + `.env.example` 放到 NAS 上同一个目录（例如 `docker/bks-updates/`），然后：
+
 ```bash
-docker compose pull && docker compose up -d
+cp .env.example .env      # 1. 填口令
+vi .env                   #    ADMIN_TOKEN=一个长口令
+docker compose pull       # 2. 拉镜像（公开包，不用 docker login）
+docker compose up -d      # 3. 起服务
+docker compose ps         #    等 Status 从 (health: starting) 变成 (healthy)
 ```
 
 `docker-compose.yml` 里已经写好端口映射（`50205:8080`）、卷（`./data:/data`）、
-两个地址前缀和健康检查，镜像名跟 Python 版保持一致，所以 NAS 上**不用改任何东西**。
+两个地址前缀、健康检查和日志上限，镜像名跟 Python 版保持一致，**别的地方都不用改**。
 
-首次部署前只改一处：把 `ADMIN_TOKEN` 换成自己的口令。
+口令走 `.env`（已在 `.gitignore` 里），不写进 compose —— compose 是要进仓库的。
+没建 `.env` 时 `docker compose` 会直接报
+`required variable ADMIN_TOKEN is missing a value`，不会稀里糊涂起一个登不进管理页的服务：
 
 ```yaml
 environment:
-  ADMIN_TOKEN: "换成一个你自己记得住的口令"
+  ADMIN_TOKEN: "${ADMIN_TOKEN:?请在 .env 里设置 ADMIN_TOKEN}"
 ```
 
-> 口令以明文出现在 compose 文件里，而 compose 是进仓库的。更稳妥的做法是
-> 新建一个**不进仓库**的 `.env`（`.gitignore` 已排除），compose 里写
-> `ADMIN_TOKEN: ${ADMIN_TOKEN}`。
+> 之前的口令曾经明文写在 compose 里、也跟着进了仓库，**换成这套之后记得把旧口令改掉**。
 
 ### 数据迁移（从 Python 版换过来）
 
