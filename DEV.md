@@ -2,7 +2,7 @@
 
 > 面向改这个服务的人。部署与日常发版见 [README.md](README.md)，交接要点与待办见 [HANDOVER.md](HANDOVER.md)。
 
-**服务端 v0.1.0 ｜ Rust 1.75+ / axum 0.8 / rusqlite(bundled) / tokio ｜ 静态二进制 → scratch 镜像**
+**服务端 v0.2.0 ｜ Rust 1.75+ / axum 0.8 / rusqlite(bundled) / tokio ｜ 静态二进制 → scratch 镜像**
 **代码 1172 行（main 327 / admin 389 / db 206 / html 159 / auth 91）**
 
 ---
@@ -45,9 +45,14 @@ admin.rs  ── GET  /admin            页面渲染（未登录 → 登录页�
           ├─ POST /admin/upload    流式落盘 + sha256 + 入库
           ├─ POST /admin/publish/{id}  回滚
           └─ POST /admin/delete/{id}   删除
-db.rs     ── 两张表的全部 SQL；表结构与 Python 版兼容（client 列只标记旧记录）
-auth.rs   ── HMAC-SHA256 签名 Cookie；常数时间比较
-html.rs   ── 登录页 / 管理页模板（`%%占位%%`）
+db.rs     ── 全部 SQL；表结构与 Python 版兼容（client 列只标记旧记录）
+auth.rs   ── HMAC-SHA256 签名：管理 Cookie / 表单 token / 编辑 token
+forms.rs  ── schema 校验、姓名登录、模板存取（乐观锁）、提交（幂等+复验）
+          ├─ GET  /admin/forms            表单管理页（提交/模板/名单三块）
+          └─ GET  /admin/forms/export.xlsx 导出（一次只导一个模板）
+xlsx.rs   ── rust_xlsxwriter：列并集 → 数字列 → sheet 名清洗
+html.rs   ── 登录页 / 分发页 / 表单页模板（`%%占位%%`）
+tests.rs  ── `cargo test`：幂等、快照冻结、乐观锁、白名单、导出列
 ```
 
 数据流很短，没有 service 层也没有 repository 抽象 —— 这个规模不需要：
@@ -94,6 +99,31 @@ CREATE TABLE checks (                     -- 单行表：客户端检查次数�
   失败就说明列已存在，用 `let _ =` 忽略。**别删**，NAS 上那份库是旧版建的。
 - `journal_mode = WAL` + `synchronous = NORMAL`：读不挡写，二十个客服同时查更新不互相等；
   断电最多丢最后几条计数，版本记录本身不会坏。
+
+### 3.1 表单的四张表（v0.2 起）
+
+```sql
+form_users (id, name UNIQUE, enabled, created_at)      -- 姓名白名单，登录只查"在不在"
+form_templates (id, name UNIQUE, version, is_active, sort_order, updated_at)
+form_template_versions (template_id, version, schema_json, created_at)  -- 每个版本的字段定义
+form_submissions (id, submission_id UNIQUE, template_id, template_version,
+                  template_snapshot, user_id, user_name, data_json,
+                  client_time, created_at, client_id)
+```
+
+关键语义：
+
+- **`template_snapshot` 是提交那一刻的字段定义，冻结不动。**
+  模板一改，历史提交的列就变了；导出按每条提交自带的快照取列，永不串行。
+  配套：`form_template_versions` 保存**每个版本**的定义，旧的也能取回来。
+- **`submission_id UNIQUE` + `ON CONFLICT DO NOTHING`** 是幂等的命根子。
+  客户端生成一次，所有重试用同一个；服务端返回 `duplicate` 也算成功
+  （客户端只有看到成功才会清队列，网络超时其实已入库时重试不会产生第二条）。
+- **`client_time` 和 `created_at` 分开**：离线补交的单子可能几小时后才到，
+  报表一律按"客服填的时间"排，服务器收到的时间只用于排查。
+- **`user_name` 冗余存一份**：改名/删人后历史记录还认得出是谁填的。
+- 四张表都在启动时的 `init_forms()` 里 `CREATE TABLE IF NOT EXISTS`，
+  NAS 上那份老库原地加表，不用迁移脚本。
 
 ## 4. 接口实现细节
 
@@ -189,6 +219,31 @@ multipart 逐字段读：
 永远是 UTC，直接显示会差 8 小时（刚发的版本看着像早上 7 点发的）。
 所以管理页显示时间时自己加偏移：`TZ_OFFSET`（分钟，默认 480 = 北京时间），
 见 `admin.rs::short_time`。清单里的 `published_at` 仍然输出标准 RFC3339 UTC，不动。
+
+### 4.7 表单：为什么是"服务端不信任客户端"
+
+模板在客户端编辑，所以服务端收到的每一份 schema 都可能是旧的、坏的、或者被人手改过的。
+四条防线：
+
+1. `validate_schema()`：字段数 ≤30、key 唯一且只含 `[a-z0-9_]`、类型在 5 种之内、
+   `select` 必须给 ≥2 个选项、label 非空。不通过返回 **422**，直接显示在客户端编辑器里。
+2. `validate_data()`：提交时按 `template_version` 取回**当时的**定义再验一遍。
+   必填、数字、日期格式、下拉值必须在选项里，逐字段返回错误。
+3. `base_version` 乐观锁：保存时带上自己看到的版本号，对不上返回 **409 且不改库**。
+   两人同时改同一个模板，后一个不会静默覆盖前一个。
+4. `edit_token`：改模板要先用管理口令换一次（7 天）。口令只在服务端比对，
+   **不落盘、不写进 exe**。没有它，任何人拿到客户端就能改所有人的模板。
+
+### 4.8 导出 xlsx 的两条规矩
+
+1. **一次只导一个模板。** 跨模板并排导，列会稀疏得没法看 —— 所以没选模板直接
+   重定向回页面并提示。
+2. **列 = 该批提交所有版本快照的并集**（按首次出现顺序）+ 提交人/填写时间/接收时间。
+   同一模板改过版时，老记录没有的新列留空，**绝不能按位置填**（那是串列的根源）。
+
+数字列整列都是数字时写成数字单元格（Excel 里能直接求和）；文本一律左对齐；
+sheet 名过 31 字符要截断，并清掉 `[]:*?/\` 这些 xlsx 禁用的字符。
+依赖 `rust_xlsxwriter`（纯 Rust，能静态编进 musl，镜像从 3.66MB 涨到约 4.4MB）。
 
 ## 5. 管理页模板
 
@@ -333,8 +388,52 @@ curl -s -b jar $H/admin | grep -c "当前"            # 1：只有一条线，�
       `POST /admin/publish/<它>` → `v1.1.2 是已停发的旧版客户端记录，不能切回`
 - [x] `delete` 当前版本后，本线最新一条自动顶上，被删的文件从磁盘消失
 - [x] 管理页时间按 `TZ_OFFSET`（默认 +480）显示，15:20 的版本不会再显示成 07:20
-- [x] `--version` 输出 `bks-updates 0.1.0`；`BIND=... --health` 退出码 0
+- [x] `--version` 输出 `bks-updates 0.2.0`；`BIND=... --health` 退出码 0
 - [x] `cargo build --release` 0 warning；`docker build` 出的镜像在容器里复验一遍同样通过
+
+### 9.1 表单的 curl 冒烟
+
+```bash
+curl -s -c jar -o /dev/null -X POST -d token=<ADMIN_TOKEN> $H/admin/login
+
+# 名单
+curl -s -b jar -o /dev/null -X POST -d "name=张三" $H/admin/users/save
+curl -s -X POST -H "content-type: application/json" -d '{"name":"查无此人"}' $H/form/login
+#   → 403 {"error":"姓名不在名单里，请联系管理员"}
+TOK=$(curl -s -X POST -H "content-type: application/json" -d '{"name":"张三"}' $H/form/login \
+      | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+ET=$(curl -s -X POST -H "content-type: application/json" -d '{"token":"<ADMIN_TOKEN>"}' \
+     $H/form/edit-login | python3 -c "import json,sys; print(json.load(sys.stdin)['edit_token'])")
+
+# 模板：无 edit_token → 403；坏 schema → 422；同 base_version 存两次 → 第二次 409
+curl -s -X POST -H "content-type: application/json" -H "x-bks-edit: $ET" \
+  -d '{"name":"补发申请","schema":{"fields":[{"key":"a","label":"A","type":"text","required":true}]}}' \
+  $H/form/template/save                       # {"id":1,"version":1}
+
+# 提交：created → duplicate → 必填缺失 422 → 下拉值非法 422
+SID=aaaaaaaa-1111-2222-3333-444444444444
+curl -s -X POST -H "content-type: application/json" -H "x-bks-form: $TOK" \
+  -d "{\"submission_id\":\"$SID\",\"template_id\":1,\"template_version\":1,\"data\":{\"a\":\"1\"}}" \
+  $H/form/submit                              # {"status":"created"}
+# 再发一次同一个 SID → {"status":"duplicate"}，库里仍只有一条
+
+# 导出
+curl -s -b jar -D - -o out.xlsx "$H/admin/forms/export.xlsx?template=1"
+python3 -c "import zipfile;print(zipfile.ZipFile('out.xlsx').namelist()[:3])"
+```
+
+2026-10-28 实测 **36 项全过**（登录/名单/口令/模板 CRUD/乐观锁/提交幂等/校验/
+旧版本补交/停用开关/日期筛选/导出内容与列顺序/老库迁移）。
+
+### 9.2 单元测试
+
+```bash
+~/.cargo/bin/cargo test --release     # 12 项
+```
+
+测的都是"错了也不报错"的地方：重复提交只落一条、模板升版后旧快照仍在、
+乐观锁被拒时库没被改、名单外登录失败、坏 schema 存不进、导出列并集缺列留空。
+**改 `forms.rs` / `db.rs` / `xlsx.rs` 之后必须跑**，这些是静默错误，界面上看不出来。
 
 ## 10. 踩过的坑（改这里前必读）
 
@@ -343,6 +442,10 @@ curl -s -b jar $H/admin | grep -c "当前"            # 1：只有一条线，�
 | 404 ≠ 故障 | 没发版时 `/latest.json` 返回 404 是给客户端**语义化**用的。并进通用异常后，客户端会报"内外网都连不上"，排查方向全错 |
 | `format!` 渲染 HTML | 页面里满是 CSS 花括号，会当占位符解析 → 500。统一 `%%占位%%` + `replace` |
 | `is_current` 更新漏 client 条件 | 库里还有旧版记录，不加条件会把它们的历史标记也清掉，回滚时才发现 |
+| 导出按位置填列而不是按 key | 模板一改版就串列，且历史数据无法修复 —— 必须按快照取列 |
+| 提交不存快照 | 同上。快照是这套设计里最不能妥协的一条 |
+| 把 `duplicate` 当错误返回 | 客户端只有看到成功才清队列，一直重试会让"待上传"永远清不掉 |
+| 允许保存离线编辑的模板 | 模板是全局配置，离线改会分叉成两套 —— 断网时保存按钮应置灰 |
 | 把清单发给旧客户端 | 旧 Python 客户端没有 `client` 校验，会拿新版 exe 把自己替换掉 —— 所以缺参数一律 404 |
 | `ALTER TABLE` 那段别删 | NAS 上的库是旧版建的，靠它补列 |
 | Location 头塞中文 | 只能 ASCII；跳转消息一律百分号编码（`admin.rs::encode`） |

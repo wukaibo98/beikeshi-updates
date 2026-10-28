@@ -76,7 +76,10 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
       <h1>贝可施更新分发</h1>
       <div class="sub">%%SUBTITLE%%</div>
     </div>
-    <form method="post" action="/admin/logout"><button class="ghost" type="submit">退出</button></form>
+    <div class="row">
+      <a class="ghost" style="display:inline-flex;align-items:center;height:28px;padding:0 10px;border:1px solid #D8E0CC;border-radius:8px;color:#66705C;text-decoration:none;font-size:12px" href="/admin/forms">表单收集</a>
+      <form method="post" action="/admin/logout"><button class="ghost" type="submit">退出</button></form>
+    </div>
   </div>
   %%FLASH%%
   <div class="card">
@@ -147,5 +150,176 @@ pub fn row(
 <td><div class="row">{publish}<form method="post" action="/admin/delete/{id}" style="display:inline" onsubmit="return confirm('删除 {version}？')"><button class="danger" type="submit">删除</button></form></div></td></tr>"#,
         notes = if notes.is_empty() { "—" } else { notes },
         size = size as f64 / 1024.0 / 1024.0,
+    )
+}
+
+/* ============================================================ 表单收集页 */
+
+pub const FORMS: &str = r##"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>表单收集 · 贝可施更新分发</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#F4F7EE;color:#232B1C;
+  font:14px/1.6 "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:19px;color:#24400D;margin:0 0 2px}
+.sub{font-size:12px;color:#66705C;margin-bottom:18px}
+.card{background:#fff;border:1px solid #E2E8D8;border-radius:14px;padding:18px 20px;margin-bottom:16px}
+.card h2{font-size:13px;margin:0 0 14px;color:#24400D;font-weight:500}
+input[type=text],input[type=date],select{border:1px solid #D8E0CC;border-radius:8px;background:#F8FAF3;
+  padding:6px 8px;font:inherit;font-size:13px;outline:none}
+button{font:inherit;font-size:13px;height:30px;padding:0 14px;border:0;border-radius:8px;
+  background:#3E6B1B;color:#fff;cursor:pointer}
+button:hover{background:#335915}
+button.ghost{background:transparent;border:1px solid #D8E0CC;color:#66705C;height:28px;padding:0 10px;font-size:12px}
+button.ghost:hover{border-color:#3E6B1B;color:#3E6B1B}
+button.danger{background:transparent;border:1px solid #F0C0BC;color:#A32D2D;height:28px;padding:0 10px;font-size:12px}
+button.danger:hover{background:#FDF4F3}
+a.ghost{display:inline-flex;align-items:center;height:28px;padding:0 12px;border-radius:8px;
+  background:#3E6B1B;color:#fff;text-decoration:none;font-size:12px}
+a.ghost:hover{background:#335915}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{font-weight:500;color:#66705C;font-size:12px;text-align:left;padding:6px 8px;border-bottom:1px solid #EFF3E7}
+td{padding:8px;border-bottom:1px solid #EFF3E7;vertical-align:top}
+code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;background:#E7EDDC;color:#3E6B1B}
+.tag.off{background:#EFEFEA;color:#98A08F}
+.muted{color:#98A08F;font-size:12px}
+.flash{background:#EAF3DE;color:#27500A;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
+.err{background:#FCEBEB;color:#791F1F;padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:14px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.kv{font-size:12px}
+.kv b{font-weight:500;color:#66705C}
+</style></head>
+<body><div class="wrap">
+  <div class="top">
+    <div>
+      <h1>表单收集</h1>
+      <div class="sub">%%SUBTITLE%%</div>
+    </div>
+    <a class="ghost" href="/admin">返回分发</a>
+  </div>
+  %%FLASH%%
+
+  <div class="card">
+    <h2>提交记录</h2>
+    <form method="get" action="/admin/forms" class="row" style="margin-bottom:12px">
+      <select name="template">%%TPLFILTER%%</select>
+      <select name="user">%%USERFILTER%%</select>
+      <label>从 <input type="date" name="from" value="%%FROM%%"></label>
+      <label>到 <input type="date" name="to" value="%%TO%%"></label>
+      <button type="submit">筛选</button>
+      <a class="ghost" href="%%EXPORT%%">导出 xlsx</a>
+    </form>
+    <div class="muted" style="margin-bottom:8px">共 %%TOTAL%% 条，最多显示最近 50 条</div>
+    <table>
+      <tr><th>填写时间</th><th>模板</th><th>提交人</th><th>内容</th></tr>
+      %%ROWS%%
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>模板（在客户端「模板管理」里编辑，这里只读）</h2>
+    <table>
+      <tr><th>名称</th><th>版本</th><th>字段数</th><th>更新时间</th><th>状态</th><th>操作</th></tr>
+      %%TPLROWS%%
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>用户（谁能填表）</h2>
+    <form method="post" action="/admin/users/save" class="row" style="margin-bottom:12px">
+      <input type="text" name="name" placeholder="中文姓名" required>
+      <button type="submit">添加</button>
+      <span class="muted">必须和客服本人说的姓名完全一致；不在名单里的人登录会失败</span>
+    </form>
+    <table>
+      <tr><th>姓名</th><th>状态</th><th>操作</th></tr>
+      %%USERROWS%%
+    </table>
+  </div>
+</div></body></html>"##;
+
+/// 一条提交记录：时间 / 模板 / 人 / 内容（按字段顺序拼成"标签：值"）。
+pub fn form_submission_row(
+    client_time: &str,
+    received_at: &str,
+    template_name: &str,
+    template_version: i64,
+    user_name: &str,
+    pairs: &[(String, String)],
+) -> String {
+    let content = if pairs.is_empty() {
+        r#"<span class="muted">—</span>"#.to_string()
+    } else {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    r#"<div class="kv"><b>{}</b>：{}</div>"#,
+                    crate::escape(k),
+                    crate::escape(v)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"<tr><td>{client_time}<br><span class="muted">收到 {received_at}</span></td>
+<td>{template_name} <span class="muted">v{template_version}</span></td>
+<td>{user_name}</td>
+<td>{content}</td></tr>"#,
+        template_name = crate::escape(template_name),
+        user_name = crate::escape(user_name),
+    )
+}
+
+/// 模板行。应急开关：模板改坏了可以在这里停用它（客户端下次拉取就不再显示）。
+pub fn form_template_row(
+    id: i64,
+    name: &str,
+    version: i64,
+    field_count: usize,
+    updated_at: &str,
+    is_active: bool,
+) -> String {
+    let tag = if is_active {
+        r#"<span class="tag">启用中</span>"#
+    } else {
+        r#"<span class="tag off">已停用</span>"#
+    };
+    let label = if is_active { "停用" } else { "启用" };
+    format!(
+        r#"<tr><td><b>{name}</b></td><td>v{version}</td><td>{field_count}</td><td>{updated_at}</td>
+<td>{tag}</td>
+<td><form method="post" action="/admin/forms/template/toggle" style="display:inline">
+<input type="hidden" name="id" value="{id}"><input type="hidden" name="is_active" value="{want}">
+<button class="ghost" type="submit">{label}</button></form></td></tr>"#,
+        name = crate::escape(name),
+        want = if is_active { 0 } else { 1 },
+    )
+}
+
+pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
+    let tag = if enabled {
+        r#"<span class="tag">可用</span>"#
+    } else {
+        r#"<span class="tag off">已停用</span>"#
+    };
+    let label = if enabled { "停用" } else { "启用" };
+    format!(
+        r#"<tr><td><b>{name}</b></td><td>{tag}</td>
+<td><div class="row"><form method="post" action="/admin/users/toggle" style="display:inline">
+<input type="hidden" name="id" value="{id}"><input type="hidden" name="enabled" value="{want}">
+<button class="ghost" type="submit">{label}</button></form>
+<form method="post" action="/admin/users/save" style="display:inline">
+<input type="hidden" name="id" value="{id}">
+<input type="text" name="name" value="{name}" style="width:120px">
+<button class="ghost" type="submit">改名</button></form></div></td></tr>"#,
+        name = crate::escape(name),
+        want = if enabled { 0 } else { 1 },
     )
 }

@@ -89,6 +89,8 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     ] {
         let _ = conn.execute(sql, []);
     }
+
+    init_forms(conn)?;
     Ok(())
 }
 
@@ -207,4 +209,417 @@ pub fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/* ==================================================== 表单收集（v0.2 起） */
+//
+// 三张业务表 + 一张版本表：
+//   form_users              姓名白名单（登录只做"在不在名单里"）
+//   form_templates          模板头（name / 当前版本 / 是否启用 / 排序）
+//   form_template_versions  每个版本的字段定义（快照从这里取，模板不留历史会串列）
+//   form_submissions        提交记录（submission_id 唯一 → 幂等）
+
+#[derive(Debug, Clone)]
+pub struct FormUser {
+    pub id: i64,
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FormTemplate {
+    pub id: i64,
+    pub name: String,
+    pub version: i64,
+    pub is_active: bool,
+    pub sort_order: i64,
+    pub updated_at: i64,
+    pub schema_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FormSubmission {
+    /// 目前页面没用到，留着是为了将来"删掉某一条"和排查时能对得上
+    #[allow(dead_code)]
+    pub id: i64,
+    pub submission_id: String,
+    pub template_id: i64,
+    pub template_version: i64,
+    pub template_snapshot: String,
+    /// 同上：筛选用的是 filter.user_id，这里只是把整行读出来
+    #[allow(dead_code)]
+    pub user_id: i64,
+    pub user_name: String,
+    pub data_json: String,
+    pub client_time: i64,
+    pub created_at: i64,
+}
+
+pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS form_users (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL UNIQUE,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS form_templates (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL UNIQUE,
+            version    INTEGER NOT NULL DEFAULT 1,
+            is_active  INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS form_template_versions (
+            template_id INTEGER NOT NULL,
+            version     INTEGER NOT NULL,
+            schema_json TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            PRIMARY KEY (template_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS form_submissions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id     TEXT NOT NULL UNIQUE,
+            template_id       INTEGER NOT NULL,
+            template_version  INTEGER NOT NULL,
+            template_snapshot TEXT NOT NULL,
+            user_id           INTEGER NOT NULL,
+            user_name         TEXT NOT NULL,
+            data_json         TEXT NOT NULL,
+            client_time       INTEGER NOT NULL,
+            created_at        INTEGER NOT NULL,
+            client_id         TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_sub_tpl  ON form_submissions(template_id, client_time);
+        CREATE INDEX IF NOT EXISTS idx_sub_user ON form_submissions(user_id, client_time);",
+    )
+}
+
+/* ---------------------------------------------------------- 用户 */
+
+pub fn form_users(conn: &Connection) -> rusqlite::Result<Vec<FormUser>> {
+    let mut stmt = conn.prepare("SELECT id, name, enabled FROM form_users ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(FormUser {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            enabled: r.get::<_, i64>(2)? == 1,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 登录用：只看启用的。
+pub fn form_user_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<FormUser>> {
+    conn.query_row(
+        "SELECT id, name, enabled FROM form_users WHERE name = ? AND enabled = 1",
+        params![name],
+        |r| Ok(FormUser { id: r.get(0)?, name: r.get(1)?, enabled: true }),
+    )
+    .optional()
+}
+
+pub fn form_user_find(conn: &Connection, id: i64) -> rusqlite::Result<Option<FormUser>> {
+    conn.query_row("SELECT id, name, enabled FROM form_users WHERE id = ?", params![id], |r| {
+        Ok(FormUser { id: r.get(0)?, name: r.get(1)?, enabled: r.get::<_, i64>(2)? == 1 })
+    })
+    .optional()
+}
+
+/// 新增或改名。名字唯一冲突时返回 Err（调用方翻成人话）。
+pub fn form_user_save(conn: &Connection, id: Option<i64>, name: &str) -> rusqlite::Result<i64> {
+    match id {
+        Some(id) => {
+            conn.execute("UPDATE form_users SET name = ? WHERE id = ?", params![name, id])?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO form_users (name, enabled, created_at) VALUES (?, 1, ?)",
+                params![name, now()],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+pub fn form_user_toggle(conn: &Connection, id: i64, enabled: bool) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE form_users SET enabled = ? WHERE id = ?",
+        params![if enabled { 1 } else { 0 }, id],
+    )?;
+    Ok(())
+}
+
+/* ---------------------------------------------------------- 模板 */
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemplateSave {
+    Saved { id: i64, version: i64 },
+    /// 乐观锁：客户端看到的版本比库里旧
+    Conflict { current: i64 },
+    NotFound,
+    NameTaken,
+}
+
+pub fn form_templates(conn: &Connection, include_inactive: bool) -> rusqlite::Result<Vec<FormTemplate>> {
+    let sql = if include_inactive {
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
+           FROM form_templates t
+           JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
+          ORDER BY t.sort_order, t.id"
+    } else {
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
+           FROM form_templates t
+           JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
+          WHERE t.is_active = 1
+          ORDER BY t.sort_order, t.id"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok(FormTemplate {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            version: r.get(2)?,
+            is_active: r.get::<_, i64>(3)? == 1,
+            sort_order: r.get(4)?,
+            updated_at: r.get(5)?,
+            schema_json: r.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn form_template_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<FormTemplate>> {
+    conn.query_row(
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
+           FROM form_templates t
+           JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
+          WHERE t.id = ?",
+        params![id],
+        |r| {
+            Ok(FormTemplate {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                version: r.get(2)?,
+                is_active: r.get::<_, i64>(3)? == 1,
+                sort_order: r.get(4)?,
+                updated_at: r.get(5)?,
+                schema_json: r.get(6)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// 取某个版本的字段定义 —— 提交时用它做"冻结快照"，客户端离线几天也不会串列。
+pub fn form_template_schema(
+    conn: &Connection,
+    template_id: i64,
+    version: i64,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT schema_json FROM form_template_versions WHERE template_id = ? AND version = ?",
+        params![template_id, version],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// 保存模板：新建 version=1；更新则 version+1 并写入版本表。
+///
+/// `base_version` 是乐观锁：`None` 表示新建。不匹配返回 Conflict，且**不改库**。
+pub fn form_template_save(
+    conn: &Connection,
+    id: Option<i64>,
+    name: &str,
+    schema_json: &str,
+    base_version: Option<i64>,
+    sort_order: i64,
+) -> rusqlite::Result<TemplateSave> {
+    let tx = conn.unchecked_transaction()?;
+
+    let (id, version) = match id {
+        None => {
+            let taken: bool = tx
+                .query_row("SELECT 1 FROM form_templates WHERE name = ?", params![name], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+            if taken {
+                return Ok(TemplateSave::NameTaken);
+            }
+            tx.execute(
+                "INSERT INTO form_templates (name, version, is_active, sort_order, updated_at)
+                 VALUES (?, 1, 1, ?, ?)",
+                params![name, sort_order, now()],
+            )?;
+            (tx.last_insert_rowid(), 1i64)
+        }
+        Some(id) => {
+            let current: Option<i64> = tx
+                .query_row("SELECT version FROM form_templates WHERE id = ?", params![id], |r| r.get(0))
+                .optional()?;
+            let Some(current) = current else { return Ok(TemplateSave::NotFound) };
+
+            if base_version != Some(current) {
+                return Ok(TemplateSave::Conflict { current });
+            }
+            let taken: bool = tx
+                .query_row(
+                    "SELECT 1 FROM form_templates WHERE name = ? AND id <> ?",
+                    params![name, id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if taken {
+                return Ok(TemplateSave::NameTaken);
+            }
+            let next = current + 1;
+            tx.execute(
+                "UPDATE form_templates SET name = ?, version = ?, sort_order = ?, updated_at = ?
+                  WHERE id = ?",
+                params![name, next, sort_order, now(), id],
+            )?;
+            (id, next)
+        }
+    };
+
+    tx.execute(
+        "INSERT INTO form_template_versions (template_id, version, schema_json, created_at)
+         VALUES (?, ?, ?, ?)",
+        params![id, version, schema_json, now()],
+    )?;
+    tx.commit()?;
+    Ok(TemplateSave::Saved { id, version })
+}
+
+pub fn form_template_toggle(conn: &Connection, id: i64, is_active: bool) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE form_templates SET is_active = ?, updated_at = ? WHERE id = ?",
+        params![if is_active { 1 } else { 0 }, now(), id],
+    )?;
+    Ok(())
+}
+
+/* ---------------------------------------------------------- 提交 */
+
+pub struct NewSubmission<'a> {
+    pub submission_id: &'a str,
+    pub template_id: i64,
+    pub template_version: i64,
+    pub template_snapshot: &'a str,
+    pub user_id: i64,
+    pub user_name: &'a str,
+    pub data_json: &'a str,
+    pub client_time: i64,
+    pub client_id: &'a str,
+}
+
+/// 写入一条提交。返回 true = 新建，false = submission_id 已存在（重试/重复）。
+pub fn form_submit_insert(conn: &Connection, s: &NewSubmission<'_>) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "INSERT INTO form_submissions
+           (submission_id, template_id, template_version, template_snapshot,
+            user_id, user_name, data_json, client_time, created_at, client_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(submission_id) DO NOTHING",
+        params![
+            s.submission_id,
+            s.template_id,
+            s.template_version,
+            s.template_snapshot,
+            s.user_id,
+            s.user_name,
+            s.data_json,
+            s.client_time,
+            now(),
+            s.client_id
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+#[derive(Default)]
+pub struct SubmissionFilter {
+    pub template_id: Option<i64>,
+    pub user_id: Option<i64>,
+    /// 按 client_time（客服填写时间）过滤，闭区间，UTC 秒
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+pub fn form_submissions(
+    conn: &Connection,
+    f: &SubmissionFilter,
+) -> rusqlite::Result<Vec<FormSubmission>> {
+    let mut sql = String::from(
+        "SELECT id, submission_id, template_id, template_version, template_snapshot,
+                user_id, user_name, data_json, client_time, created_at
+           FROM form_submissions WHERE 1 = 1",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(t) = f.template_id {
+        sql.push_str(" AND template_id = ?");
+        args.push(Box::new(t));
+    }
+    if let Some(u) = f.user_id {
+        sql.push_str(" AND user_id = ?");
+        args.push(Box::new(u));
+    }
+    if let Some(from) = f.from {
+        sql.push_str(" AND client_time >= ?");
+        args.push(Box::new(from));
+    }
+    if let Some(to) = f.to {
+        sql.push_str(" AND client_time <= ?");
+        args.push(Box::new(to));
+    }
+    sql.push_str(" ORDER BY client_time DESC, id DESC LIMIT ? OFFSET ?");
+    args.push(Box::new(if f.limit <= 0 { 50 } else { f.limit }));
+    args.push(Box::new(f.offset.max(0)));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), |r| {
+        Ok(FormSubmission {
+            id: r.get(0)?,
+            submission_id: r.get(1)?,
+            template_id: r.get(2)?,
+            template_version: r.get(3)?,
+            template_snapshot: r.get(4)?,
+            user_id: r.get(5)?,
+            user_name: r.get(6)?,
+            data_json: r.get(7)?,
+            client_time: r.get(8)?,
+            created_at: r.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn form_submissions_count(conn: &Connection, f: &SubmissionFilter) -> rusqlite::Result<i64> {
+    let mut sql = String::from("SELECT COUNT(*) FROM form_submissions WHERE 1 = 1");
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(t) = f.template_id {
+        sql.push_str(" AND template_id = ?");
+        args.push(Box::new(t));
+    }
+    if let Some(u) = f.user_id {
+        sql.push_str(" AND user_id = ?");
+        args.push(Box::new(u));
+    }
+    if let Some(from) = f.from {
+        sql.push_str(" AND client_time >= ?");
+        args.push(Box::new(from));
+    }
+    if let Some(to) = f.to {
+        sql.push_str(" AND client_time <= ?");
+        args.push(Box::new(to));
+    }
+    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    conn.query_row(&sql, refs.as_slice(), |r| r.get(0))
 }

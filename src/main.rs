@@ -7,11 +7,18 @@
 //!   1. 对外发版本清单 `/latest.json?client=web`（客户端只认这个）
 //!   2. 发程序包 `/packages/{filename}`
 //!   3. 一个管理页：上传、发布、回滚、删除
+//!   4. 表单收集（v0.2 起）：姓名登录、模板存取/下发、提交、导出 xlsx
+//!      模板由**客户端**编辑，服务端只负责存、下发、收提交、导出。
 
 mod admin;
 mod auth;
 mod db;
+mod forms;
 mod html;
+mod xlsx;
+
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -254,6 +261,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/upload", post(admin::upload))
         .route("/admin/publish/{id}", post(admin::publish))
         .route("/admin/delete/{id}", post(admin::delete))
+        .route("/admin/forms", get(forms::admin_page))
+        .route("/admin/forms/template/toggle", post(forms::admin_template_toggle))
+        .route("/admin/forms/export.xlsx", get(forms::export))
+        .route("/admin/users/save", post(forms::user_save))
+        .route("/admin/users/toggle", post(forms::user_toggle))
+        .route("/form/login", post(forms::login))
+        .route("/form/edit-login", post(forms::edit_login))
+        .route("/form/templates", get(forms::templates))
+        .route("/form/template/save", post(forms::template_save))
+        .route("/form/template/toggle", post(forms::template_toggle))
+        .route("/form/submit", post(forms::submit))
+        .route("/form/mine", get(forms::mine))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

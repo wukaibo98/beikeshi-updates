@@ -1,6 +1,6 @@
 [package]
 name = "bks-updates"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "贝可施客服小工具 · 更新分发服务"
@@ -17,6 +17,7 @@ hmac = "0.12"
 hex = "0.4"
 rand = "0.8"
 time = { version = "0.3", features = ["formatting"] }
+rust_xlsxwriter = "0.92.0"
 
 [profile.release]
 opt-level = "z"

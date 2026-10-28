@@ -7,9 +7,10 @@
 GET /latest.json?client=web      # 客户端拿清单
 GET /packages/bkstools-0.2.0.exe # 下包
 GET /admin                       # 管理页：上传 / 发布 / 回滚 / 删除
+GET /admin/forms                 # 表单收集：提交记录 / 名单 / 导出 xlsx
 ```
 
-当前服务端版本 **0.1.0**（跟客户端版本无关）。跑在 NAS 上，镜像
+当前服务端版本 **0.2.0**（跟客户端版本无关）。跑在 NAS 上，镜像
 `ghcr.io/wukaibo98/beikeshi-updates:latest`，容器内端口 8080，NAS 映射到 **50205**；
 公网经 Lucky 反代到 `https://bks.beikeshi.cn:54321`。
 
@@ -105,6 +106,56 @@ GET /latest.json?client=python → 404「未知客户端：python」
 
 管理页能看到：每个版本的大小 / 下载次数 / 发布时间、两条线各自当前的版本、
 累计客户端检查次数、内网与公网地址、网页版清单地址。
+
+### 表单收集（客户端用）
+
+客服在客户端填写的表单走这一组。**模板由客户端编辑**（服务端不做编辑器），
+服务端只负责存、下发、收提交、导出。
+
+| 方法 | 路径 | 请求 / 说明 |
+|---|---|---|
+| POST | `/form/login` | `{"name":"张三"}` → 姓名在有户表里才通过，发 30 天 token（放 `X-Bks-Form` 头） |
+| POST | `/form/edit-login` | `{"token":"<管理口令>"}` → 换 7 天 `edit_token`（放 `X-Bks-Edit` 头）。**口令只在服务端比对，客户端不落盘** |
+| GET | `/form/templates` | 启用中的模板；带 `?all=1` 要 `edit_token`（编辑器要看到停用项） |
+| POST | `/form/template/save` | 存模板，要 `edit_token`。`base_version` 是乐观锁，对不上返回 409 且**不改库** |
+| POST | `/form/template/toggle` | 停用 / 启用模板，要 `edit_token` |
+| POST | `/form/submit` | 提交，要 `X-Bks-Form`。详见下方三条硬规则 |
+| GET | `/form/mine` | 我自己最近提交的记录（确认"真交上去了"，离线补交后尤其需要） |
+
+字段类型 5 种：`text` / `textarea` / `number` / `select` / `date`。
+模板 schema 长这样：
+
+```json
+{
+  "title": "补发申请",
+  "fields": [
+    {"key":"order_no","label":"订单号","type":"text","required":true},
+    {"key":"reason","label":"补发原因","type":"select","required":true,
+     "options":["少发","破损","错发"]},
+    {"key":"day","label":"发生日期","type":"date"}
+  ]
+}
+```
+
+**`/form/submit` 的三条硬规则**
+
+1. `submission_id` 由客户端生成一次，所有重试用同一个；服务端
+   `ON CONFLICT DO NOTHING`，重复提交返回 `duplicate` **并且算成功**。
+   网络超时但服务器其实已入库时，重试不会产生第二条。
+2. 服务端按 `template_version` 取出**当时的字段定义**再复验一遍（不信客户端）。
+   离线几天后拿旧版本提交照样能收，只是记录里如实存旧版本号。
+3. 每条提交都冻结一份字段定义快照（`template_snapshot`）。
+   模板改了以后，导出的列按提交自带的快照取 —— 这条不守，历史数据会串列且没法修。
+
+### 表单收集（管理页，沿用 admin Cookie）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/forms` | 提交记录（可筛选）/ 模板清单（只读）/ 用户名单 |
+| POST | `/admin/users/save` | 加人 / 改名。**加人必须有界面**，否则新人用不了等于只有你能维护 |
+| POST | `/admin/users/toggle` | 停用 / 启用（停用后登录失败，历史提交保留） |
+| POST | `/admin/forms/template/toggle` | 模板应急开关：改坏了可以在这里停掉，客户端下次拉取就不再显示 |
+| GET | `/admin/forms/export.xlsx` | 导出，**必须先选模板**：一次只导一个模板，否则列会稀疏得没法看 |
 
 ## 环境变量
 
@@ -231,9 +282,14 @@ src/
 ├─ main.rs    配置、路由、清单生成、下载、健康检查
 ├─ admin.rs   管理页、登录、上传、发布、删除
 ├─ db.rs      SQLite 存取（表结构与 Python 版兼容，client 列只用于标记旧记录）
-├─ auth.rs    口令校验与 Cookie 签名
-└─ html.rs    管理页 / 登录页模板
+├─ auth.rs    口令校验、Cookie 签名、表单 token / 编辑 token
+├─ forms.rs   表单：schema 校验、姓名登录、模板存取、提交、管理页、导出
+├─ xlsx.rs    提交记录导出（列并集、数字列、sheet 名清洗）
+├─ html.rs    登录 / 分发 / 表单三个页面模板
+└─ tests.rs   单元测试（幂等、快照冻结、乐观锁、导出列……）
 Dockerfile                     多阶段构建 → scratch，镜像里只有一个二进制
 docker-compose.yml             部署（NAS 上直接用这个）
 .github/workflows/docker.yml   推 main 自动构建多架构镜像并推 ghcr
 ```
+
+详细设计与字段说明见客户端仓库的 `FORMS.md`。

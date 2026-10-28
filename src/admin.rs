@@ -361,7 +361,7 @@ fn encode(text: &str) -> String {
 /// 页面上显示的时间。库里存的是 Unix 秒（UTC），这里按 `tz_offset_min` 换成当地时间 ——
 /// scratch 镜像里没有 tzdata，`OffsetDateTime` 的"本地时间"永远是 UTC，
 /// 直接显示会差 8 小时（"刚发布的版本"看着像早上 7 点发的）。
-fn short_time(ts: i64, tz_offset_min: i32) -> String {
+pub(crate) fn short_time(ts: i64, tz_offset_min: i32) -> String {
     let offset = time::UtcOffset::from_whole_seconds(tz_offset_min.saturating_mul(60))
         .unwrap_or(time::UtcOffset::UTC);
     match time::OffsetDateTime::from_unix_timestamp(ts) {
