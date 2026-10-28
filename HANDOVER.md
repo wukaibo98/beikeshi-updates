@@ -71,6 +71,30 @@ target/release/bks-updates --version                               # bks-updates
 8. 管理页口令 `ADMIN_TOKEN` 目前写在 compose 里（明文、会进仓库）。**接手后第一件事**
    建议挪到不进仓库的 `.env`，见 §6 待办。
 
+### 2.1 推送这本仓库要注意网络
+
+这台机器上 **`github.com`（git 用的 443）经常连不上，而 `api.github.com` 一直通**。
+表现是 `git push` 卡 75 秒后报 `Failed to connect to github.com port 443`。两条路：
+
+```bash
+# 通路时：正常推
+git push
+
+# 不通时：走 REST API 全量快照推送（自动遵守 .gitignore）
+GH_TOKEN=ghp_xxx python3 ~/AI/WorkBuddy/tools/gh_push.py . <owner>/<repo> "提交信息"
+```
+
+`gh_push.py` 会用远端 main 的 HEAD 当父提交，所以**它产生的提交在本地不存在** ——
+一旦用过它，本地和远端历史就分叉了（内容一致，sha 不同）。等网络通的时候收一次：
+
+```bash
+git fetch origin main && git reset --hard origin/main
+```
+
+> 当前状态（2026-10-28）：远端有两个提交（`5db9ec31` 初始化仓库 → `546c2788` 正文），
+> 是本机走 API 推的；本地只有一个同名内容的提交。**内容完全一致，只是历史没对齐**，
+> 按上面两行收一次即可。
+
 ---
 
 ## 3. 这个服务是怎么来的
