@@ -53,6 +53,12 @@ pub struct PageQuery {
     pub ok: Option<String>,
     #[serde(default)]
     pub err: Option<String>,
+    /// 要编辑字段结构的模板 id（表单预览里的【编辑】）
+    #[serde(default, deserialize_with = "crate::opt_i64")]
+    pub tpl_edit: Option<i64>,
+    /// 「加一个字段」（没 JS 时点链接过来）
+    #[serde(default)]
+    pub add: Option<String>,
 }
 
 impl PageQuery {
@@ -241,6 +247,8 @@ pub async fn page(
         from: q.from.clone(),
         to: q.to.clone(),
         rec: q.rec,
+        tpl_edit: q.tpl_edit,
+        add: q.add.clone(),
     };
     let panes = crate::forms::panes(&state, &fq);
 
@@ -255,6 +263,7 @@ pub async fn page(
     };
 
     let body = html::PAGE
+        .replace("%%CSS%%", html::CSS)
         .replace("%%SUBTITLE%%", &crate::escape(&subtitle))
         .replace("%%FLASH%%", &crate::flash(q.ok.clone(), q.err.clone()))
         .replace("%%TABS%%", &crate::html::tabs(&active, &counts))

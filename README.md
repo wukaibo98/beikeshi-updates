@@ -9,8 +9,11 @@ GET /packages/bkstools-0.5.0.exe # 下包
 GET /admin                       # 管理页：概览 / 表单登记 / 版本更新 / 登录管理
 ```
 
-当前服务端版本 **0.4.0**（跟客户端版本无关）。跑在 NAS 上，容器名 `bks-updates`，
+当前服务端版本 **0.5.0**（跟客户端版本无关）。跑在 NAS 上，容器名 `bks-updates`，
 容器内端口 8080，NAS 映射到 **50205**；公网经 Lucky 反代到 `https://bks.beikeshi.cn:54321`。
+
+v0.5.0 给「表单预览」里**每一个模板**加了三个按钮（**编辑** / **上传记录** / **导出**），
+并给「已删除的模板」加了**永久删除**。见「表单预览的三个按钮」与「永久删除模板」。
 
 > **部署方式**：镜像**在本机构建**（`docker build` → `docker save | gzip` → `ssh cat` 传到 NAS
 > → `docker load` → `compose up -d`），不再从 ghcr 拉。步骤见下面「部署到 NAS」。
@@ -111,8 +114,8 @@ GET /latest.json?client=python → 404「未知客户端：python」
 
 ### 表单收集（客户端用）
 
-客服在客户端填写的表单走这一组。**模板由客户端编辑**（服务端不做编辑器），
-服务端只负责存、下发、收提交、导出。
+客服在客户端填写的表单走这一组。**模板的主编辑器在客户端**，
+服务端另有一套**网页版编辑器**（v0.5 起）作为应急/微调通道，见「表单预览的三个按钮」。
 
 | 方法 | 路径 | 请求 / 说明 |
 |---|---|---|
@@ -124,7 +127,7 @@ GET /latest.json?client=python → 404「未知客户端：python」
 | POST | `/form/submit` | 提交，要 `X-Bks-Form`。详见下方三条硬规则 |
 | GET | `/form/mine` | 我自己最近提交的记录（确认"真交上去了"，离线补交后尤其需要） |
 
-字段类型 5 种：`text` / `textarea` / `number` / `select` / `date`。
+字段类型 6 种：`text` / `textarea` / `number` / `select` / `date` / `name`（姓名，会自动去名单里核名字）。
 模板 schema 长这样：
 
 ```json
@@ -157,8 +160,8 @@ GET /latest.json?client=python → 404「未知客户端：python」
 | `?tab=` | `?sub=` | 内容 |
 |---|---|---|
 | `overview` | — | **谁在连服务器**（最近活动：谁/机器、IP、最后动作、时间）+ 概况数字 + 地址 |
-| `register` | `preview` | **表单预览**：按模板分组列出登记，点「预览」打开**可编辑的表格**；每组一个「导出这个模板」 |
-| `register` | `templates` | **模板管理**：停用 / 启用 / **删除**（删是软删除，见下）+ 已删除的模板清单 |
+| `register` | `preview` | **表单预览**：按模板分组列出登记。每组三个按钮：**编辑** / **上传记录** / **导出**，见下 |
+| `register` | `templates` | **模板管理**：停用 / 启用 / **删除**（删是软删除，见下）+ 已删除的模板清单（可**永久删除**） |
 | `versions` | — | 发布新版本 + 版本列表 |
 | `login` | `clients` | **客户端**：谁能填表（姓名白名单）—— 添加 / 停用 / 改名 / 删除 |
 | `login` | `admins` | **管理端**：谁能登进管理页 —— 添加 / 改口令 / 停用 / 删除 |
@@ -167,6 +170,38 @@ GET /latest.json?client=python → 404「未知客户端：python」
 标签本身是 `<a href="?tab=&sub=">`，没有 JS 时点它照样整页跳转。
 
 旧地址 `/admin/forms` 会 302 到 `?tab=register`，书签不会失效。
+
+### 表单预览的三个按钮（v0.5 起）
+
+「表单预览」里**每一个模板**（哪怕一条登记都没填过）都带三个按钮：
+
+| 按钮 | 做什么 | 落地方式 |
+|---|---|---|
+| **编辑** | 在网页里直接改这个模板的**表格结构**（有哪些列、每列什么类型、必填与否、下拉选项、列的顺序），保存后客户端下次拉取就是新表 | `GET /admin/forms/template/{id}/edit` 取 HTML 片段弹层；保存走 `POST /admin/forms/template/save`（带 `base_version` 乐观锁，对不上返回 409 且**不改库**） |
+| **上传记录** | **新窗口**打开这个模板的上传记录，只显示**最近 200 条** | `GET /admin/forms/template/{id}/records`（独立页面，不是弹层），`target="_blank"` |
+| **导出** | 导出这个模板的全部登记为 **xlsx** | `GET /admin/forms/export.xlsx?template={id}` |
+
+工具条上那个按钮改叫「**导出当前筛选**」—— 它导的是**当前筛选条件下**的登记（可跨模板）。
+想要「就这一个模板、全部历史」，点模板右上角的【导出】。没选模板就点它，会提示改用模板上的【导出】
+（跨模板导出的列会稀疏得没法看）。
+
+**关于「编辑」**：这里改的是**表格结构**（schema），不是表格里的数据。
+数据内容的修改走登记条目自己的「预览 → 改内容」弹层（`/admin/forms/submission/{id}/edit`），
+那里改的是某一条登记的填法，字段定义快照不动 —— 动了就串列。
+
+**为什么不引入开源 Office**（常见想法，这里明确记一下取舍）：
+
+- 要引入的是 **OnlyOffice / Collabora / LibreOffice headless** 这一类。OnlyOffice Document Server
+  镜像 1–2 GB，还要额外 Postgres + Redis；LibreOffice headless 也在几百 MB 量级。NAS 上再压一套
+  办公套件，等于给这台机器加一个**新的部署面、一组新的漏洞面**，为的是编辑一种**字段受限的表单结构**，
+  投入产出不划算。
+- 更关键的是**功能对不上**：本工具的模板只有 6 种字段类型（`text` / `textarea` / `number` /
+  `select` / `date` / `name`），是**结构化表单**，不是任意 Excel 文件。用一套办公套件去编辑
+  一张只有几列的表单，等于为了拧一颗螺丝先装一整个车间。
+- 真要做「像 Excel 那样拖拽改数据」，下一步更合适的选项是**纯前端 SheetJS**（约 1 MB，不落服务端、
+  不新增部署面）——但那解决的是「改数据」，而「改数据」的需求已经有登记弹层在满足了。
+- 结论：**暂不引入**。要真需要 Office 级体验，优先走「客户端里做」——客户端本来就有完整的模板编辑器
+  （`/form/template/save`），字段定义、校验、版本都更完备，浏览器这一侧只保留应急开关和结构微调。
 
 ### 删模板 = 软删除（历史表格不受影响）
 
@@ -179,6 +214,24 @@ GET /latest.json?client=python → 404「未知客户端：python」
 - 客户端下次拉取就看不到这个模板了；往已删模板**提交新登记会被拒**。
 
 「已删除的模板」清单列在「模板管理」下面，让人看得到历史还在。
+
+### 永久删除模板（v0.5 起）
+
+软删除的模板可以在「模板管理 → 已删除的模板」里**永久删除**（`POST /admin/forms/template/purge`），
+点之前有二次确认。
+
+永久删除做三件事：
+
+1. **先把模板名冗余写进历史登记** —— `form_submissions.template_name` 这一列就是为它准备的。
+   模板行真删了以后，历史登记仍然认得出「这条是哪个表填的」，导出的表格（靠 `template_snapshot`）
+   也照常。
+2. **删掉这个模板的字段定义历史版本**（`form_template_versions` 里该模板的行）。
+3. **删掉模板行本身**（`form_templates`）。
+
+**历史登记一条都不删。** 这是硬规矩：删模板是「不想要这张表了」，不是「连填过的记录一起抹掉」。
+
+前置条件：模板**必须先软删除过**（`deleted_at > 0`）。没删过的直接调永久删除会返回
+`not_deleted` —— 免得手滑把还在用的表直接抹了。
 
 ### 管理端人员与口令
 
@@ -209,7 +262,11 @@ GET /latest.json?client=python → 404「未知客户端：python」
 | POST | `/admin/admins/delete` | 删除管理端人员 |
 | POST | `/admin/forms/template/toggle` | 模板应急开关：改坏了可以在这里停掉，客户端下次拉取就不再显示 |
 | POST | `/admin/forms/template/delete` | **软删除**模板（历史登记与已导出表格不受影响） |
-| GET | `/admin/forms/export.xlsx` | 导出，**必须先选模板**：一次只导一个模板，否则列会稀疏得没法看 |
+| GET | `/admin/forms/template/{id}/edit` | 模板编辑器的 **HTML 片段**（弹层用；无 JS 时走 `?tpl_edit={id}` 内联） |
+| GET | `/admin/forms/template/{id}/records` | 该模板的**上传记录**独立页面，**只显示最近 200 条** |
+| POST | `/admin/forms/template/save` | 保存模板结构（网页版编辑器）。带 `base_version` 乐观锁，对不上返回 409 且**不改库** |
+| POST | `/admin/forms/template/purge` | **永久删除**已软删除的模板（历史登记保留，模板名已冗余进登记） |
+| GET | `/admin/forms/export.xlsx` | 导出，**必须先选模板**：一次只导一个模板，否则列会稀疏得没法看。带 `?template={id}` 时导出该模板全部登记 |
 
 ## 环境变量
 

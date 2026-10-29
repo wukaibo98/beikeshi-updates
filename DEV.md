@@ -47,17 +47,24 @@ admin.rs  ── GET  /admin            页面渲染（未登录 → 登录页�
           └─ POST /admin/delete/{id}   删除
 db.rs     ── 全部 SQL；表结构与 Python 版兼容（client 列只标记旧记录）
           ├─ 表单四表 + admin_users（v0.4 新增）
-          └─ 模板软删除（form_template_delete）
+          ├─ 模板软删除（form_template_delete）
+          └─ 模板永久删除（form_template_purge，v0.5 新增）
 auth.rs   ── HMAC-SHA256 签名：管理 Cookie（带管理员 id，v0.4）/ 表单 token / 编辑 token
 forms.rs  ── schema 校验、姓名登录、模板存取（乐观锁）、提交（幂等+复验）
           ├─ GET  /admin/forms            表单管理页（v0.4 起渲染成四个二级面板）
           ├─ GET  /admin/forms/export.xlsx 导出（一次只导一个模板）
           ├─ POST /admin/forms/template/delete        模板软删除
+          ├─ GET  /admin/forms/template/{id}/edit     模板编辑器片段（v0.5）
+          ├─ GET  /admin/forms/template/{id}/records  上传记录独立页（v0.5）
+          ├─ POST /admin/forms/template/save         模板保存（v0.5）
+          ├─ POST /admin/forms/template/purge        模板永久删除（v0.5）
           ├─ GET  /admin/forms/submission/{id}/edit   登记编辑片段（弹层用）
           ├─ POST /admin/forms/submission/save        登记保存（只改 data_json）
           └─ POST /admin/admins/{save,toggle,token,delete} 管理端人员与口令
 xlsx.rs   ── rust_xlsxwriter：列并集 → 数字列 → sheet 名清洗
-html.rs   ── 登录页 / 分发页 / 表单页模板（`%%占位%%`）；v0.4 加两级标签结构
+html.rs   ── 登录页 / 分发页 / 表单页模板（`%%占位%%`）；v0.4 加两级标签结构；
+          v0.5 加 CSS 抽出（pub const CSS）、模板编辑器模板（template_editor）、
+          已删除模板行（deleted_template_row）、上传记录独立页（RECORDS_PAGE）
 tests.rs  ── `cargo test`：幂等、快照冻结、乐观锁、白名单、导出列
 tools/shot-admin.js ── 无头 Chrome 截管理页（CDP 注入自签 Cookie，见 §9.3）
 ```
@@ -116,7 +123,8 @@ form_templates (id, name UNIQUE, version, is_active, sort_order, updated_at,
 form_template_versions (template_id, version, schema_json, created_at)  -- 每个版本的字段定义
 form_submissions (id, submission_id UNIQUE, template_id, template_version,
                   template_snapshot, user_id, user_name, data_json,
-                  client_time, created_at, client_id)
+                  client_time, created_at, client_id,
+                  template_name)              -- v0.5 加：模板名冗余，永久删除后仍认得出表名
 ```
 
 关键语义：
@@ -124,6 +132,15 @@ form_submissions (id, submission_id UNIQUE, template_id, template_version,
 - **`template_snapshot` 是提交那一刻的字段定义，冻结不动。**
   模板一改，历史提交的列就变了；导出按每条提交自带的快照取列，永不串行。
   配套：`form_template_versions` 保存**每个版本**的定义，旧的也能取回来。
+- **`template_name` 是模板名的冗余副本（v0.5）**。软删除时模板行还在，名字从
+  `form_templates.name` 取就够；但**永久删除**会把模板行真删掉，历史登记就会变成
+  一个认不出表名的孤儿。所以在永久删除那一刻，**先把模板名写进这一列**再删行 ——
+  顺序不能反（先删行就拿不到名字了）。
+  - 这一列在 `form_submissions` 里是 `NOT NULL DEFAULT ''`，
+    老库靠 `ALTER TABLE ... ADD COLUMN template_name TEXT NOT NULL DEFAULT ''` 补上。
+  - 加列之前提交的老登记，这一列是**空串** —— 这是预期的，
+    它们本来就在模板行还完整的时候提交过，名字随时能从 `form_templates` 取到；
+    只有走永久删除时才会被补上。
 - **`submission_id UNIQUE` + `ON CONFLICT DO NOTHING`** 是幂等的命根子。
   客户端生成一次，所有重试用同一个；服务端返回 `duplicate` 也算成功
   （客户端只有看到成功才会清队列，网络超时其实已入库时重试不会产生第二条）。
@@ -437,6 +454,107 @@ UPDATE form_templates
 - 导出的筛选参数由 `export_url(q, template)` 统一拼，
   免得漏掉 `from` / `to` 导致导出的行数跟页面上看到的不一致。
 
+### 4.15 网页版模板编辑器（v0.5）
+
+「表单预览」里每个模板的**【编辑】**按钮：改的是**表格结构**（有哪些列、每列什么类型），
+不是表格里的数据。
+
+**为什么要做**：客户端里本来就有模板编辑器，但客户端是**装在客服电脑上**的。
+客服在班车上、领导在客户现场想加一列，客户端编辑器不一定在手边。服务端这个编辑器是
+**应急/微调通道**，不是主编辑器。
+
+**关键约束：浏览器表单不能收数组。**
+`serde_urlencoded` 遇到同名参数只保留**最后一个**，所以不能发
+`key[]=a&key[]=b`。因此每个字段的每个属性用**独立名字**：
+
+```
+f0_pos=1   f0_key=order_no   f0_label=订单号   f0_type=text
+f0_required=1   f0_options=少发,破损   f0_del=0
+f1_pos=2   f1_key=reason     ...
+```
+
+- 行号 `i` 是**表单里的下标**（0 起），不是最终位置；最终位置看 `f{i}_pos`。
+- 服务端 `parse_template_form()` 按 `f{i}_{属性}` 把散落的键收成「行号 → 属性表」，
+  再按 `pos` 排序 —— 排序的权威是 `pos`，`i` 只是收集时的临时下标。
+- **勾了「删」的行直接跳过**（`f{i}_del=1`）；**`key` 为空的行也跳过**（空行模板）。
+  这两条是"加一行"和"删一行"的实现方式：不真删 DOM，标记后跳过即可。
+- `options` 用 `，` `,` `、` 三种分隔符切（客服手打习惯不统一）。
+  **只有 `type == "select"` 才带 options**，其它类型的 options 一律丢掉。
+- 保存走 `template_save_web()`，带 `base_version` 乐观锁：模板被别人改过就返回 409，
+  页面提示重试，**不改库**。
+
+**有 JS / 无 JS 双路径**（和 §4.14 登记编辑同一个规矩）：
+
+| | 有 JS | 无 JS |
+|---|---|---|
+| 取内容 | `fetch('/admin/forms/template/{id}/edit')` 取 HTML 片段塞进弹层 | `?tpl_edit={id}` 服务端整页内联渲染 |
+| 加行 | 克隆 `<template id="tpl-blank">` | 点「加一个字段」整页跳转，带 `&add=1` |
+| 排序 | ↑↓ 按钮交换 `pos` | 「位置」数字框手填 |
+| 删除 | 勾「删」把行收起 | 勾「删」（同） |
+
+两条路径共用 `template_editor_html()`，避免两套渲染逻辑走偏。
+
+**字段类型 6 种**（`kind_label()` 给中文标签）：
+`text`→单行文本、`textarea`→多行文本、`number`→数字、`select`→下拉、`date`→日期、`name`→姓名。
+
+**为什么不引入开源 Office**（这个想法被明确否掉了，理由记在这里免得反复讨论）：
+
+- **体积与部署面**：OnlyOffice Document Server 镜像 1–2 GB，还要另起 Postgres + Redis；
+  LibreOffice headless 也在几百 MB。NAS 上再压一套办公套件 = 多一个部署面、多一组漏洞面。
+- **功能对不上**：这里的模板是**结构化表单**，只有 6 种字段类型。
+  用办公套件去编辑一张几列的表单，是"为了拧一颗螺丝先装一整个车间"。
+- **数据编辑这条路已经有解**：登记内容修改走 `/admin/forms/submission/{id}/edit` 弹层
+  （按快照渲染成可编辑表单），不需要 Excel 引擎。
+- **真要做"像 Excel 那样改数据"**，更合适的下一步是**纯前端 SheetJS**（约 1 MB，
+  不落服务端、不新增部署面），但那解决的是改数据，不是改结构。
+- **结论：暂不引入**。需要 Office 级体验就往客户端做 —— 客户端的编辑器更完备
+  （有字段校验、有版本），服务端只保留应急开关和结构微调。
+
+### 4.16 上传记录独立页（v0.5）
+
+「表单预览」里每个模板的**【上传记录】**按钮：新窗口（`target="_blank"`）打开
+`/admin/forms/template/{id}/records`，**独立页面**而不是弹层。
+
+- **只显示最近 200 条**（`RECORDS_WINDOW = 200`）。超了副标题提示
+  「只看最近 200 条，要看全部请导出 xlsx」。
+  为什么不是全量：有人填了上万条时，全量渲染会把浏览器拖死，而这条记录
+  本身是给人**抽查一眼**用的 —— 要全量数据请走导出。
+- 走独立页面而不是弹层：独立页能直接右键复制链接发给同事、能单独开标签页对比。
+- 页面骨架是 `html::RECORDS_PAGE`，复用 `html::CSS`（v0.5 把样式从 `PAGE` 里抽出来了，
+  两个页面共用一套，不复制粘贴）。
+
+### 4.17 模板永久删除（v0.5）
+
+「模板管理 → 已删除的模板」里每个软删模板多一个**【永久删除】**按钮，
+点之前有 confirm 二次确认。
+
+`db::form_template_purge()` 在**一个事务**里做三件事：
+
+```sql
+-- 1. 先把模板名冗余进历史登记（顺序不能反：先删行就拿不到名字了）
+UPDATE form_submissions SET template_name = ? WHERE template_id = ? AND (template_name IS NULL OR template_name = '');
+-- 2. 删掉这个模板的字段定义历史版本
+DELETE FROM form_template_versions WHERE template_id = ?;
+-- 3. 删掉模板行本身
+DELETE FROM form_templates WHERE id = ?;
+```
+
+返回三态 `PurgeResult`：
+
+| 返回 | 含义 |
+|---|---|
+| `Purged { submissions }` | 删掉了，`submissions` 是这个模板名下的历史登记条数 |
+| `NotFound` | 没有这个模板（id 不存在） |
+| `NotDeleted` | **还没软删过** —— 必须先走「删除」 |
+
+- **`NotDeleted` 是故意的闸门**：没删过的模板直接调永久删除会抹掉一张还在用的表。
+  要求先软删除，等于强迫操作者先看一眼"这个表有人填过吗"。
+- **历史登记一条都不删**。删模板是"不想要这张表了"，不是"连填过的记录一起抹掉"。
+- 冗余名只补**这一列为空**的那些行（`(template_name IS NULL OR template_name = '')`）——
+  老登记本来就靠 `form_templates.name` 取名字，不用动。
+- `form_template_versions` 要一起删：那是这个模板的字段定义历史，模板都没了，
+  留着只是垃圾，还会让人误以为能回滚到一个已经不存在模板的版本。
+
 
 ## 5. 管理页模板
 
@@ -658,13 +776,25 @@ v0.3.0 标签页改版后又跑了一遍：五个 `?tab=` 各只有一段可见�
 ### 9.2 单元测试
 
 ```bash
-~/.cargo/bin/cargo test --release     # 22 项
+~/.cargo/bin/cargo test --release     # 28 项
 ```
 
 测的都是"错了也不报错"的地方：重复提交只落一条、模板升版后旧快照仍在、
 乐观锁被拒时库没被改、名单外登录失败、坏 schema 存不进、导出列并集缺列留空、
 删模板后历史记录和名字都还在、改登记只动内容不动字段定义、
 管理端口令只存哈希、停用/改口令后老口令登不进来、查询参数空串当没填。
+
+v0.5 新增 6 项：
+
+| 测试 | 测什么 |
+|---|---|
+| `网页版编辑器_解析出字段并按位置排序` | `f{i}_{属性}` 能收成字段，顺序按 `pos` 不按下标 |
+| `网页版编辑器_删掉的行和空行都不算` | 勾「删」的行、`key` 为空的行都不进结果 |
+| `提交时把模板名冗余存进登记` | `form_submissions.template_name` 有值 |
+| `永久删除后模板行没了但登记和名字都还在` | 模板行真删，登记一条不少，名字认得出 |
+| `没删过的模板不能永久删除` | 返回 `NotDeleted`（闸门有效） |
+| `永久删除会清掉字段定义的历史版本` | `form_template_versions` 里该模板的行被清掉 |
+
 **改 `forms.rs` / `db.rs` / `xlsx.rs` 之后必须跑**，这些是静默错误，界面上看不出来。
 
 ### 9.3 无头 Chrome 截管理页（v0.4 起）
@@ -681,6 +811,22 @@ node tools/shot-admin.js http://127.0.0.1:18080 /tmp/admin.png
   原因是 `file://` → `http://` 属跨站，Chrome 的第三方 cookie 策略会把
   `Set-Cookie` 拦掉，截出来还是登录页。
 - Cookie 格式是 v0.4 的 `a{id}.{nonce}.{sig}`，签名密钥是 `DATA_DIR/secret.key`。
+
+**第 7 个参数是「截图前先点一下」**（v0.5 加）——弹层、编辑器这类**要点击才出现**的东西，
+静态截图拍不到，得先模拟点击：
+
+```bash
+# 1. 预览页三个按钮
+node tools/shot-admin.js http://127.0.0.1:18080 /tmp/1-preview.png
+# 2. 点开模板编辑器弹层
+node tools/shot-admin.js http://127.0.0.1:18080 /tmp/2-editor.png '.tpl-open'
+# 3. 上传记录独立页（直接开 URL）
+node tools/shot-admin.js http://127.0.0.1:18080/admin/forms/template/1/records /tmp/3-records.png
+```
+
+点击是用 `Runtime.evaluate` 执行 `document.querySelector(sel).click()`，
+找不到元素会返回 `NOT_FOUND` —— **参数写错时不会报错，只会截到没弹层的页面**，
+所以截图后要肉眼看一眼弹层在不在。点击后等 1.8 秒再截（等 fetch 回来填弹层）。
 
 ## 10. 踩过的坑（改这里前必读）
 
@@ -712,6 +858,14 @@ node tools/shot-admin.js http://127.0.0.1:18080 /tmp/admin.png
 | 依赖层缓存 | Dockerfile 里 `touch src/main.rs` 不能少，否则编出来的镜像是空壳 |
 | 仓库名 | workflow 用 `github.repository` 当镜像名，仓库必须叫 `beikeshi-updates` |
 | 端口 | 容器内 8080，NAS 映射 50205；公网走 Lucky 反代到 `:54321`。改这里要同时改客户端里的两个地址常量 |
+| 模板永久删除前不先冗余名字 | 模板行一删，历史登记就变成认不出表名的孤儿。先 `UPDATE ... SET template_name` 再 `DELETE`，**顺序不能反** |
+| `form_submissions.template_name` 加列 | 老库要 `ALTER TABLE ... ADD COLUMN template_name TEXT NOT NULL DEFAULT ''`；**别删**，NAS 上那份库是 v0.4 建的 |
+| 浏览器表单收不了数组 | `serde_urlencoded` 遇到同名参数只保留最后一个，`key[]=a&key[]=b` 会丢。字段属性必须用独立名字 `f{i}_{属性}` |
+| `f{i}` 下标 ≠ 最终位置 | 下标只是收集时的临时下标（删一行后下标会跳）。排序的权威是 `f{i}_pos`，按 `pos` 排 |
+| 抄 CSS 时抓到登录页的 | `html.rs` 里有多个 `<style>`，用 `re.search` 会抓到第一个（LOGIN 的 14 行）。要按 `pub const PAGE` 的位置定位再往后找 |
+| GitHub API 归一化提交日期 | API 存的是 UTC。git author 行里**时间戳是绝对纪元秒**，`+0800` 只是显示标签 —— 归一化是**只改标签不动时间戳**，减 8 小时会变成另一个时刻 |
+| GitHub API 不补 message 尾换行 | 本地 `git commit` 总带尾 `\n`，API 不会补。要 SHA 完全一致只能用 `git hash-object -t commit -w --stdin` 精确写字节，`git commit --amend` 做不到 |
+| `git diff-tree -z` 的输出格式 | `-z` 模式下是 `"<header>\0<path>\0"` **成对交替**，不是 tab 分隔。按 tab 切会切错行 |
 
 ## 11. 与客户端的关系
 

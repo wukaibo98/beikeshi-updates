@@ -291,6 +291,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/users/delete", post(forms::user_delete))
         .route("/admin/forms/template/toggle", post(forms::admin_template_toggle))
         .route("/admin/forms/template/delete", post(forms::admin_template_delete))
+        .route("/admin/forms/template/purge", post(forms::admin_template_purge))
+        .route(
+            "/admin/forms/template/{id}/edit",
+            get(forms::template_edit),
+        )
+        .route(
+            "/admin/forms/template/{id}/records",
+            get(forms::template_records),
+        )
+        .route("/admin/forms/template/save", post(forms::template_save_web))
         .route("/admin/forms/submission/save", post(forms::submission_save))
         .route(
             "/admin/forms/submission/{id}/edit",

@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // 无头 Chrome 截图管理页：先算一个登录 Cookie 注进去，再导航到目标标签截图。
-// 用法：node tools/shot-admin.js <secretKeyFile> <baseUrl> <tabQuery> <out.png> [width] [height]
+// 用法：node tools/shot-admin.js <secretKeyFile> <baseUrl> <tabQuery> <out.png> [width] [height] [clickSelector]
+//
+// clickSelector 可选：截图前先点一下这个 CSS 选择器（用来截弹层这种要交互才出现的东西）。
 const fs = require('fs');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
-const [keyFile, baseUrl, tabQuery, out, w = '1280', h = '1400'] = process.argv.slice(2);
+const [keyFile, baseUrl, tabQuery, out, w = '1280', h = '1400', clickSel] = process.argv.slice(2);
 const secret = fs.readFileSync(keyFile, 'utf8').trim();
 const nonce = crypto.randomBytes(16).toString('hex');
 const payload = `a0.${nonce}`;
@@ -63,6 +65,15 @@ async function json(path) {
   });
   await send('Page.navigate', { url: `${baseUrl}${tabQuery}` });
   await sleep(2500);
+  if (clickSel) {
+    // 点一下再截：弹层这类要交互才出现的东西
+    await send('Runtime.evaluate', {
+      expression: `(function(){var el=document.querySelector(${JSON.stringify(clickSel)});
+        if(!el) return 'NOT_FOUND'; el.click(); return 'OK';})()`,
+      awaitPromise: false,
+    });
+    await sleep(1800);
+  }
   const shot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
   fs.writeFileSync(out, Buffer.from(shot.data, 'base64'));
   console.log(`已截图 ${out}`);

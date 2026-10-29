@@ -29,6 +29,7 @@ fn parse(s: &str) -> Schema {
 fn 同一_submission_id_只落一条() {
     let conn = fresh();
     let base = db::NewSubmission {
+        template_name: "测试模板",
         submission_id: "sid-0001",
         template_id: 1,
         template_version: 1,
@@ -73,6 +74,7 @@ fn 模板升版后旧提交仍带旧快照() {
     db::form_submit_insert(
         &conn,
         &db::NewSubmission {
+            template_name: "测试模板",
             submission_id: "old-0001",
             template_id: 1,
             template_version: 1,
@@ -225,6 +227,7 @@ fn 导出列取多版本并集且缺列留空() {
 
     let rows = vec![
         db::FormSubmission {
+            template_name: String::new(),
             id: 2,
             submission_id: "s2".into(),
             template_id: 1,
@@ -237,6 +240,7 @@ fn 导出列取多版本并集且缺列留空() {
             created_at: 1_700_000_300,
         },
         db::FormSubmission {
+            template_name: String::new(),
             id: 1,
             submission_id: "s1".into(),
             template_id: 1,
@@ -271,6 +275,7 @@ fn 导出列取多版本并集且缺列留空() {
 fn 导出的字节是合法_xlsx() {
     let snap = schema(r#"[{"key":"a","label":"A","type":"number"}]"#);
     let rows = vec![db::FormSubmission {
+            template_name: String::new(),
         id: 1,
         submission_id: "s1".into(),
         template_id: 1,
@@ -301,6 +306,7 @@ fn 删模板后历史登记和名字都还在() {
     db::form_submit_insert(
         &conn,
         &db::NewSubmission {
+            template_name: "测试模板",
             submission_id: "sub-0001",
             template_id: 1,
             template_version: 1,
@@ -357,6 +363,7 @@ fn 改登记只动内容不动字段定义() {
     db::form_submit_insert(
         &conn,
         &db::NewSubmission {
+            template_name: "测试模板",
             submission_id: "sub-0001",
             template_id: 1,
             template_version: 1,
@@ -450,4 +457,195 @@ fn 查询参数里的整数_空串和乱填都当没填() {
     let uri2: axum::http::Uri = "/admin?template=abc".parse().unwrap();
     let q2 = axum::extract::Query::<crate::admin::PageQuery>::try_from_uri(&uri2).unwrap();
     assert_eq!(q2.template, None);
+}
+
+/* --------------------------------------- v0.5：模板的网页版编辑器 + 永久删除 */
+
+#[test]
+fn 网页版编辑器_解析出字段并按位置排序() {
+    let mut form = std::collections::HashMap::new();
+    form.insert("id".to_string(), "1".to_string());
+    form.insert("name".to_string(), "  补发申请  ".to_string());
+    // 三行，故意把顺序打乱：位置 2 / 1 / 3
+    form.insert("f0_pos".to_string(), "2".to_string());
+    form.insert("f0_key".to_string(), "b".to_string());
+    form.insert("f0_label".to_string(), "乙".to_string());
+    form.insert("f0_type".to_string(), "text".to_string());
+
+    form.insert("f1_pos".to_string(), "1".to_string());
+    form.insert("f1_key".to_string(), "a".to_string());
+    form.insert("f1_label".to_string(), "甲".to_string());
+    form.insert("f1_type".to_string(), "select".to_string());
+    form.insert("f1_required".to_string(), "1".to_string());
+    form.insert("f1_options".to_string(), "一，二、三".to_string());
+
+    form.insert("f2_pos".to_string(), "3".to_string());
+    form.insert("f2_key".to_string(), "c".to_string());
+    form.insert("f2_label".to_string(), "丙".to_string());
+    form.insert("f2_type".to_string(), "number".to_string());
+
+    let (name, fields) = crate::forms::parse_template_form(&form);
+    assert_eq!(name, "补发申请", "名字要去掉首尾空格");
+    assert_eq!(fields.len(), 3);
+    assert_eq!(
+        fields.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b", "c"],
+        "必须按「位置」排序，不能按行号"
+    );
+    assert!(fields[0].required, "必填勾上了要认出来");
+    assert_eq!(
+        fields[0].options.as_deref(),
+        Some(["一".to_string(), "二".to_string(), "三".to_string()].as_slice()),
+        "下拉选项要按中英文逗号都切"
+    );
+    assert!(fields[1].options.is_none(), "非下拉字段不该带选项");
+}
+
+#[test]
+fn 网页版编辑器_删掉的行和空行都不算() {
+    let mut form = std::collections::HashMap::new();
+    form.insert("name".to_string(), "表".to_string());
+    // 这一行勾了「删」
+    form.insert("f0_key".to_string(), "a".to_string());
+    form.insert("f0_label".to_string(), "甲".to_string());
+    form.insert("f0_type".to_string(), "text".to_string());
+    form.insert("f0_del".to_string(), "1".to_string());
+    // 这一行标识是空的（没 JS 时「加一个字段」留下的空行）
+    form.insert("f1_key".to_string(), "".to_string());
+    form.insert("f1_label".to_string(), "还没填".to_string());
+    form.insert("f1_type".to_string(), "text".to_string());
+    // 这一行是正常的
+    form.insert("f2_key".to_string(), "b".to_string());
+    form.insert("f2_label".to_string(), "乙".to_string());
+    form.insert("f2_type".to_string(), "text".to_string());
+
+    let (_, fields) = crate::forms::parse_template_form(&form);
+    assert_eq!(fields.len(), 1, "只该留下没被删、标识也填了的那一行");
+    assert_eq!(fields[0].key, "b");
+}
+
+#[test]
+fn 提交时把模板名冗余存进登记() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    db::form_submit_insert(
+        &conn,
+        &db::NewSubmission {
+            template_name: "客户需求表",
+            submission_id: "sub-9001",
+            template_id: 1,
+            template_version: 1,
+            template_snapshot: &v1,
+            user_id: 1,
+            user_name: "张三",
+            data_json: r#"{"a":"1"}"#,
+            client_time: 1_700_000_000,
+            client_id: "",
+        },
+    )
+    .unwrap();
+
+    let name: String = conn
+        .query_row(
+            "SELECT template_name FROM form_submissions WHERE submission_id = 'sub-9001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "客户需求表", "模板名要冗余存一份，永久删除后还认得出来");
+}
+
+#[test]
+fn 永久删除后模板行没了但登记和名字都还在() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    // 老数据：template_name 是空的（这一列是后加的）
+    db::form_submit_insert(
+        &conn,
+        &db::NewSubmission {
+            template_name: "",
+            submission_id: "sub-9101",
+            template_id: 1,
+            template_version: 1,
+            template_snapshot: &v1,
+            user_id: 1,
+            user_name: "张三",
+            data_json: r#"{"a":"1"}"#,
+            client_time: 1_700_000_000,
+            client_id: "",
+        },
+    )
+    .unwrap();
+
+    // 先软删
+    assert!(db::form_template_delete(&conn, 1).unwrap());
+    // 再永久删除
+    match db::form_template_purge(&conn, 1).unwrap() {
+        db::PurgeResult::Purged { submissions } => assert_eq!(submissions, 1),
+        other => panic!("应该是删成功，实际 {other:?}"),
+    }
+
+    // 模板行真的没了
+    assert!(db::form_templates_all(&conn).unwrap().is_empty(), "模板行应该被真删");
+    assert!(
+        db::form_template_by_id(&conn, 1).unwrap().is_none(),
+        "再查也查不到这个模板"
+    );
+
+    // 登记一条不少，而且名字被补上了
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM form_submissions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "永久删除模板不能动已经填过的登记");
+
+    let name: String = conn
+        .query_row("SELECT template_name FROM form_submissions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(name, "客户需求表（已删除）", "名字要补进登记里，历史才认得出来");
+}
+
+#[test]
+fn 没删过的模板不能永久删除() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+
+    match db::form_template_purge(&conn, 1).unwrap() {
+        db::PurgeResult::NotDeleted => {}
+        other => panic!("没软删的模板不该被永久删除，实际 {other:?}"),
+    }
+    // 模板还在
+    assert_eq!(db::form_templates_all(&conn).unwrap().len(), 1);
+}
+
+#[test]
+fn 永久删除会清掉字段定义的历史版本() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    let v2 = schema(r#"[{"key":"a","label":"A","type":"text"},{"key":"b","label":"B","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    db::form_template_save(&conn, Some(1), "客户需求表", &v2, Some(1), 0).unwrap();
+
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM form_template_versions WHERE template_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "应该存了两个版本的字段定义");
+
+    db::form_template_delete(&conn, 1).unwrap();
+    db::form_template_purge(&conn, 1).unwrap();
+
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM form_template_versions WHERE template_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "永久删除要把字段定义的历史版本也清掉");
 }

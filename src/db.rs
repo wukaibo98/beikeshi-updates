@@ -249,6 +249,8 @@ pub struct FormSubmission {
     pub template_id: i64,
     pub template_version: i64,
     pub template_snapshot: String,
+    /// 冗余存一份模板名。模板被「永久删除」之后，老记录靠这一列还认得出是哪张表。
+    pub template_name: String,
     /// 同上：筛选用的是 filter.user_id，这里只是把整行读出来
     #[allow(dead_code)]
     pub user_id: i64,
@@ -295,6 +297,7 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
             template_id       INTEGER NOT NULL,
             template_version  INTEGER NOT NULL,
             template_snapshot TEXT NOT NULL,
+            template_name     TEXT NOT NULL DEFAULT '',
             user_id           INTEGER NOT NULL,
             user_name         TEXT NOT NULL,
             data_json         TEXT NOT NULL,
@@ -320,6 +323,8 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
     for sql in [
         // 模板软删除标记。删模板不能真删 —— 历史提交和已经导出的表格还要靠它认名字。
         "ALTER TABLE form_templates ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
+        // 冗余存一份模板名。模板被「永久删除」之后，提交记录靠这一列还认得出是哪张表。
+        "ALTER TABLE form_submissions ADD COLUMN template_name TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = conn.execute(sql, []);
     }
@@ -595,6 +600,69 @@ pub fn form_template_deleted(conn: &Connection, id: i64) -> rusqlite::Result<boo
     Ok(deleted_at.unwrap_or(0) > 0)
 }
 
+/// **永久删除**一个已经软删掉的模板 —— 这次是真的把行删掉。
+///
+/// 只允许删 `deleted_at > 0` 的（没软删过的要走软删除那条路）。
+///
+/// 关键：**先把模板名写进历史登记**。软删除时模板行还在，历史记录靠查表认名字；
+/// 真删了行就没了，登记里的 `template_id` 会指向一个不存在的模板，
+/// 管理页上就只剩「已删除的模板 #3」。所以删之前把名字冗余进
+/// `form_submissions.template_name`，老登记（那一列为空的）一并补上。
+///
+/// 登记本身**一条都不删** —— 表单的列在 `template_snapshot` 里，导出照常能用。
+#[derive(Debug)]
+pub enum PurgeResult {
+    /// 删掉了，连带清掉的历史登记条数
+    Purged { submissions: i64 },
+    /// 没有这个模板
+    NotFound,
+    /// 还没软删过 —— 得先走「删除」
+    NotDeleted,
+}
+
+pub fn form_template_purge(conn: &Connection, id: i64) -> rusqlite::Result<PurgeResult> {
+    let tx = conn.unchecked_transaction()?;
+
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT name, deleted_at FROM form_templates WHERE id = ?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((name, deleted_at)) = row else {
+        return Ok(PurgeResult::NotFound);
+    };
+    if deleted_at <= 0 {
+        return Ok(PurgeResult::NotDeleted);
+    }
+
+    // 把模板名冗余进历史登记（只补那一列为空的，老数据才有这个需要）
+    let touched = tx.execute(
+        "UPDATE form_submissions
+            SET template_name = ?
+          WHERE template_id = ? AND (template_name IS NULL OR template_name = '')",
+        params![name, id],
+    )?;
+    let submissions = tx.query_row(
+        "SELECT COUNT(*) FROM form_submissions WHERE template_id = ?",
+        params![id],
+        |r| r.get::<_, i64>(0),
+    )?;
+
+    // 字段定义的各版本也跟着清掉
+    tx.execute(
+        "DELETE FROM form_template_versions WHERE template_id = ?",
+        params![id],
+    )?;
+    tx.execute("DELETE FROM form_templates WHERE id = ?", params![id])?;
+
+    tx.commit()?;
+    Ok(PurgeResult::Purged {
+        submissions: submissions.max(touched as i64),
+    })
+}
+
 /* ---------------------------------------------------------- 提交 */
 
 pub struct NewSubmission<'a> {
@@ -602,6 +670,7 @@ pub struct NewSubmission<'a> {
     pub template_id: i64,
     pub template_version: i64,
     pub template_snapshot: &'a str,
+    pub template_name: &'a str,
     pub user_id: i64,
     pub user_name: &'a str,
     pub data_json: &'a str,
@@ -613,15 +682,16 @@ pub struct NewSubmission<'a> {
 pub fn form_submit_insert(conn: &Connection, s: &NewSubmission<'_>) -> rusqlite::Result<bool> {
     let changed = conn.execute(
         "INSERT INTO form_submissions
-           (submission_id, template_id, template_version, template_snapshot,
+           (submission_id, template_id, template_version, template_snapshot, template_name,
             user_id, user_name, data_json, client_time, created_at, client_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(submission_id) DO NOTHING",
         params![
             s.submission_id,
             s.template_id,
             s.template_version,
             s.template_snapshot,
+            s.template_name,
             s.user_id,
             s.user_name,
             s.data_json,
@@ -650,7 +720,7 @@ pub fn form_submissions(
 ) -> rusqlite::Result<Vec<FormSubmission>> {
     let mut sql = String::from(
         "SELECT id, submission_id, template_id, template_version, template_snapshot,
-                user_id, user_name, data_json, client_time, created_at
+                template_name, user_id, user_name, data_json, client_time, created_at
            FROM form_submissions WHERE 1 = 1",
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -683,11 +753,12 @@ pub fn form_submissions(
             template_id: r.get(2)?,
             template_version: r.get(3)?,
             template_snapshot: r.get(4)?,
-            user_id: r.get(5)?,
-            user_name: r.get(6)?,
-            data_json: r.get(7)?,
-            client_time: r.get(8)?,
-            created_at: r.get(9)?,
+            template_name: r.get(5)?,
+            user_id: r.get(6)?,
+            user_name: r.get(7)?,
+            data_json: r.get(8)?,
+            client_time: r.get(9)?,
+            created_at: r.get(10)?,
         })
     })?;
     rows.collect()
@@ -733,7 +804,7 @@ pub fn form_submission_by_id(
 ) -> rusqlite::Result<Option<FormSubmission>> {
     conn.query_row(
         "SELECT id, submission_id, template_id, template_version, template_snapshot,
-                user_id, user_name, data_json, client_time, created_at
+                template_name, user_id, user_name, data_json, client_time, created_at
            FROM form_submissions WHERE id = ?",
         params![id],
         |r| {
@@ -743,11 +814,12 @@ pub fn form_submission_by_id(
                 template_id: r.get(2)?,
                 template_version: r.get(3)?,
                 template_snapshot: r.get(4)?,
-                user_id: r.get(5)?,
-                user_name: r.get(6)?,
-                data_json: r.get(7)?,
-                client_time: r.get(8)?,
-                created_at: r.get(9)?,
+                template_name: r.get(5)?,
+                user_id: r.get(6)?,
+                user_name: r.get(7)?,
+                data_json: r.get(8)?,
+                client_time: r.get(9)?,
+                created_at: r.get(10)?,
             })
         },
     )

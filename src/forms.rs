@@ -10,7 +10,7 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::Form;
 use std::net::SocketAddr;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -60,6 +60,19 @@ pub struct Field {
 /// `name` 是「姓名」：客户端填写页会自动填入当前登录人的姓名，
 /// 服务端只当它是普通文本校验（默认最多 30 字）。
 pub const KINDS: [&str; 6] = ["text", "textarea", "number", "select", "date", "name"];
+
+/// 字段类型的中文名（管理页的模板编辑器下拉框用）。
+pub fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "text" => "单行文本",
+        "textarea" => "多行文本",
+        "number" => "数字",
+        "select" => "下拉",
+        "date" => "日期",
+        "name" => "姓名",
+        _ => "单行文本",
+    }
+}
 
 /// 姓名字段默认最多几个字（客户端 form-render.js 里也是 30）。
 pub const NAME_MAX: usize = 30;
@@ -551,6 +564,7 @@ pub async fn submit(
                 template_id: req.template_id,
                 template_version: req.template_version,
                 template_snapshot: &schema_json,
+                template_name: &tpl_name,
                 user_id: user.id,
                 user_name: &user.name,
                 data_json: &data_json,
@@ -628,6 +642,12 @@ pub struct AdminQuery {
     /// 要预览/编辑的那条登记
     #[serde(default, deserialize_with = "crate::opt_i64")]
     pub rec: Option<i64>,
+    /// 要编辑字段结构的那个模板（表单预览里的【编辑】按钮）
+    #[serde(default, deserialize_with = "crate::opt_i64")]
+    pub tpl_edit: Option<i64>,
+    /// 加一个字段（没 JS 时「加一个字段」点链接过来）
+    #[serde(default)]
+    pub add: Option<String>,
 }
 
 impl AdminQuery {
@@ -746,6 +766,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
         user_opts,
         preview_groups,
         editor_html,
+        tpl_editor_html,
         deleted_rows,
     ) = {
         let conn = state.conn.lock().unwrap();
@@ -755,29 +776,50 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
 
         // 模板名：一次取全，避免 N+1。**含已删除的** —— 模板删了之后，
         // 历史登记上要还显示它原来的名字，而不是一个光秃秃的 #3。
+        // 模板被「永久删除」之后表里就查不到了，这时用登记里冗余存的那份名字。
         let templates_all = db::form_templates_all(&conn).unwrap_or_default();
-        let name_of = |id: i64| -> String {
+        let name_of_sub = |r: &db::FormSubmission| -> String {
             templates_all
                 .iter()
-                .find(|t| t.id == id)
+                .find(|t| t.id == r.template_id)
                 .map(|t| t.name.clone())
-                .unwrap_or_else(|| format!("已删除的模板 #{id}"))
+                .unwrap_or_else(|| {
+                    let n = r.template_name.trim();
+                    if n.is_empty() {
+                        format!("已删除的模板 #{}", r.template_id)
+                    } else {
+                        n.to_string()
+                    }
+                })
         };
 
-        /* ---- 表单预览：按模板分组，每组一张表 + 一个导出按钮 ---- */
-        let mut groups: Vec<(i64, String, Vec<&db::FormSubmission>)> = Vec::new();
-        for r in &rows {
-            match groups.iter_mut().find(|(tid, _, _)| *tid == r.template_id) {
-                Some((_, _, list)) => list.push(r),
-                None => {
-                    let name = name_of(r.template_id);
-                    groups.push((r.template_id, name, vec![r]));
-                }
+        /* ---- 表单预览：每个模板一张表 + 三个按钮 ----
+           编辑（改表格结构）/ 上传记录（新窗口）/ 导出（xlsx）。
+           列出**所有**没删掉的模板 —— 一条都没填过的也能编辑、导出；
+           另外，已经删掉但当前筛选下还有登记的，也要列出来（不然那些记录
+           在页面上就再也找不到了）。 */
+        let templates = db::form_templates(&conn, true).unwrap_or_default();
+        let shown: Vec<&db::FormTemplate> = match q.template {
+            Some(tid) => templates.iter().filter(|t| t.id == tid).collect(),
+            None => templates.iter().collect(),
+        };
+        // (模板 id, 显示的名字, 是不是已删除的)
+        let mut group_list: Vec<(i64, String, bool)> = shown
+            .iter()
+            .map(|t| (t.id, t.name.clone(), false))
+            .collect();
+        for t in templates_all.iter().filter(|t| t.deleted_at > 0) {
+            let wanted =
+                q.template == Some(t.id) || rows.iter().any(|r| r.template_id == t.id);
+            if wanted {
+                group_list.push((t.id, t.name.clone(), true));
             }
         }
-        let preview_groups: String = groups
+        let preview_groups: String = group_list
             .iter()
-            .map(|(tid, name, list)| {
+            .map(|(tid, tpl_name, deleted)| {
+                let list: Vec<&db::FormSubmission> =
+                    rows.iter().filter(|r| r.template_id == *tid).collect();
                 let body: String = list
                     .iter()
                     .map(|r| {
@@ -797,18 +839,44 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                     })
                     .collect::<Vec<_>>()
                     .join("");
+                let body = if body.is_empty() {
+                    r#"<tr><td colspan="4" class="muted">这个筛选下还没有记录</td></tr>"#.to_string()
+                } else {
+                    body
+                };
+                // 已删除的模板不能编辑（行都软删了），只留「上传记录」和「导出」
+                let edit_btn = if *deleted {
+                    String::new()
+                } else {
+                    format!(
+                        r#"<a class="ghost tpl-open" href="/admin?tab=register&amp;sub=preview&amp;tpl_edit={tid}" data-tpl="{tid}" data-title="编辑模板：{name}">编辑</a>"#,
+                        tid = tid,
+                        name = crate::escape(tpl_name),
+                    )
+                };
+                let tag = if *deleted {
+                    r#"<span class="tag off">已删除</span>"#
+                } else {
+                    ""
+                };
                 format!(
                     r#"<div class="card">
-  <h2>{name}<span class="muted">{n} 条</span>
-    <a class="ghost" href="{export}" style="float:right">导出这个模板</a></h2>
+  <h2>{name}{tag}<span class="muted">{n} 条</span>
+    <span class="row" style="float:right">
+      {edit_btn}
+      <a class="ghost" href="/admin/forms/template/{tid}/records" target="_blank" rel="noopener">上传记录</a>
+      <a class="ghost" href="/admin/forms/export.xlsx?template={tid}" title="导出这个模板的全部登记">导出</a>
+    </span></h2>
   <table>
     <tr><th>填写时间</th><th>提交人</th><th>内容</th><th>操作</th></tr>
     {body}
   </table>
 </div>"#,
-                    name = crate::escape(name),
+                    name = crate::escape(tpl_name),
+                    tag = tag,
                     n = list.len(),
-                    export = crate::escape(&export_url(q, Some(*tid))),
+                    tid = tid,
+                    edit_btn = edit_btn,
                 )
             })
             .collect::<Vec<_>>()
@@ -856,10 +924,11 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                     .find(|(tid, _)| *tid == t.id)
                     .map(|(_, n)| *n)
                     .unwrap_or(0);
-                format!(
-                    r#"<tr><td><b>{name}</b></td><td>{when}</td><td>{subs} 条登记还在</td></tr>"#,
-                    name = crate::escape(&t.name),
-                    when = crate::admin::short_time(t.deleted_at, state.cfg.tz_offset_min),
+                html::deleted_template_row(
+                    t.id,
+                    &t.name,
+                    &crate::admin::short_time(t.deleted_at, state.cfg.tz_offset_min),
+                    subs,
                 )
             })
             .collect::<Vec<_>>()
@@ -919,13 +988,20 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                     };
                     html::submission_editor(
                         r.id,
-                        &name_of(r.template_id),
+                        &name_of_sub(&r),
                         &r.user_name,
                         &crate::admin::short_time(r.client_time, state.cfg.tz_offset_min),
                         &fields,
                     )
                 })
                 .unwrap_or_default(),
+            None => String::new(),
+        };
+
+        /* ---- 要编辑字段结构的那个模板：渲染成编辑器 ----
+           没 JS 时这条链接是普通跳转，编辑器就内联在这儿（跟登记预览一个套路）。 */
+        let tpl_editor_html = match q.tpl_edit {
+            Some(id) => template_editor_html(&conn, id, q.add.is_some()),
             None => String::new(),
         };
 
@@ -937,6 +1013,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
             user_opts,
             preview_groups,
             editor_html,
+            tpl_editor_html,
             deleted_rows,
         )
     };
@@ -947,16 +1024,16 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
     // 下面每个模板分组里各有一个「导出这个模板」，那个永远能用。
     let export_btn = if q.template.is_some() {
         format!(
-            r#"<a class="primary" href="{url}">导出 xlsx</a>"#,
+            r#"<a class="primary" href="{url}" title="按当前筛选（模板/人/日期）导出">导出当前筛选</a>"#,
             url = crate::escape(&export_url(q, q.template))
         )
     } else {
-        r#"<span class="muted">导出：在下面选一个模板，或直接点分组里的「导出这个模板」</span>"#.to_string()
+        r#"<span class="muted">导出：在下面选一个模板，或直接点模板右上角的【导出】</span>"#.to_string()
     };
 
     let preview = format!(
         r##"<div class="card">
-    <h2>表单预览<span class="muted">共 {total} 条；点「预览」可以查看和修改这一条</span></h2>
+    <h2>表单预览<span class="muted">共 {total} 条；每个模板右上有【编辑】【上传记录】【导出】三个按钮</span></h2>
     <form method="get" action="/admin" class="row" style="margin-bottom:12px">
       <input type="hidden" name="tab" value="register">
       <input type="hidden" name="sub" value="preview">
@@ -968,6 +1045,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
       {export_btn}
     </form>
     <div id="rec-editor-host">{editor}</div>
+    <div id="tpl-editor-host">{tpl_editor}</div>
     {groups}
   </div>"##,
         total = total,
@@ -978,8 +1056,13 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
         } else {
             format!(r#"<div id="rec-editor">{editor_html}</div>"#)
         },
+        tpl_editor = if tpl_editor_html.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div id="tpl-editor">{tpl_editor_html}</div>"#)
+        },
         groups = if preview_groups.is_empty() {
-            r#"<p class="muted">这个筛选下没有记录。</p>"#.to_string()
+            r#"<p class="muted">还没有模板。</p>"#.to_string()
         } else {
             preview_groups
         },
@@ -989,7 +1072,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
 
     let templates = format!(
         r##"<div class="card">
-    <h2>模板<span class="muted">在客户端「模板管理」里编辑；这里可以停用，也可以删除</span></h2>
+    <h2>模板<span class="muted">字段结构在「表单预览」里点【编辑】就能改；这里可以停用，也可以删除</span></h2>
     <table>
       <tr><th>名称</th><th>版本</th><th>字段</th><th>更新时间</th><th>状态</th><th>操作</th></tr>
       {tpl_rows}
@@ -1002,12 +1085,16 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
   <div class="card">
     <h2>已删除的模板<span class="muted">从列表里删掉了，但填过的登记和导出的表格都还在</span></h2>
     {deleted}
+    <p class="muted" style="margin-top:10px">
+      「永久删除」会把这一行真的从数据库里删掉，不能恢复 ——
+      但<b>已经填过的登记会保留</b>（表名记在登记里，导出的表格也不受影响）。
+    </p>
   </div>"##,
         deleted = if deleted_rows.is_empty() {
             r#"<p class="muted">还没有删过模板。</p>"#.to_string()
         } else {
             format!(
-                r#"<table><tr><th>名称</th><th>删除时间</th><th>历史</th></tr>{deleted_rows}</table>"#
+                r#"<table><tr><th>名称</th><th>删除时间</th><th>历史</th><th>操作</th></tr>{deleted_rows}</table>"#
             )
         },
     );
@@ -1259,6 +1346,352 @@ pub async fn admin_template_delete(
         ),
         Ok(false) => redirect_err("register", "templates", "没有这个模板（或已经删过了）"),
         Err(e) => redirect_err("register", "templates", &format!("删除失败：{e}")),
+    }
+}
+
+/// **永久删除**一个已经软删掉的模板 —— 这次是真的把行从数据库里删掉。
+///
+/// 只允许删已经「删除」过的。删之前会把模板名冗余进历史登记，
+/// 所以登记和导出的表格都还在，只是这个模板本身不再占地方了。
+pub async fn admin_template_purge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TemplateDeleteForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("register", "templates", "请先登录");
+    }
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        db::form_template_purge(&conn, form.id)
+    };
+    match result {
+        Ok(db::PurgeResult::Purged { submissions }) => redirect_ok(
+            "register",
+            "templates",
+            &format!("已永久删除；{submissions} 条登记保留不变（表名记在登记里）"),
+        ),
+        Ok(db::PurgeResult::NotFound) => {
+            redirect_err("register", "templates", "没有这个模板")
+        }
+        Ok(db::PurgeResult::NotDeleted) => redirect_err(
+            "register",
+            "templates",
+            "这个模板还没删过，先点「删除」再永久删除",
+        ),
+        Err(e) => redirect_err("register", "templates", &format!("永久删除失败：{e}")),
+    }
+}
+
+/* -------------------------------------------- 模板的网页版编辑器（v0.5 起） */
+
+/// 模板的字段编辑器 —— 改的是**表格结构**（有哪些列、每列什么类型）。
+///
+/// 既是弹出层的内容，也是没 JS 时内联在页面里的那份，所以两种情况都能用。
+fn template_editor_html(conn: &rusqlite::Connection, id: i64, add_blank: bool) -> String {
+    let Some(t) = db::form_template_by_id(conn, id).ok().flatten() else {
+        return String::new();
+    };
+    // 删掉的模板不能编辑（行都软删了）
+    if t.deleted_at > 0 {
+        return String::new();
+    }
+    let Ok(schema) = serde_json::from_str::<Schema>(&t.schema_json) else {
+        return String::new();
+    };
+    let mut fields: Vec<html::TplField> = schema
+        .fields
+        .iter()
+        .map(|f| html::TplField {
+            key: f.key.clone(),
+            label: f.label.clone(),
+            kind: f.kind.clone(),
+            required: f.required,
+            options: f.options.clone().unwrap_or_default(),
+        })
+        .collect();
+    if add_blank {
+        // 没 JS 时点「加一个字段」整页跳过来，多带一行空的
+        fields.push(html::TplField {
+            key: String::new(),
+            label: String::new(),
+            kind: "text".to_string(),
+            required: false,
+            options: Vec::new(),
+        });
+    }
+    html::template_editor(t.id, &t.name, t.version, &fields)
+}
+
+/// 取模板的字段编辑器（HTML 片段）。「表单预览」点【编辑】时用。
+pub async fn template_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return (StatusCode::FORBIDDEN, "请先登录").into_response();
+    }
+    let conn = state.conn.lock().unwrap();
+    let out = template_editor_html(&conn, id, false);
+    if out.is_empty() {
+        return (StatusCode::NOT_FOUND, "没有这个模板（或已经删掉了）").into_response();
+    }
+    (StatusCode::OK, out).into_response()
+}
+
+/// 表格里那一行的操作链接（「上传记录」新窗口里用）。
+fn record_row(time: &str, user: &str, summary: &str, id: i64) -> String {
+    format!(
+        r#"<tr><td>{time}</td><td>{user}</td><td>{summary}</td>
+<td><a class="ghost" href="/admin?tab=register&sub=preview&rec={id}" target="_blank">查看</a></td></tr>"#,
+        time = crate::escape(time),
+        user = crate::escape(user),
+        summary = summary,
+    )
+}
+
+/// 「上传记录」：新窗口打开的独立页面，**只显示最近 200 条**。
+pub async fn template_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return (StatusCode::FORBIDDEN, "请先登录").into_response();
+    }
+    let conn = state.conn.lock().unwrap();
+
+    // 模板名：删掉了就退回登记里冗余存的那份
+    let name = db::form_templates_all(&conn)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| t.id == id)
+        .map(|t| t.name)
+        .unwrap_or_else(|| format!("已删除的模板 #{id}"));
+
+    let filter = db::SubmissionFilter {
+        template_id: Some(id),
+        user_id: None,
+        from: None,
+        to: None,
+        limit: RECORDS_WINDOW,
+        offset: 0,
+    };
+    let rows = db::form_submissions(&conn, &filter).unwrap_or_default();
+    let total = db::form_submissions_count(&conn, &filter).unwrap_or(0);
+
+    let body: String = rows
+        .iter()
+        .map(|r| {
+            let schema: Option<Schema> = serde_json::from_str(&r.template_snapshot).ok();
+            let data: Map<String, Value> = serde_json::from_str::<Value>(&r.data_json)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            record_row(
+                &crate::admin::short_time(r.client_time, state.cfg.tz_offset_min),
+                &r.user_name,
+                &crate::escape(&record_summary(schema.as_ref(), &data)),
+                r.id,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let body = if body.is_empty() {
+        r#"<p class="muted">这个模板还没有人填过。</p>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="card"><table>
+<tr><th>填写时间</th><th>提交人</th><th>内容</th><th>操作</th></tr>
+{body}
+</table></div>"#
+        )
+    };
+
+    let subtitle = if total > RECORDS_WINDOW {
+        format!("共 {total} 条，这个窗口只显示最近 {RECORDS_WINDOW} 条（要看全部请导出 xlsx）")
+    } else {
+        format!("共 {total} 条")
+    };
+
+    let page = html::RECORDS_PAGE
+        .replace("%%CSS%%", html::CSS)
+        .replace("%%TITLE%%", &crate::escape(&format!("{name} · 上传记录")))
+        .replace("%%SUBTITLE%%", &crate::escape(&subtitle))
+        .replace("%%BODY%%", &body);
+    Html(page).into_response()
+}
+
+/// 「上传记录」窗口最多显示多少条。
+pub const RECORDS_WINDOW: i64 = 200;
+
+/// 解析网页版模板编辑器提交的表单 → (模板名, 字段列表)。
+///
+/// 表单里每个字段一小组参数：`f0_key` / `f0_label` / `f0_type` / `f0_required` /
+/// `f0_options` / `f0_pos` / `f0_del`。用 `f{行号}_{属性}` 是因为浏览器的表单
+/// 不支持同名参数收数组（`serde_urlencoded` 只保留最后一个同名的）。
+///
+/// 规则：
+/// - 勾了「删」的行跳过；标识空着的行也跳过（没 JS 时「加一个字段」留下的空行）
+/// - 按「位置」排序，数字小的在前；位置一样按原来的行号
+/// - 只有下拉字段才带选项
+pub fn parse_template_form(form: &std::collections::HashMap<String, String>) -> (String, Vec<Field>) {
+    let name = form
+        .get("name")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // 把 f{i}_{属性} 收成「行号 → 属性表」
+    let mut raw: BTreeMap<i64, BTreeMap<String, String>> = BTreeMap::new();
+    for (k, v) in form {
+        let Some(rest) = k.strip_prefix('f') else { continue };
+        let Some((idx_s, attr)) = rest.split_once('_') else { continue };
+        let Ok(idx) = idx_s.parse::<i64>() else { continue };
+        raw.entry(idx).or_default().insert(attr.to_string(), v.clone());
+    }
+
+    // 按「位置」排序：数字小的在前；位置一样按原来的行号
+    let mut items: Vec<(i64, i64, BTreeMap<String, String>)> = raw
+        .into_iter()
+        .map(|(idx, attrs)| {
+            let pos = attrs
+                .get("pos")
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(idx + 1);
+            (pos, idx, attrs)
+        })
+        .collect();
+    items.sort_by_key(|(pos, idx, _)| (*pos, *idx));
+
+    let mut fields: Vec<Field> = Vec::new();
+    for (_, _, attrs) in &items {
+        if attrs.get("del").map(|s| s == "1").unwrap_or(false) {
+            continue;
+        }
+        let key = attrs.get("key").map(|s| s.trim().to_string()).unwrap_or_default();
+        if key.is_empty() {
+            continue;
+        }
+        let kind = attrs
+            .get("type")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "text".to_string());
+        let options: Vec<String> = attrs
+            .get("options")
+            .map(|s| {
+                s.split(['，', ',', '、'])
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        fields.push(Field {
+            key,
+            label: attrs.get("label").map(|s| s.trim().to_string()).unwrap_or_default(),
+            kind: kind.clone(),
+            required: attrs.get("required").map(|s| s == "1").unwrap_or(false),
+            max_length: None,
+            min: None,
+            max: None,
+            decimals: None,
+            options: if kind == "select" { Some(options) } else { None },
+            placeholder: None,
+        });
+    }
+    (name, fields)
+}
+
+/// 保存模板的字段结构（网页版编辑器提交的表单）。
+pub async fn template_save_web(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("register", "preview", "请先登录");
+    }
+
+    let id: i64 = form
+        .get("id")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if id <= 0 {
+        return redirect_err("register", "preview", "没有这个模板");
+    }
+    let base_version: Option<i64> = form.get("base_version").and_then(|s| s.trim().parse().ok());
+    let (name, fields) = parse_template_form(&form);
+    if name.is_empty() {
+        return redirect_err("register", "preview", "模板名称不能为空");
+    }
+    if name.chars().count() > 20 {
+        return redirect_err("register", "preview", "模板名称最多 20 字");
+    }
+
+    let schema = Schema {
+        // title 服务端和客户端都没在用，但保存时原样带着，别把人家的东西抹掉
+        title: None,
+        fields: fields.clone(),
+    };
+    if let Err(msg) = validate_schema(&schema) {
+        return redirect_err("register", "preview", &msg);
+    }
+    let schema_json = match serde_json::to_string(&schema) {
+        Ok(s) => s,
+        Err(e) => return redirect_err("register", "preview", &format!("字段定义无法序列化：{e}")),
+    };
+
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        // 已经删掉的模板不让改
+        if db::form_template_deleted(&conn, id).unwrap_or(false) {
+            return redirect_err("register", "preview", "这个模板已经删除了，不能再改");
+        }
+        let current = db::form_template_by_id(&conn, id).ok().flatten();
+        let Some(current) = current else {
+            return redirect_err("register", "preview", "没有这个模板");
+        };
+        // 把原来的 title 带回去
+        let mut schema_json = schema_json;
+        if let Ok(old) = serde_json::from_str::<Schema>(&current.schema_json) {
+            if let Some(t) = old.title {
+                if let Ok(mut v) = serde_json::from_str::<Value>(&schema_json) {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("title".to_string(), Value::String(t));
+                    }
+                    if let Ok(s) = serde_json::to_string(&v) {
+                        schema_json = s;
+                    }
+                }
+            }
+        }
+        db::form_template_save(
+            &conn,
+            Some(id),
+            &name,
+            &schema_json,
+            base_version,
+            current.sort_order,
+        )
+    };
+
+    match result {
+        Ok(db::TemplateSave::Saved { version, .. }) => redirect_ok(
+            "register",
+            "preview",
+            &format!("已保存，模板升到 v{version}；已经填过的登记不受影响"),
+        ),
+        Ok(db::TemplateSave::Conflict { current }) => redirect_err(
+            "register",
+            "preview",
+            &format!("模板已被别处修改（现在是 v{current}），请关掉这个窗口重新打开再改"),
+        ),
+        Ok(db::TemplateSave::NotFound) => redirect_err("register", "preview", "没有这个模板"),
+        Ok(db::TemplateSave::NameTaken) => {
+            redirect_err("register", "preview", "已经有同名模板了")
+        }
+        Err(e) => redirect_err("register", "preview", &format!("保存失败：{e}")),
     }
 }
 
@@ -1571,10 +2004,16 @@ pub async fn export(
     let (rows, sheet_name) = {
         let conn = state.conn.lock().unwrap();
         let rows = db::form_submissions(&conn, &filter).unwrap_or_default();
+        // sheet 名取模板名；模板被「永久删除」了就退回登记里冗余存的那份
         let name = q
             .template
             .and_then(|id| db::form_template_by_id(&conn, id).ok().flatten())
             .map(|t| t.name)
+            .or_else(|| {
+                rows.first()
+                    .map(|r| r.template_name.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_else(|| "提交记录".to_string());
         (rows, name)
     };

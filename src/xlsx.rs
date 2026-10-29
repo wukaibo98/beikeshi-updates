@@ -175,6 +175,7 @@ mod tests {
 
     fn sub(snapshot: &str, data: &str, name: &str) -> FormSubmission {
         FormSubmission {
+            template_name: String::new(),
             id: 1,
             submission_id: "abc".into(),
             template_id: 1,

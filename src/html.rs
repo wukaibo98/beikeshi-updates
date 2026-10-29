@@ -281,14 +281,142 @@ pub fn admin_env_row(configured: bool) -> String {
     }
 }
 
-/* ================================================ 标签页外壳（v0.4 起两级标签） */
+/* ================================================ 模板的网页版编辑器（v0.5 起） */
 
-pub const PAGE: &str = r##"<!DOCTYPE html>
+/// 模板编辑器里的一行字段。
+pub struct TplField {
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+    pub required: bool,
+    pub options: Vec<String>,
+}
+
+/// 字段类型的下拉选项。
+fn kind_options(selected: &str) -> String {
+    crate::forms::KINDS
+        .iter()
+        .map(|k| {
+            let sel = if *k == selected { " selected" } else { "" };
+            format!(
+                r#"<option value="{k}"{sel}>{label}</option>"#,
+                label = crate::forms::kind_label(k)
+            )
+        })
+        .collect()
+}
+
+/// 模板的字段编辑器 —— 改的是**表格结构**（有哪些列、每列什么类型）。
+///
+/// 既是弹出层的内容，也是没 JS 时内联在页面里的那份，所以两种情况都能用：
+/// - 位置：数字小的排前面（没 JS 时直接改数字；有 JS 时有 ↑↓ 按钮）
+/// - 删：勾上「删」这一行保存时不保留（有 JS 时点一下就把这行收起来）
+/// - 加一个字段：没 JS 时点链接整页跳转（重渲染并多一行空字段），
+///   有 JS 时在页面上直接克隆一行
+pub fn template_editor(id: i64, name: &str, version: i64, fields: &[TplField]) -> String {
+    let rows: String = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            format!(
+                r#"<tr class="tplrow">
+<td class="mid"><input type="number" class="tpl-pos" name="f{i}_pos" value="{pos}" min="1" title="位置：数字小的排前面">
+<button class="ghost tpl-up" type="button" title="上移">↑</button>
+<button class="ghost tpl-down" type="button" title="下移">↓</button></td>
+<td><input type="text" name="f{i}_key" value="{key}" placeholder="order_no"></td>
+<td><input type="text" name="f{i}_label" value="{label}" placeholder="订单号"></td>
+<td><select name="f{i}_type">{kind_opts}</select></td>
+<td class="mid"><input type="checkbox" name="f{i}_required" value="1"{req}></td>
+<td><input type="text" name="f{i}_options" value="{opts}" placeholder="逗号隔开" title="下拉选项，用逗号隔开"></td>
+<td class="mid"><label class="tpl-del"><input type="checkbox" class="tpl-delbox" name="f{i}_del" value="1"> 删</label></td>
+</tr>"#,
+                pos = i + 1,
+                key = crate::escape(&f.key),
+                label = crate::escape(&f.label),
+                kind_opts = kind_options(&f.kind),
+                req = if f.required { " checked" } else { "" },
+                opts = crate::escape(&f.options.join("，")),
+            )
+        })
+        .collect();
+
+    let blank = format!(
+        r#"<tr class="tplrow">
+<td class="mid"><input type="number" class="tpl-pos" name="f0_pos" value="" min="1">
+<button class="ghost tpl-up" type="button">↑</button>
+<button class="ghost tpl-down" type="button">↓</button></td>
+<td><input type="text" name="f0_key" value=""></td>
+<td><input type="text" name="f0_label" value=""></td>
+<td><select name="f0_type">{kind_opts}</select></td>
+<td class="mid"><input type="checkbox" name="f0_required" value="1"></td>
+<td><input type="text" name="f0_options" value="" title="下拉选项，用逗号隔开"></td>
+<td class="mid"><label class="tpl-del"><input type="checkbox" class="tpl-delbox" name="f0_del" value="1"> 删</label></td>
+</tr>"#,
+        kind_opts = kind_options("text")
+    );
+
+    format!(
+        r##"<template id="tpl-blank">{blank}</template>
+<form method="post" action="/admin/forms/template/save" id="tpl-form">
+<input type="hidden" name="id" value="{id}">
+<input type="hidden" name="base_version" value="{version}">
+<div class="frow"><label>模板名称</label><input type="text" name="name" value="{name}" maxlength="20" required></div>
+<p class="muted" style="margin:6px 0 0">保存后版本 +1，客户端下次拉取就是新的字段。
+<b>已经填过的登记不受影响</b> —— 每条登记的表格列按提交那一刻的字段定义冻结。</p>
+<table class="tpltbl">
+<tr><th style="width:120px">位置</th><th style="width:118px">标识</th><th style="width:138px">显示名称</th>
+<th style="width:100px">类型</th><th style="width:40px">必填</th><th>下拉选项</th><th style="width:52px">操作</th></tr>
+{rows}
+</table>
+<div class="row" style="margin-top:12px">
+  <a class="ghost" href="/admin?tab=register&amp;sub=preview&amp;tpl_edit={id}&amp;add=1" id="tpl-add">加一个字段</a>
+  <span class="muted">标识只能用小写字母、数字、下划线；下拉字段至少两个选项</span>
+  <button type="submit" style="margin-left:auto">保存</button>
+</div>
+</form>"##,
+        id = id,
+        version = version,
+        name = crate::escape(name),
+        rows = rows,
+        blank = blank,
+    )
+}
+
+/// 「已删除的模板」清单里的一行 —— 比普通模板多一个【永久删除】。
+pub fn deleted_template_row(id: i64, name: &str, when: &str, submissions: i64) -> String {
+    format!(
+        r#"<tr><td><b>{name}</b></td><td>{when}</td><td>{subs} 条登记还在</td>
+<td><form method="post" action="/admin/forms/template/purge" style="display:inline"
+  onsubmit="return confirm('永久删除模板「{name}」？\n\n这一行会真的从数据库里删掉，不能再恢复。\n已经填过的登记会保留（表名记在登记里），导出的表格也不受影响。')">
+<input type="hidden" name="id" value="{id}">
+<button class="danger" type="submit">永久删除</button></form></td></tr>"#,
+        name = crate::escape(name),
+        when = when,
+        subs = submissions,
+    )
+}
+
+/// 「上传记录」新窗口：一个独立页面 —— 没有标签栏，就是一张表。
+pub const RECORDS_PAGE: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>贝可施更新分发</title>
-<style>
-*{box-sizing:border-box}
+<title>%%TITLE%%</title>
+<style>%%CSS%%</style></head>
+<body><div class="wrap">
+  <div class="top">
+    <div>
+      <h1>%%TITLE%%</h1>
+      <div class="sub">%%SUBTITLE%%</div>
+    </div>
+    <a class="ghost" href="/admin?tab=register&amp;sub=preview">回到表单预览</a>
+  </div>
+  %%BODY%%
+</div></body></html>"##;
+
+/* ================================================ 标签页外壳（v0.4 起两级标签） */
+
+/// 样式：管理页和「上传记录」新窗口共用一份 —— 要改样式只改这一处。
+pub const CSS: &str = r##"*{box-sizing:border-box}
 body{margin:0;background:#F4F7EE;color:#232B1C;
   font:14px/1.6 "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif}
 .wrap{max-width:1000px;margin:0 auto;padding:28px 20px 60px}
@@ -375,7 +503,28 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
 .frow label{font-size:13px;color:#66705C}
 .frow input,.frow select,.frow textarea{width:100%}
 .frow textarea{min-height:64px}
-</style></head>
+
+/* 模板字段编辑器 */
+.tpltbl{margin-top:12px}
+.tpltbl td{vertical-align:middle;padding:5px 6px}
+.tpltbl th{white-space:nowrap}
+.tpltbl input[type=text]{width:100%;min-width:64px}
+.tpltbl select{width:100%}
+.tpltbl input[type=number]{width:100%}
+.tpltbl .mid{text-align:center}
+.tpl-pos{width:58px;text-align:center}
+.tplrow.gone{display:none}
+.tplrow.gone td{opacity:.4}
+.tplrow td .ghost{height:24px;padding:0 7px;margin-left:3px}
+.tpl-del{font-size:12px;color:#A32D2D;white-space:nowrap}
+.tpl-del input{width:auto}
+"##;
+
+pub const PAGE: &str = r##"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>贝可施更新分发</title>
+<style>%%CSS%%</style></head>
 <body><div class="wrap">
   <div class="top">
     <div>
@@ -494,9 +643,10 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
     if (!sheet) return;
     sheet.hidden = true;
     sheetBody.innerHTML = "";
-    // 顺手把地址栏里的 rec= 清掉，刷新不会又弹出来
+    // 顺手把地址栏里的 rec= / tpl_edit= 清掉，刷新不会又弹出来
     var u = new URL(location.href);
     u.searchParams.delete("rec");
+    u.searchParams.delete("tpl_edit");
     history.replaceState(null, "", u);
   }
 
@@ -505,6 +655,11 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
     var inline = document.getElementById("rec-editor");
     if (inline) {
       sheetBody.appendChild(inline);
+      sheet.hidden = false;
+    }
+    var inlineTpl = document.getElementById("tpl-editor");
+    if (inlineTpl) {
+      sheetBody.appendChild(inlineTpl);
       sheet.hidden = false;
     }
     var close = document.getElementById("sheet-close");
@@ -516,6 +671,91 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
       if (e.key === "Escape" && !sheet.hidden) { closeSheet(); }
     });
   }
+
+  /* ---- 模板字段编辑器（改表格结构）----
+     有 JS：点「编辑」只取一段 HTML 塞进弹出层，页面上直接加行/删行/上下移。
+     没 JS：点「编辑」走普通链接，服务端把编辑器渲染在预览区顶部，一样能用
+     （位置改数字、勾「删」、点「加一个字段」整页跳一下）。 */
+  function tplRows() {
+    var f = document.getElementById("tpl-form");
+    return f ? f.querySelectorAll(".tplrow") : [];
+  }
+
+  function renumberTpl() {
+    var rows = tplRows();
+    for (var i = 0; i < rows.length; i++) {
+      var inputs = rows[i].querySelectorAll("[name]");
+      for (var j = 0; j < inputs.length; j++) {
+        var nm = inputs[j].getAttribute("name") || "";
+        if (nm.indexOf("f") === 0) {
+          inputs[j].setAttribute("name", "f" + i + "_" + nm.replace(/^f\d+_/, ""));
+        }
+      }
+      var pos = rows[i].querySelector(".tpl-pos");
+      if (pos && !pos.value) { pos.value = String(i + 1); }
+    }
+  }
+
+  function bindTplEditor() {
+    var form = document.getElementById("tpl-form");
+    if (!form) { return; }
+    renumberTpl();
+
+    var add = document.getElementById("tpl-add");
+    if (add && !add.getAttribute("data-bound")) {
+      add.setAttribute("data-bound", "1");
+      add.addEventListener("click", function (e) {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+        var tpl = document.getElementById("tpl-blank");
+        if (!tpl) { return; }
+        e.preventDefault();
+        var table = form.querySelector(".tpltbl");
+        if (!table) { return; }
+        table.appendChild(tpl.content.cloneNode(true));
+        renumberTpl();
+      });
+    }
+
+    var ups = form.querySelectorAll(".tpl-up");
+    for (var u = 0; u < ups.length; u++) {
+      if (ups[u].getAttribute("data-bound")) { continue; }
+      ups[u].setAttribute("data-bound", "1");
+      ups[u].addEventListener("click", function () {
+        var row = this.closest(".tplrow");
+        var prev = row && row.previousElementSibling;
+        if (!prev || !prev.classList.contains("tplrow")) { return; }
+        var a = row.querySelector(".tpl-pos");
+        var b = prev.querySelector(".tpl-pos");
+        if (a && b) { var t = a.value; a.value = b.value; b.value = t; }
+      });
+    }
+
+    var downs = form.querySelectorAll(".tpl-down");
+    for (var d = 0; d < downs.length; d++) {
+      if (downs[d].getAttribute("data-bound")) { continue; }
+      downs[d].setAttribute("data-bound", "1");
+      downs[d].addEventListener("click", function () {
+        var row = this.closest(".tplrow");
+        var next = row && row.nextElementSibling;
+        if (!next || !next.classList.contains("tplrow")) { return; }
+        var a = row.querySelector(".tpl-pos");
+        var b = next.querySelector(".tpl-pos");
+        if (a && b) { var t = a.value; a.value = b.value; b.value = t; }
+      });
+    }
+
+    var dels = form.querySelectorAll(".tpl-delbox");
+    for (var x = 0; x < dels.length; x++) {
+      if (dels[x].getAttribute("data-bound")) { continue; }
+      dels[x].setAttribute("data-bound", "1");
+      dels[x].addEventListener("change", function () {
+        var row = this.closest(".tplrow");
+        if (row) { row.classList.toggle("gone", this.checked); }
+      });
+    }
+  }
+
+  if (document.getElementById("tpl-form")) { bindTplEditor(); }
 
   var recLinks = document.querySelectorAll(".rec-open");
   for (var n = 0; n < recLinks.length; n++) {
@@ -532,6 +772,28 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
           return r.text();
         })
         .then(function (html) { openSheet(html, title); })
+        .catch(function () { location.href = href; });
+    });
+  }
+
+  /* ---- 编辑模板（改表格结构）----
+     有 JS：点「编辑」取一段 HTML 塞进弹出层，页面上直接改。
+     没 JS：点「编辑」走普通链接，服务端把编辑器渲染在预览区顶部，一样能用。 */
+  var tplLinks = document.querySelectorAll(".tpl-open");
+  for (var p = 0; p < tplLinks.length; p++) {
+    tplLinks[p].addEventListener("click", function (e) {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+      if (!sheet || !window.fetch) return;
+      e.preventDefault();
+      var id = this.getAttribute("data-tpl");
+      var title = this.getAttribute("data-title") || "编辑模板";
+      var href = this.getAttribute("href");
+      fetch("/admin/forms/template/" + id + "/edit", { credentials: "same-origin" })
+        .then(function (r) {
+          if (!r.ok) { throw new Error("HTTP " + r.status); }
+          return r.text();
+        })
+        .then(function (html) { openSheet(html, title); bindTplEditor(); })
         .catch(function () { location.href = href; });
     });
   }
