@@ -25,7 +25,8 @@ pub struct LoginForm {
 
 /* ------------------------------------------------------------ 页面 */
 
-/// 五个标签页的统一入口：`概览 / 版本 / 登记 / 模板 / 名单`。
+/// 四个顶层标签的统一入口：`概览 / 表单登记 / 版本更新 / 登录管理`。
+/// 其中「表单登记」和「登录管理」下面还有二级标签，用 `sub` 参数选。
 ///
 /// 所有内容**一次渲染完**，切标签由页面里 20 行 JS 切 `hidden`（不刷新），
 /// URL 用 `replaceState` 同步，所以刷新和书签都能回到同一个标签。
@@ -34,9 +35,15 @@ pub struct LoginForm {
 pub struct PageQuery {
     #[serde(default)]
     pub tab: Option<String>,
+    /// 二级标签（表单登记 / 登录管理 下面那层）
     #[serde(default)]
+    pub sub: Option<String>,
+    /// 要预览/编辑的登记记录 id
+    #[serde(default, deserialize_with = "crate::opt_i64")]
+    pub rec: Option<i64>,
+    #[serde(default, deserialize_with = "crate::opt_i64")]
     pub template: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::opt_i64")]
     pub user: Option<i64>,
     #[serde(default)]
     pub from: Option<String>,
@@ -49,12 +56,27 @@ pub struct PageQuery {
 }
 
 impl PageQuery {
-    fn tab(&self) -> &str {
+    pub(crate) fn tab(&self) -> &str {
         let t = self.tab.as_deref().unwrap_or("overview").trim();
         if html::TABS.iter().any(|(k, _)| *k == t) {
             t
         } else {
             "overview"
+        }
+    }
+
+    /// 二级标签。没给或给错了就用这个顶层标签的默认那一项。
+    pub(crate) fn sub(&self, tab: &str) -> &str {
+        let s = self.sub.as_deref().unwrap_or("").trim();
+        let ok = html::SUBTABS
+            .iter()
+            .find(|(t, _)| *t == tab)
+            .map(|(_, subs)| subs.iter().any(|(k, _)| *k == s))
+            .unwrap_or(false);
+        if ok {
+            s
+        } else {
+            html::default_sub(tab)
         }
     }
 }
@@ -69,6 +91,7 @@ pub async fn page(
     }
 
     let active = q.tab().to_string();
+    let active_sub = q.sub(&active).to_string();
     let tz = state.cfg.tz_offset_min;
 
     let (overview, versions, counts, subtitle) = {
@@ -84,6 +107,7 @@ pub async fn page(
         };
 
         let stats = db::form_stats(&conn);
+        let admin_count = db::admin_users(&conn).unwrap_or_default().len() as i64;
         let stat_cards = [
             html::stat("启用模板", stats.templates),
             html::stat("可填人数", stats.users),
@@ -189,12 +213,11 @@ pub async fn page(
   </div>"##
         );
 
-        let counts: [(&str, i64); 5] = [
+        let counts: [(&str, i64); 4] = [
             ("overview", 0),
-            ("versions", releases.len() as i64),
             ("register", stats.submissions),
-            ("templates", stats.templates),
-            ("users", stats.users),
+            ("versions", releases.len() as i64),
+            ("login", stats.users + admin_count),
         ];
 
         let subtitle = format!(
@@ -211,16 +234,25 @@ pub async fn page(
         (overview, versions, counts, subtitle)
     };
 
-    // 登记 / 模板 / 名单三段在 forms.rs（业务归业务，页面只是拼装）
+    // 表单预览 / 模板管理 / 客户端 / 管理端 四段在 forms.rs（业务归业务，页面只是拼装）
     let fq = crate::forms::AdminQuery {
         template: q.template,
         user: q.user,
         from: q.from.clone(),
         to: q.to.clone(),
+        rec: q.rec,
     };
-    let (register, templates, users) = crate::forms::panes(&state, &fq);
+    let panes = crate::forms::panes(&state, &fq);
 
     let hide = |pane: &str| if pane == active { "" } else { "hidden" };
+    // 二级标签：只有"顶层标签正开着 + 这一项正是当前子标签"时才显示
+    let hide_sub = |tab: &str, sub: &str| {
+        if tab == active && sub == active_sub {
+            ""
+        } else {
+            "hidden"
+        }
+    };
 
     let body = html::PAGE
         .replace("%%SUBTITLE%%", &crate::escape(&subtitle))
@@ -229,13 +261,19 @@ pub async fn page(
         .replace("%%HIDE_OVERVIEW%%", hide("overview"))
         .replace("%%HIDE_VERSIONS%%", hide("versions"))
         .replace("%%HIDE_REGISTER%%", hide("register"))
-        .replace("%%HIDE_TEMPLATES%%", hide("templates"))
-        .replace("%%HIDE_USERS%%", hide("users"))
+        .replace("%%HIDE_LOGIN%%", hide("login"))
+        .replace("%%SUB_REGISTER%%", &crate::html::sub_tabs("register", &active_sub))
+        .replace("%%SUB_LOGIN%%", &crate::html::sub_tabs("login", &active_sub))
+        .replace("%%HIDE_REG_PREVIEW%%", hide_sub("register", "preview"))
+        .replace("%%HIDE_REG_TEMPLATES%%", hide_sub("register", "templates"))
+        .replace("%%HIDE_LOGIN_CLIENTS%%", hide_sub("login", "clients"))
+        .replace("%%HIDE_LOGIN_ADMINS%%", hide_sub("login", "admins"))
         .replace("%%PANE_OVERVIEW%%", &overview)
         .replace("%%PANE_VERSIONS%%", &versions)
-        .replace("%%PANE_REGISTER%%", &register)
-        .replace("%%PANE_TEMPLATES%%", &templates)
-        .replace("%%PANE_USERS%%", &users);
+        .replace("%%PANE_REG_PREVIEW%%", &panes.preview)
+        .replace("%%PANE_REG_TEMPLATES%%", &panes.templates)
+        .replace("%%PANE_LOGIN_CLIENTS%%", &panes.clients)
+        .replace("%%PANE_LOGIN_ADMINS%%", &panes.admins);
 
     Html(body).into_response()
 }
@@ -246,10 +284,27 @@ pub async fn login(
     State(state): State<AppState>,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let expected = state.cfg.admin_token.trim();
     let given = form.token.trim();
 
-    if expected.is_empty() || !constant_time_eq(expected.as_bytes(), given.as_bytes()) {
+    // 两种口令都认：
+    //   ① 环境变量 ADMIN_TOKEN —— 超级管理员，compose 里那个，改它要重启容器
+    //   ② admin_users 表里某个人的口令 —— 可以在「登录管理 → 管理端」里加和改
+    let mut admin_id: Option<i64> = None;
+    if !state.cfg.admin_token.trim().is_empty()
+        && constant_time_eq(state.cfg.admin_token.trim().as_bytes(), given.as_bytes())
+    {
+        admin_id = Some(0);
+    } else if !given.is_empty() {
+        let hash = crate::forms::token_hash(given);
+        let conn = state.conn.lock().unwrap();
+        if let Ok(Some(u)) = db::admin_user_by_hash(&conn, &hash) {
+            if u.enabled {
+                admin_id = Some(u.id);
+            }
+        }
+    }
+
+    let Some(admin_id) = admin_id else {
         let mut response = Html(html::LOGIN.replace(
             "%%ERROR%%",
             r#"<div class="err">口令不对</div>"#,
@@ -257,9 +312,9 @@ pub async fn login(
         .into_response();
         *response.status_mut() = StatusCode::UNAUTHORIZED;
         return response;
-    }
+    };
 
-    let cookie = state.auth.issue_cookie();
+    let cookie = state.auth.issue_cookie(admin_id);
     let mut response = Redirect::to("/admin?ok=%E7%99%BB%E5%BD%95%E6%88%90%E5%8A%9F").into_response();
     if let Ok(value) = header::HeaderValue::from_str(&cookie) {
         response.headers_mut().append(header::SET_COOKIE, value);

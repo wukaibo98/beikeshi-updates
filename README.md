@@ -5,14 +5,16 @@
 
 ```bash
 GET /latest.json?client=web      # 客户端拿清单
-GET /packages/bkstools-0.2.0.exe # 下包
-GET /admin                       # 管理页：上传 / 发布 / 回滚 / 删除
-GET /admin/forms                 # 表单收集：提交记录 / 名单 / 导出 xlsx
+GET /packages/bkstools-0.5.0.exe # 下包
+GET /admin                       # 管理页：概览 / 表单登记 / 版本更新 / 登录管理
 ```
 
-当前服务端版本 **0.3.1**（跟客户端版本无关）。跑在 NAS 上，镜像
-`ghcr.io/wukaibo98/beikeshi-updates:latest`，容器内端口 8080，NAS 映射到 **50205**；
-公网经 Lucky 反代到 `https://bks.beikeshi.cn:54321`。
+当前服务端版本 **0.4.0**（跟客户端版本无关）。跑在 NAS 上，容器名 `bks-updates`，
+容器内端口 8080，NAS 映射到 **50205**；公网经 Lucky 反代到 `https://bks.beikeshi.cn:54321`。
+
+> **部署方式**：镜像**在本机构建**（`docker build` → `docker save | gzip` → `ssh cat` 传到 NAS
+> → `docker load` → `compose up -d`），不再从 ghcr 拉。步骤见下面「部署到 NAS」。
+> ghcr 上那个镜像只作备用（要多架构时才用）。
 
 ## 三份文档
 
@@ -147,32 +149,66 @@ GET /latest.json?client=python → 404「未知客户端：python」
 3. 每条提交都冻结一份字段定义快照（`template_snapshot`）。
    模板改了以后，导出的列按提交自带的快照取 —— 这条不守，历史数据会串列且没法修。
 
-### 管理页是标签页
+### 管理页是标签页（v0.4 起两级）
 
-`GET /admin` 一次返回全部内容，页面上有五个标签（切标签不刷新，URL 会同步成
-`?tab=`）：
+`GET /admin` 一次返回全部内容，页面上有**四个顶层标签**，
+其中两个下面还有**二级标签**（切标签不刷新，URL 同步成 `?tab=&sub=`）：
 
-| `?tab=` | 内容 |
-|---|---|
-| `overview` | **谁在连服务器**（最近活动：谁/机器、IP、最后动作、时间）+ 概况数字 + 地址 |
-| `versions` | 发布新版本 + 版本列表 |
-| `register` | 提交记录（按模板/人/日期筛选）+ 导出 xlsx |
-| `templates` | 模板只读清单 + 应急停用开关 |
-| `users` | 谁能填表：添加 / 停用 / 改名 / **删除** |
+| `?tab=` | `?sub=` | 内容 |
+|---|---|---|
+| `overview` | — | **谁在连服务器**（最近活动：谁/机器、IP、最后动作、时间）+ 概况数字 + 地址 |
+| `register` | `preview` | **表单预览**：按模板分组列出登记，点「预览」打开**可编辑的表格**；每组一个「导出这个模板」 |
+| `register` | `templates` | **模板管理**：停用 / 启用 / **删除**（删是软删除，见下）+ 已删除的模板清单 |
+| `versions` | — | 发布新版本 + 版本列表 |
+| `login` | `clients` | **客户端**：谁能填表（姓名白名单）—— 添加 / 停用 / 改名 / 删除 |
+| `login` | `admins` | **管理端**：谁能登进管理页 —— 添加 / 改口令 / 停用 / 删除 |
+
+二级标签没给就用该顶层标签的第一项（`register` → `preview`，`login` → `clients`）。
+标签本身是 `<a href="?tab=&sub=">`，没有 JS 时点它照样整页跳转。
 
 旧地址 `/admin/forms` 会 302 到 `?tab=register`，书签不会失效。
+
+### 删模板 = 软删除（历史表格不受影响）
+
+「删除」不是真删：
+
+- 模板这一行**留在库里**，只打一个 `deleted_at` 时间戳，名字改成「原名（已删除）」
+  （`name` 上有 UNIQUE，不改名就没法用同一个名字重新建一个模板 —— "删了重做"是最常见的用法）；
+- **已经填过的登记一条都不动**，导出出来的表格也照旧能导；
+- 历史登记里显示的仍是原来那张表（`客户需求表（已删除）`），不会变成一个光秃秃的 `#3`；
+- 客户端下次拉取就看不到这个模板了；往已删模板**提交新登记会被拒**。
+
+「已删除的模板」清单列在「模板管理」下面，让人看得到历史还在。
+
+### 管理端人员与口令
+
+`ADMIN_TOKEN` 环境变量那个口令仍然是**超级管理员**（在 compose 的 `.env` 里，改它要重启容器）。
+除它以外，还能在「登录管理 → 管理端」里给别的人各配一个口令：
+
+- 口令**只存 sha256 哈希**，库里看不到原文，页面也不显示；
+- 登录时环境变量口令和库里的人员口令**都认**；
+- 忘了口令就用环境变量口令登进来，在「管理端」里「改口令」重置；
+- 停用后这个人立刻登不进来（已登录的 Cookie 还能用到他下次请求，之后失效）。
 
 ### 表单收集（管理页，沿用 admin Cookie）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin?tab=register` | 提交记录（可筛选） |
-| GET | `/admin?tab=templates` | 模板清单（只读） |
-| GET | `/admin?tab=users` | 用户名单 |
+| GET | `/admin?tab=register&sub=preview` | 表单预览（按模板分组，可筛选） |
+| GET | `/admin/forms/submission/{id}/edit` | 单条登记的**可编辑表单**（HTML 片段，弹层用） |
+| POST | `/admin/forms/submission/save` | 改一条登记的**内容**（字段定义快照不动，改了列就串了） |
+| GET | `/admin?tab=register&sub=templates` | 模板清单（能停用、能删除） |
+| GET | `/admin?tab=login&sub=clients` | 客户端名单 |
+| GET | `/admin?tab=login&sub=admins` | 管理端人员 |
 | POST | `/admin/users/save` | 加人 / 改名。**加人必须有界面**，否则新人用不了等于只有你能维护 |
 | POST | `/admin/users/toggle` | 停用 / 启用（停用后登录失败，历史提交保留） |
 | POST | `/admin/users/delete` | 删除。**历史提交不动**（记录里冗余存了姓名，删了人还认得出是谁填的） |
+| POST | `/admin/admins/save` | 加管理端人员 / 改口令（两次口令要一样） |
+| POST | `/admin/admins/token` | 只改口令，不改名字 |
+| POST | `/admin/admins/toggle` | 停用 / 启用管理端人员 |
+| POST | `/admin/admins/delete` | 删除管理端人员 |
 | POST | `/admin/forms/template/toggle` | 模板应急开关：改坏了可以在这里停掉，客户端下次拉取就不再显示 |
+| POST | `/admin/forms/template/delete` | **软删除**模板（历史登记与已导出表格不受影响） |
 | GET | `/admin/forms/export.xlsx` | 导出，**必须先选模板**：一次只导一个模板，否则列会稀疏得没法看 |
 
 ## 环境变量

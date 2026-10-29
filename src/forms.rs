@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::Form;
 use std::net::SocketAddr;
 use axum::http::{HeaderMap, StatusCode};
@@ -497,6 +497,10 @@ pub async fn submit(
     // 取提交时那一版的字段定义 —— 客户端离线几天也不会串列
     let schema_json = {
         let conn = state.conn.lock().unwrap();
+        // 模板被删了（软删除）就不该再收新登记
+        if db::form_template_deleted(&conn, req.template_id).unwrap_or(false) {
+            return bad(StatusCode::UNPROCESSABLE_ENTITY, "这个表单已经被删除了，不能再提交");
+        }
         db::form_template_schema(&conn, req.template_id, req.template_version).ok().flatten()
     };
     let Some(schema_json) = schema_json else {
@@ -613,14 +617,17 @@ pub async fn mine(
 /// `/admin/forms` 的查询与筛选参数。ok/err 是闪信，跟分发页共用一套。
 #[derive(Deserialize)]
 pub struct AdminQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::opt_i64")]
     pub template: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::opt_i64")]
     pub user: Option<i64>,
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
+    /// 要预览/编辑的那条登记
+    #[serde(default, deserialize_with = "crate::opt_i64")]
+    pub rec: Option<i64>,
 }
 
 impl AdminQuery {
@@ -654,78 +661,172 @@ fn parse_date(s: Option<&str>, end_of_day: bool) -> Option<i64> {
     Some(dt.assume_utc().unix_timestamp())
 }
 
-/// 三块内容，供 `admin::page` 拼进标签页。鉴权在调用方做过了。
-pub fn panes(state: &AppState, q: &AdminQuery) -> (String, String, String) {
+/// 管理页里那四段内容。鉴权在调用方做过了。
+pub struct AdminPanes {
+    /// 表单登记 → 表单预览
+    pub preview: String,
+    /// 表单登记 → 模板管理
+    pub templates: String,
+    /// 登录管理 → 客户端（姓名白名单）
+    pub clients: String,
+    /// 登录管理 → 管理端（管理口令）
+    pub admins: String,
+}
 
+/// 导出链接带上当前筛选，所见即所得。
+fn export_url(q: &AdminQuery, template: Option<i64>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = template {
+        parts.push(format!("template={t}"));
+    }
+    if let Some(u) = q.user {
+        parts.push(format!("user={u}"));
+    }
+    if let Some(f) = q.from.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("from={f}"));
+    }
+    if let Some(t) = q.to.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("to={t}"));
+    }
+    if parts.is_empty() {
+        "/admin/forms/export.xlsx".to_string()
+    } else {
+        format!("/admin/forms/export.xlsx?{}", parts.join("&"))
+    }
+}
+
+/// 一条登记的摘要：取前几个字段拼成"标签：值"，太长截断。
+fn record_summary(schema: Option<&Schema>, data: &Map<String, Value>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match schema {
+        Some(s) => {
+            for f in s.fields.iter().take(4) {
+                let v = data.get(&f.key).map(value_text).unwrap_or_default();
+                if v.is_empty() {
+                    continue;
+                }
+                parts.push(format!("{}：{}", f.label, v));
+            }
+        }
+        None => {
+            for (k, v) in data.iter().take(4) {
+                let t = value_text(v);
+                if !t.is_empty() {
+                    parts.push(format!("{k}：{t}"));
+                }
+            }
+        }
+    }
+    let text = parts.join("　");
+    if text.chars().count() > 90 {
+        let cut: String = text.chars().take(90).collect();
+        format!("{cut}…")
+    } else {
+        text
+    }
+}
+
+/// 四段内容，供 `admin::page` 拼进标签页。
+pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
     let (from, to) = q.range();
     let filter = db::SubmissionFilter {
         template_id: q.template,
         user_id: q.user,
         from,
         to,
-        limit: 50,
+        limit: 200,
         offset: 0,
     };
 
-    let (rows_html, total, tpl_rows, user_rows, tpl_opts, user_opts) = {
+    let (
+        total,
+        tpl_rows,
+        user_rows,
+        tpl_opts,
+        user_opts,
+        preview_groups,
+        editor_html,
+        deleted_rows,
+    ) = {
         let conn = state.conn.lock().unwrap();
 
         let rows = db::form_submissions(&conn, &filter).unwrap_or_default();
         let total = db::form_submissions_count(&conn, &filter).unwrap_or(0);
 
-        // 模板名：一次取全，避免 N+1
-        let templates = db::form_templates(&conn, true).unwrap_or_default();
+        // 模板名：一次取全，避免 N+1。**含已删除的** —— 模板删了之后，
+        // 历史登记上要还显示它原来的名字，而不是一个光秃秃的 #3。
+        let templates_all = db::form_templates_all(&conn).unwrap_or_default();
         let name_of = |id: i64| -> String {
-            templates.iter().find(|t| t.id == id).map(|t| t.name.clone()).unwrap_or_else(|| format!("#{id}"))
+            templates_all
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("已删除的模板 #{id}"))
         };
 
-        let rows_html: String = rows
+        /* ---- 表单预览：按模板分组，每组一张表 + 一个导出按钮 ---- */
+        let mut groups: Vec<(i64, String, Vec<&db::FormSubmission>)> = Vec::new();
+        for r in &rows {
+            match groups.iter_mut().find(|(tid, _, _)| *tid == r.template_id) {
+                Some((_, _, list)) => list.push(r),
+                None => {
+                    let name = name_of(r.template_id);
+                    groups.push((r.template_id, name, vec![r]));
+                }
+            }
+        }
+        let preview_groups: String = groups
             .iter()
-            .map(|r| {
-                let schema: Option<Schema> = serde_json::from_str(&r.template_snapshot).ok();
-                let data: Map<String, Value> = serde_json::from_str::<Value>(&r.data_json)
-                    .ok()
-                    .and_then(|v| v.as_object().cloned())
-                    .unwrap_or_default();
-                let pairs: Vec<(String, String)> = match schema {
-                    Some(s) => s
-                        .fields
-                        .iter()
-                        .map(|f| {
-                            let v = data
-                                .get(&f.key)
-                                .map(value_text)
+            .map(|(tid, name, list)| {
+                let body: String = list
+                    .iter()
+                    .map(|r| {
+                        let schema: Option<Schema> =
+                            serde_json::from_str(&r.template_snapshot).ok();
+                        let data: Map<String, Value> =
+                            serde_json::from_str::<Value>(&r.data_json)
+                                .ok()
+                                .and_then(|v| v.as_object().cloned())
                                 .unwrap_or_default();
-                            (f.label.clone(), v)
-                        })
-                        .collect(),
-                    None => data
-                        .iter()
-                        .map(|(k, v)| (k.clone(), value_text(v)))
-                        .collect(),
-                };
-                html::form_submission_row(
-                    &crate::admin::short_time(r.client_time, state.cfg.tz_offset_min),
-                    &crate::admin::short_time(r.created_at, state.cfg.tz_offset_min),
-                    &name_of(r.template_id),
-                    r.template_version,
-                    &r.user_name,
-                    &pairs,
+                        html::form_record_row(
+                            r.id,
+                            &crate::admin::short_time(r.client_time, state.cfg.tz_offset_min),
+                            &r.user_name,
+                            &crate::escape(&record_summary(schema.as_ref(), &data)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!(
+                    r#"<div class="card">
+  <h2>{name}<span class="muted">{n} 条</span>
+    <a class="ghost" href="{export}" style="float:right">导出这个模板</a></h2>
+  <table>
+    <tr><th>填写时间</th><th>提交人</th><th>内容</th><th>操作</th></tr>
+    {body}
+  </table>
+</div>"#,
+                    name = crate::escape(name),
+                    n = list.len(),
+                    export = crate::escape(&export_url(q, Some(*tid))),
                 )
             })
             .collect::<Vec<_>>()
             .join("");
-        let rows_html = if rows_html.is_empty() {
-            r#"<tr><td colspan="4" class="muted">没有符合条件的记录</td></tr>"#.to_string()
-        } else {
-            rows_html
-        };
 
+        /* ---- 模板管理：能停用也能删（删是软删，历史登记不受影响）---- */
+        let templates = db::form_templates(&conn, true).unwrap_or_default();
+        let sub_counts = db::form_submissions_count_by_template(&conn).unwrap_or_default();
         let tpl_rows: String = templates
             .iter()
             .map(|t| {
                 let count = serde_json::from_str::<Schema>(&t.schema_json)
                     .map(|s| s.fields.len())
+                    .unwrap_or(0);
+                let subs = sub_counts
+                    .iter()
+                    .find(|(tid, _)| *tid == t.id)
+                    .map(|(_, n)| *n)
                     .unwrap_or(0);
                 html::form_template_row(
                     t.id,
@@ -734,6 +835,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> (String, String, String) {
                     count,
                     &crate::admin::short_time(t.updated_at, state.cfg.tz_offset_min),
                     t.is_active,
+                    subs,
                 )
             })
             .collect::<Vec<_>>()
@@ -744,6 +846,26 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> (String, String, String) {
             tpl_rows
         };
 
+        /* ---- 已删除的模板：单独列出来，让人看得到历史还在 ---- */
+        let deleted_rows: String = templates_all
+            .iter()
+            .filter(|t| t.deleted_at > 0)
+            .map(|t| {
+                let subs = sub_counts
+                    .iter()
+                    .find(|(tid, _)| *tid == t.id)
+                    .map(|(_, n)| *n)
+                    .unwrap_or(0);
+                format!(
+                    r#"<tr><td><b>{name}</b></td><td>{when}</td><td>{subs} 条登记还在</td></tr>"#,
+                    name = crate::escape(&t.name),
+                    when = crate::admin::short_time(t.deleted_at, state.cfg.tz_offset_min),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+
+        /* ---- 客户端名单 ---- */
         let users = db::form_users(&conn).unwrap_or_default();
         let user_rows: String = users
             .iter()
@@ -770,62 +892,131 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> (String, String, String) {
             "全部人",
         );
 
-        (rows_html, total, tpl_rows, user_rows, tpl_opts, user_opts)
+        /* ---- 要预览的那条：渲染成可编辑的表单 ---- */
+        let editor_html = match q.rec {
+            Some(id) => db::form_submission_by_id(&conn, id)
+                .ok()
+                .flatten()
+                .map(|r| {
+                    let schema: Option<Schema> = serde_json::from_str(&r.template_snapshot).ok();
+                    let data: Map<String, Value> = serde_json::from_str::<Value>(&r.data_json)
+                        .ok()
+                        .and_then(|v| v.as_object().cloned())
+                        .unwrap_or_default();
+                    let fields: Vec<html::EditorField> = match &schema {
+                        Some(s) => s
+                            .fields
+                            .iter()
+                            .map(|f| html::EditorField {
+                                key: f.key.clone(),
+                                label: f.label.clone(),
+                                kind: f.kind.clone(),
+                                value: data.get(&f.key).map(value_text).unwrap_or_default(),
+                                options: f.options.clone().unwrap_or_default(),
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    html::submission_editor(
+                        r.id,
+                        &name_of(r.template_id),
+                        &r.user_name,
+                        &crate::admin::short_time(r.client_time, state.cfg.tz_offset_min),
+                        &fields,
+                    )
+                })
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+
+        (
+            total,
+            tpl_rows,
+            user_rows,
+            tpl_opts,
+            user_opts,
+            preview_groups,
+            editor_html,
+            deleted_rows,
+        )
     };
 
-    // 导出链接带上当前筛选，所见即所得
-    let mut export = String::from("/admin/forms/export.xlsx?");
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = q.template {
-        parts.push(format!("template={t}"));
-    }
-    if let Some(u) = q.user {
-        parts.push(format!("user={u}"));
-    }
-    if let Some(f) = q.from.as_deref().filter(|s| !s.trim().is_empty()) {
-        parts.push(format!("from={f}"));
-    }
-    if let Some(t) = q.to.as_deref().filter(|s| !s.trim().is_empty()) {
-        parts.push(format!("to={t}"));
-    }
-    export.push_str(&parts.join("&"));
+    /* ------------------------------------------------------------ 表单预览 */
 
-    let register = format!(
+    // 工具条上的导出按钮：没选模板时不给链接（点下去只会跳回来报错），
+    // 下面每个模板分组里各有一个「导出这个模板」，那个永远能用。
+    let export_btn = if q.template.is_some() {
+        format!(
+            r#"<a class="primary" href="{url}">导出 xlsx</a>"#,
+            url = crate::escape(&export_url(q, q.template))
+        )
+    } else {
+        r#"<span class="muted">导出：在下面选一个模板，或直接点分组里的「导出这个模板」</span>"#.to_string()
+    };
+
+    let preview = format!(
         r##"<div class="card">
-    <h2>提交记录<span class="muted">共 {} 条，最多显示最近 50 条</span></h2>
+    <h2>表单预览<span class="muted">共 {total} 条；点「预览」可以查看和修改这一条</span></h2>
     <form method="get" action="/admin" class="row" style="margin-bottom:12px">
       <input type="hidden" name="tab" value="register">
+      <input type="hidden" name="sub" value="preview">
       <select name="template">{tpl_opts}</select>
       <select name="user">{user_opts}</select>
       <label>从 <input type="date" name="from" value="{from}"></label>
       <label>到 <input type="date" name="to" value="{to}"></label>
       <button type="submit">筛选</button>
-      <a class="primary" href="{export}">导出 xlsx</a>
+      {export_btn}
     </form>
-    <table>
-      <tr><th>填写时间</th><th>模板</th><th>提交人</th><th>内容</th></tr>
-      {rows_html}
-    </table>
+    <div id="rec-editor-host">{editor}</div>
+    {groups}
   </div>"##,
-        total,
+        total = total,
         from = crate::escape(q.from.as_deref().unwrap_or("")),
         to = crate::escape(q.to.as_deref().unwrap_or("")),
-        export = crate::escape(&export),
+        editor = if editor_html.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div id="rec-editor">{editor_html}</div>"#)
+        },
+        groups = if preview_groups.is_empty() {
+            r#"<p class="muted">这个筛选下没有记录。</p>"#.to_string()
+        } else {
+            preview_groups
+        },
     );
+
+    /* ------------------------------------------------------------ 模板管理 */
 
     let templates = format!(
         r##"<div class="card">
-    <h2>模板<span class="muted">在客户端「模板管理」里编辑，这里只读；改坏了可以在这里停用</span></h2>
+    <h2>模板<span class="muted">在客户端「模板管理」里编辑；这里可以停用，也可以删除</span></h2>
     <table>
       <tr><th>名称</th><th>版本</th><th>字段</th><th>更新时间</th><th>状态</th><th>操作</th></tr>
       {tpl_rows}
     </table>
-  </div>"##
+    <p class="muted" style="margin-top:12px">
+      「停用」只是不让客户端再显示；「删除」是把模板从列表里去掉 ——
+      <b>已经填过的登记和已经导出的表格都保留不变</b>，历史记录里还是原来那张表。
+    </p>
+  </div>
+  <div class="card">
+    <h2>已删除的模板<span class="muted">从列表里删掉了，但填过的登记和导出的表格都还在</span></h2>
+    {deleted}
+  </div>"##,
+        deleted = if deleted_rows.is_empty() {
+            r#"<p class="muted">还没有删过模板。</p>"#.to_string()
+        } else {
+            format!(
+                r#"<table><tr><th>名称</th><th>删除时间</th><th>历史</th></tr>{deleted_rows}</table>"#
+            )
+        },
     );
 
-    let users = format!(
+    /* ------------------------------------------------------------ 客户端 */
+
+    let clients = format!(
         r##"<div class="card">
-    <h2>用户（谁能填表）</h2>
+    <h2>客户端（谁能填表）</h2>
     <form method="post" action="/admin/users/save" class="row" style="margin-bottom:12px">
       <input type="text" name="name" placeholder="中文姓名" required>
       <button type="submit">添加</button>
@@ -838,7 +1029,54 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> (String, String, String) {
   </div>"##
     );
 
-    (register, templates, users)
+    /* ------------------------------------------------------------ 管理端 */
+
+    let admins = {
+        let conn = state.conn.lock().unwrap();
+        let rows = db::admin_users(&conn).unwrap_or_default();
+        let body: String = rows
+            .iter()
+            .map(|a| {
+                html::admin_user_row(
+                    a.id,
+                    &a.name,
+                    a.enabled,
+                    &crate::admin::short_time(a.updated_at, state.cfg.tz_offset_min),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let body = if body.is_empty() {
+            String::new()
+        } else {
+            format!("<tbody>{body}</tbody>")
+        };
+        let env_row = html::admin_env_row(!state.cfg.admin_token.trim().is_empty());
+        format!(
+            r##"<div class="card">
+    <h2>管理端<span class="muted">谁可以登进这个管理页</span></h2>
+    <form method="post" action="/admin/admins/save" class="row" style="margin-bottom:12px">
+      <input type="text" name="name" placeholder="姓名" required>
+      <input type="password" name="token" placeholder="登录口令" required>
+      <input type="password" name="token2" placeholder="再输一次" required>
+      <button type="submit">添加</button>
+      <span class="muted">口令只存哈希，库里看不到原文；忘了就用环境变量口令进来改</span>
+    </form>
+    <table>
+      <tr><th>姓名</th><th>状态</th><th>更新时间</th><th>操作</th></tr>
+      {env_row}
+      {body}
+    </table>
+  </div>"##
+        )
+    };
+
+    AdminPanes {
+        preview,
+        templates,
+        clients,
+        admins,
+    }
 }
 
 fn select_options(items: &[(String, String)], selected: Option<&str>, all_label: &str) -> String {
@@ -882,14 +1120,14 @@ pub async fn user_save(
     Form(form): Form<UserSaveForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("users", "请先登录");
+        return redirect_err("login", "clients", "请先登录");
     }
     let name = form.name.trim().to_string();
     if name.is_empty() {
-        return redirect_err("users", "姓名不能为空");
+        return redirect_err("login", "clients", "姓名不能为空");
     }
     if name.chars().count() > 20 {
-        return redirect_err("users", "姓名最多 20 个字");
+        return redirect_err("login", "clients", "姓名最多 20 个字");
     }
 
     let result = {
@@ -897,12 +1135,12 @@ pub async fn user_save(
         db::form_user_save(&conn, form.id, &name)
     };
     match result {
-        Ok(_) => redirect_ok("users", &format!("已保存「{name}」")),
+        Ok(_) => redirect_ok("login", "clients", &format!("已保存「{name}」")),
         Err(e) => {
             if e.to_string().contains("UNIQUE") {
-                redirect_err("users", "已经有同名的人了")
+                redirect_err("login", "clients", "已经有同名的人了")
             } else {
-                redirect_err("users", &format!("保存失败：{e}"))
+                redirect_err("login", "clients", &format!("保存失败：{e}"))
             }
         }
     }
@@ -921,7 +1159,7 @@ pub async fn user_toggle(
     Form(form): Form<UserToggleForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("users", "请先登录");
+        return redirect_err("login", "clients", "请先登录");
     }
     let enabled = matches!(form.enabled.as_deref(), Some("1") | Some("true"));
     let result = {
@@ -929,8 +1167,8 @@ pub async fn user_toggle(
         db::form_user_toggle(&conn, form.id, enabled)
     };
     match result {
-        Ok(()) => redirect_ok("users", if enabled { "已启用" } else { "已停用" }),
-        Err(e) => redirect_err("users", &format!("操作失败：{e}")),
+        Ok(()) => redirect_ok("login", "clients", if enabled { "已启用" } else { "已停用" }),
+        Err(e) => redirect_err("login", "clients", &format!("操作失败：{e}")),
     }
 }
 
@@ -946,16 +1184,16 @@ pub async fn user_delete(
     Form(form): Form<UserDeleteForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("users", "请先登录");
+        return redirect_err("login", "clients", "请先登录");
     }
     let result = {
         let conn = state.conn.lock().unwrap();
         db::form_user_delete(&conn, form.id)
     };
     match result {
-        Ok(true) => redirect_ok("users", "已删除；他填过的登记保留不变"),
-        Ok(false) => redirect_err("users", "没有这个人"),
-        Err(e) => redirect_err("users", &format!("删除失败：{e}")),
+        Ok(true) => redirect_ok("login", "clients", "已删除；他填过的登记保留不变"),
+        Ok(false) => redirect_err("login", "clients", "没有这个人"),
+        Err(e) => redirect_err("login", "clients", &format!("删除失败：{e}")),
     }
 }
 
@@ -975,7 +1213,7 @@ pub async fn admin_template_toggle(
     Form(form): Form<TemplateToggleForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("templates", "请先登录");
+        return redirect_err("register", "templates", "请先登录");
     }
     let is_active = matches!(form.is_active.as_deref(), Some("1") | Some("true"));
     let result = {
@@ -984,26 +1222,341 @@ pub async fn admin_template_toggle(
     };
     match result {
         Ok(()) => redirect_ok(
+            "register",
             "templates",
             if is_active { "模板已启用" } else { "模板已停用，客户端下次拉取就不再显示" },
         ),
-        Err(e) => redirect_err("templates", &format!("操作失败：{e}")),
+        Err(e) => redirect_err("register", "templates", &format!("操作失败：{e}")),
+    }
+}
+
+/* -------------------------------------------------- 删模板（软删除） */
+
+#[derive(Deserialize)]
+pub struct TemplateDeleteForm {
+    id: i64,
+}
+
+/// 删模板。**软删除**：模板从列表里消失、客户端也拉不到，
+/// 但模板这一行还在库里 —— 历史登记还认得它的名字，已经导出的表格也不受影响。
+pub async fn admin_template_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TemplateDeleteForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("register", "templates", "请先登录");
+    }
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        db::form_template_delete(&conn, form.id)
+    };
+    match result {
+        Ok(true) => redirect_ok(
+            "register",
+            "templates",
+            "已删除；已经填过的登记和导出的表格都保留不变",
+        ),
+        Ok(false) => redirect_err("register", "templates", "没有这个模板（或已经删过了）"),
+        Err(e) => redirect_err("register", "templates", &format!("删除失败：{e}")),
+    }
+}
+
+/* -------------------------------------------- 登记的预览与编辑 */
+
+/// 取一条登记的编辑表单（HTML 片段）。「表单预览」点「预览」时用。
+pub async fn submission_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return (StatusCode::FORBIDDEN, "请先登录").into_response();
+    }
+    let conn = state.conn.lock().unwrap();
+    let Some(sub) = db::form_submission_by_id(&conn, id).ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "没有这条登记").into_response();
+    };
+    let schema: Option<Schema> = serde_json::from_str(&sub.template_snapshot).ok();
+    let data: Map<String, Value> = serde_json::from_str::<Value>(&sub.data_json)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let fields: Vec<html::EditorField> = match &schema {
+        Some(s) => s
+            .fields
+            .iter()
+            .map(|f| html::EditorField {
+                key: f.key.clone(),
+                label: f.label.clone(),
+                kind: f.kind.clone(),
+                value: data.get(&f.key).map(value_text).unwrap_or_default(),
+                options: f.options.clone().unwrap_or_default(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let templates = db::form_templates_all(&conn).unwrap_or_default();
+    let name = templates
+        .iter()
+        .find(|t| t.id == sub.template_id)
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| format!("已删除的模板 #{}", sub.template_id));
+    let html_out = html::submission_editor(
+        sub.id,
+        &name,
+        &sub.user_name,
+        &crate::admin::short_time(sub.client_time, state.cfg.tz_offset_min),
+        &fields,
+    );
+    (StatusCode::OK, html_out).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SubmissionSaveForm {
+    id: i64,
+    /// 每个字段一个 `f_<key>` 参数。这里统一收进来再按快照校验。
+    #[serde(flatten)]
+    fields: std::collections::HashMap<String, String>,
+}
+
+/// 改一条登记的内容。**只改 `data_json`**，字段定义（快照）不动 ——
+/// 改了列就会跟同模板的其他行对不上。
+pub async fn submission_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SubmissionSaveForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("register", "preview", "请先登录");
+    }
+
+    let conn = state.conn.lock().unwrap();
+    let Some(sub) = db::form_submission_by_id(&conn, form.id).ok().flatten() else {
+        return redirect_err("register", "preview", "没有这条登记");
+    };
+
+    // 按**提交那一刻的快照**校验：改完还得是一份合法的登记
+    let schema: Schema = match serde_json::from_str(&sub.template_snapshot) {
+        Ok(s) => s,
+        Err(_) => return redirect_err("register", "preview", "这条登记的字段定义坏了，改不了"),
+    };
+
+    let mut data = Map::new();
+    for f in &schema.fields {
+        let raw = form.fields.get(&format!("f_{}", f.key));
+        if let Some(v) = raw {
+            let v = v.trim();
+            if !v.is_empty() {
+                data.insert(f.key.clone(), Value::String(v.to_string()));
+            }
+        }
+    }
+
+    let errs = validate_data(&schema, &data);
+    if !errs.is_empty() {
+        // 报错带上字段名，不然客服不知道是哪一栏填错了
+        let label_of = |key: &str| {
+            schema
+                .fields
+                .iter()
+                .find(|f| f.key == key)
+                .map(|f| f.label.clone())
+                .unwrap_or_else(|| key.to_string())
+        };
+        let msg = errs
+            .iter()
+            .map(|(k, v)| format!("{v}（{}）", label_of(k)))
+            .collect::<Vec<_>>()
+            .join("；");
+        return redirect_err("register", "preview", &format!("没存上：{msg}"));
+    }
+
+    let data_json = Value::Object(data).to_string();
+    match db::form_submission_update(&conn, form.id, &data_json) {
+        Ok(true) => redirect_ok("register", "preview", "已保存"),
+        Ok(false) => redirect_err("register", "preview", "没有这条登记"),
+        Err(e) => redirect_err("register", "preview", &format!("保存失败：{e}")),
+    }
+}
+
+/* ------------------------------------------------- 管理端人员与口令 */
+
+/// 口令存哈希。**不存明文** —— 库文件被人拷走也猜不出口令。
+pub fn token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(token.trim().as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// 口令最少几个字。太短的口令跟没有口令差不多。
+const MIN_TOKEN_LEN: usize = 6;
+
+#[derive(Deserialize)]
+pub struct AdminSaveForm {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    token2: String,
+}
+
+/// 加一个管理端人员，或改已有人员的口令。
+pub async fn admin_user_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AdminSaveForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("login", "admins", "请先登录");
+    }
+    let name = form.name.trim().to_string();
+    if name.is_empty() {
+        return redirect_err("login", "admins", "姓名不能为空");
+    }
+    if name.chars().count() > 20 {
+        return redirect_err("login", "admins", "姓名最多 20 个字");
+    }
+
+    let token = form.token.trim();
+    if token.len() < MIN_TOKEN_LEN {
+        return redirect_err("login", "admins", &format!("口令至少 {MIN_TOKEN_LEN} 个字"));
+    }
+    if token != form.token2.trim() {
+        return redirect_err("login", "admins", "两次输的口令不一样");
+    }
+
+    let hash = token_hash(token);
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        match form.id {
+            Some(id) => db::admin_user_update(&conn, id, &name, Some(&hash)),
+            None => db::admin_user_create(&conn, &name, &hash).map(|_| true),
+        }
+    };
+    match result {
+        Ok(true) => redirect_ok("login", "admins", &format!("已保存「{name}」")),
+        Ok(false) => redirect_err("login", "admins", "没有这个人"),
+        Err(e) => {
+            if e.to_string().contains("UNIQUE") {
+                redirect_err("login", "admins", "已经有同名的人了")
+            } else {
+                redirect_err("login", "admins", &format!("保存失败：{e}"))
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AdminToggleForm {
+    id: i64,
+    #[serde(default)]
+    enabled: Option<String>,
+}
+
+pub async fn admin_user_toggle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AdminToggleForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("login", "admins", "请先登录");
+    }
+    let enabled = matches!(form.enabled.as_deref(), Some("1") | Some("true"));
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        db::admin_user_toggle(&conn, form.id, enabled)
+    };
+    match result {
+        Ok(true) => redirect_ok("login", "admins", if enabled { "已启用" } else { "已停用" }),
+        Ok(false) => redirect_err("login", "admins", "没有这个人"),
+        Err(e) => redirect_err("login", "admins", &format!("操作失败：{e}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AdminDeleteForm {
+    id: i64,
+}
+
+pub async fn admin_user_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AdminDeleteForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("login", "admins", "请先登录");
+    }
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        db::admin_user_delete(&conn, form.id)
+    };
+    match result {
+        Ok(true) => redirect_ok("login", "admins", "已删除；这个人之后登不进管理页了"),
+        Ok(false) => redirect_err("login", "admins", "没有这个人"),
+        Err(e) => redirect_err("login", "admins", &format!("删除失败：{e}")),
+    }
+}
+
+/// 改口令（管理端那一行的「改口令」按钮走这里）。
+#[derive(Deserialize)]
+pub struct AdminTokenForm {
+    id: i64,
+    #[serde(default)]
+    token: String,
+}
+
+pub async fn admin_user_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AdminTokenForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("login", "admins", "请先登录");
+    }
+    let token = form.token.trim();
+    if token.len() < MIN_TOKEN_LEN {
+        return redirect_err("login", "admins", &format!("口令至少 {MIN_TOKEN_LEN} 个字"));
+    }
+    let hash = token_hash(token);
+    let result = {
+        let conn = state.conn.lock().unwrap();
+        // 名字不改，只换口令
+        let name = db::admin_users(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.id == form.id)
+            .map(|a| a.name)
+            .unwrap_or_default();
+        if name.is_empty() {
+            Ok(false)
+        } else {
+            db::admin_user_update(&conn, form.id, &name, Some(&hash))
+        }
+    };
+    match result {
+        Ok(true) => redirect_ok("login", "admins", "口令已改"),
+        Ok(false) => redirect_err("login", "admins", "没有这个人"),
+        Err(e) => redirect_err("login", "admins", &format!("改口令失败：{e}")),
     }
 }
 
 /* ------------------------------------------------------------ 导出 xlsx */
-
 pub async fn export(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<AdminQuery>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
-        return redirect_err("register", "请先登录");
+        return redirect_err("register", "preview", "请先登录");
     }
     if q.template.is_none() {
         // 跨模板并排导，列会稀疏得没法看 —— 一次只导一个模板
-        return redirect_err("register", "导出请先选一个模板（一次只导一个）");
+        return redirect_err("register", "preview", "导出请先选一个模板（一次只导一个）");
     }
     let (from, to) = q.range();
     let filter = db::SubmissionFilter {
@@ -1027,13 +1580,13 @@ pub async fn export(
     };
 
     if rows.is_empty() {
-        return redirect_err("register", "这个筛选下没有记录可导出");
+        return redirect_err("register", "preview", "这个筛选下没有记录可导出");
     }
 
     let table = crate::xlsx::build_table(&rows, state.cfg.tz_offset_min);
     let bytes = match crate::xlsx::write_xlsx(&table, &sheet_name) {
         Ok(b) => b,
-        Err(e) => return redirect_err("register", &format!("生成表格失败：{e}")),
+        Err(e) => return redirect_err("register", "preview", &format!("生成表格失败：{e}")),
     };
 
     let filename = format!(
@@ -1081,21 +1634,22 @@ fn url_encode(s: &str) -> String {
 
 /* ------------------------------------------------------------ 跳转 */
 
-/// 管理页的操作都重定向回带标签的地址：加人回名单、停用模板回模板、
-/// 导出出错回登记 —— 不然一操作就跳回概览，还得再点一次。
-fn redirect_ok(tab: &str, msg: &str) -> Response {
-    redirect_with(tab, "ok", msg)
+/// 管理页的操作都重定向回带标签的地址：加人回「登录管理 → 客户端」、
+/// 停用模板回「表单登记 → 模板管理」、导出出错回「表单登记 → 表单预览」——
+/// 不然一操作就跳回概览，还得再点两次。
+fn redirect_ok(tab: &str, sub: &str, msg: &str) -> Response {
+    redirect_with(tab, sub, "ok", msg)
 }
 
-fn redirect_err(tab: &str, msg: &str) -> Response {
-    redirect_with(tab, "err", msg)
+fn redirect_err(tab: &str, sub: &str, msg: &str) -> Response {
+    redirect_with(tab, sub, "err", msg)
 }
 
-fn redirect_with(tab: &str, kind: &str, msg: &str) -> Response {
-    axum::response::Redirect::to(&format!(
-        "/admin?tab={tab}&{}={}",
-        kind,
-        url_encode(msg)
-    ))
-    .into_response()
+fn redirect_with(tab: &str, sub: &str, kind: &str, msg: &str) -> Response {
+    let mut url = format!("/admin?tab={tab}");
+    if !sub.is_empty() {
+        url.push_str(&format!("&sub={sub}"));
+    }
+    url.push_str(&format!("&{}={}", kind, url_encode(msg)));
+    axum::response::Redirect::to(&url).into_response()
 }

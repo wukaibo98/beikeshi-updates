@@ -235,6 +235,9 @@ pub struct FormTemplate {
     pub sort_order: i64,
     pub updated_at: i64,
     pub schema_json: String,
+    /// 软删除时间（0 = 没删）。删了之后模板不再出现在列表里，
+    /// 但这一行还在 —— 历史提交靠它认模板名，删干净了老记录就只剩个 id。
+    pub deleted_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -257,7 +260,15 @@ pub struct FormSubmission {
 
 pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS form_users (
+        "        CREATE TABLE IF NOT EXISTS admin_users (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL UNIQUE,
+            token_hash TEXT NOT NULL,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS form_users (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             name       TEXT NOT NULL UNIQUE,
             enabled    INTEGER NOT NULL DEFAULT 1,
@@ -303,7 +314,16 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
             at        INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_activity_at ON activity(at);",
-    )
+    )?;
+
+    // 老库补列：ALTER 失败说明已经有了，忽略即可
+    for sql in [
+        // 模板软删除标记。删模板不能真删 —— 历史提交和已经导出的表格还要靠它认名字。
+        "ALTER TABLE form_templates ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = conn.execute(sql, []);
+    }
+    Ok(())
 }
 
 /* ---------------------------------------------------------- 用户 */
@@ -373,17 +393,19 @@ pub enum TemplateSave {
     NameTaken,
 }
 
+/// 模板列表。**永远不返回已删除的** —— 删掉的模板不该再出现在任何列表里。
 pub fn form_templates(conn: &Connection, include_inactive: bool) -> rusqlite::Result<Vec<FormTemplate>> {
     let sql = if include_inactive {
         "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
            FROM form_templates t
            JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
+          WHERE t.deleted_at = 0
           ORDER BY t.sort_order, t.id"
     } else {
         "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
            FROM form_templates t
            JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
-          WHERE t.is_active = 1
+          WHERE t.is_active = 1 AND t.deleted_at = 0
           ORDER BY t.sort_order, t.id"
     };
     let mut stmt = conn.prepare(sql)?;
@@ -396,6 +418,31 @@ pub fn form_templates(conn: &Connection, include_inactive: bool) -> rusqlite::Re
             sort_order: r.get(4)?,
             updated_at: r.get(5)?,
             schema_json: r.get(6)?,
+            deleted_at: 0,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 全部模板，**含已删除的**。只给"历史记录认名字"用：
+/// 模板删了之后，老提交里显示的仍然是它原来的名字，而不是一个光秃秃的 id。
+pub fn form_templates_all(conn: &Connection) -> rusqlite::Result<Vec<FormTemplate>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_at
+           FROM form_templates t
+           JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
+          ORDER BY t.sort_order, t.id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(FormTemplate {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            version: r.get(2)?,
+            is_active: r.get::<_, i64>(3)? == 1,
+            sort_order: r.get(4)?,
+            updated_at: r.get(5)?,
+            schema_json: r.get(6)?,
+            deleted_at: r.get(7)?,
         })
     })?;
     rows.collect()
@@ -403,7 +450,7 @@ pub fn form_templates(conn: &Connection, include_inactive: bool) -> rusqlite::Re
 
 pub fn form_template_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<FormTemplate>> {
     conn.query_row(
-        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_at
            FROM form_templates t
            JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
           WHERE t.id = ?",
@@ -417,6 +464,7 @@ pub fn form_template_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Optio
                 sort_order: r.get(4)?,
                 updated_at: r.get(5)?,
                 schema_json: r.get(6)?,
+                deleted_at: r.get(7)?,
             })
         },
     )
@@ -511,6 +559,40 @@ pub fn form_template_toggle(conn: &Connection, id: i64, is_active: bool) -> rusq
         params![if is_active { 1 } else { 0 }, now(), id],
     )?;
     Ok(())
+}
+
+/// 删模板 —— **软删除**：只打一个时间戳并把名字改成"（已删除）"。
+///
+/// 为什么不能真删：`form_submissions` 里存的是 `template_id`，模板一删，
+/// 历史登记在管理页上就只剩一个 `#3`，导出出来的表格也认不出是哪张表。
+/// 软删除之后模板从列表里消失、客户端也拉不到，但老记录还认得它。
+///
+/// 为什么要改名：`form_templates.name` 上有 UNIQUE，名字被占着的话，
+/// 就没法用同一个名字重新建一个模板了（"删了重做"是最常见的用法）。
+/// 改名之后原名就空出来了。
+///
+/// 已有的登记记录**一个字都不动** —— 这就是"删除模板不影响已经生成的表格"。
+pub fn form_template_delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE form_templates
+            SET deleted_at = ?, is_active = 0, updated_at = ?,
+                name = substr(name, 1, 24) || '（已删除）'
+          WHERE id = ? AND deleted_at = 0",
+        params![now(), now(), id],
+    )?;
+    Ok(changed == 1)
+}
+
+/// 模板是否已删。提交时用：模板删了就不该再收新登记。
+pub fn form_template_deleted(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    let deleted_at: Option<i64> = conn
+        .query_row(
+            "SELECT deleted_at FROM form_templates WHERE id = ?",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(deleted_at.unwrap_or(0) > 0)
 }
 
 /* ---------------------------------------------------------- 提交 */
@@ -634,8 +716,164 @@ pub fn form_submissions_count(conn: &Connection, f: &SubmissionFilter) -> rusqli
     conn.query_row(&sql, refs.as_slice(), |r| r.get(0))
 }
 
-/* ==================================================== 最近活动（概览页用） */
+/// 每个模板各有多少条登记（模板管理页上显示"已有 N 条登记"）。
+pub fn form_submissions_count_by_template(conn: &Connection) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT template_id, COUNT(*) FROM form_submissions GROUP BY template_id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
 
+/* ------------------------------------------------------ 单条提交（预览/编辑用） */
+/// 取一条提交。管理页"表单预览"点进去看到的就是它。
+pub fn form_submission_by_id(
+    conn: &Connection,
+    id: i64,
+) -> rusqlite::Result<Option<FormSubmission>> {
+    conn.query_row(
+        "SELECT id, submission_id, template_id, template_version, template_snapshot,
+                user_id, user_name, data_json, client_time, created_at
+           FROM form_submissions WHERE id = ?",
+        params![id],
+        |r| {
+            Ok(FormSubmission {
+                id: r.get(0)?,
+                submission_id: r.get(1)?,
+                template_id: r.get(2)?,
+                template_version: r.get(3)?,
+                template_snapshot: r.get(4)?,
+                user_id: r.get(5)?,
+                user_name: r.get(6)?,
+                data_json: r.get(7)?,
+                client_time: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// 改一条提交的内容（管理页预览时手改）。
+///
+/// 只改 `data_json`：**字段定义（`template_snapshot`）不动** —— 表格的列是提交那一刻
+/// 的模板，改了列就会跟同模板的其他行对不上。
+pub fn form_submission_update(
+    conn: &Connection,
+    id: i64,
+    data_json: &str,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE form_submissions SET data_json = ? WHERE id = ?",
+        params![data_json, id],
+    )?;
+    Ok(changed == 1)
+}
+
+/* ---------------------------------------------------- 管理端人员（admin_users） */
+
+#[derive(Debug, Clone)]
+pub struct AdminUser {
+    pub id: i64,
+    pub name: String,
+    /// 口令的 sha256 十六进制。**不存明文**：库文件被人拷走也猜不出口令。
+    /// 页面永远不显示它（也显示不出来）。
+    #[allow(dead_code)]
+    pub token_hash: String,
+    pub enabled: bool,
+    #[allow(dead_code)]
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub fn admin_users(conn: &Connection) -> rusqlite::Result<Vec<AdminUser>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, token_hash, enabled, created_at, updated_at FROM admin_users ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(AdminUser {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            token_hash: r.get(2)?,
+            enabled: r.get::<_, i64>(3)? == 1,
+            created_at: r.get(4)?,
+            updated_at: r.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 按口令哈希找人。登录时用 —— 哈希一样就是这个人。
+pub fn admin_user_by_hash(
+    conn: &Connection,
+    token_hash: &str,
+) -> rusqlite::Result<Option<AdminUser>> {
+    conn.query_row(
+        "SELECT id, name, token_hash, enabled, created_at, updated_at
+           FROM admin_users WHERE token_hash = ?",
+        params![token_hash],
+        |r| {
+            Ok(AdminUser {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                token_hash: r.get(2)?,
+                enabled: r.get::<_, i64>(3)? == 1,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// 新建管理端人员。口令先在调用方算成哈希再传进来。
+pub fn admin_user_create(
+    conn: &Connection,
+    name: &str,
+    token_hash: &str,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO admin_users (name, token_hash, enabled, created_at, updated_at)
+         VALUES (?, ?, 1, ?, ?)",
+        params![name, token_hash, now(), now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 改口令。`token_hash` 传空串表示"不改口令，只改名"。
+pub fn admin_user_update(
+    conn: &Connection,
+    id: i64,
+    name: &str,
+    token_hash: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let changed = match token_hash {
+        Some(h) => conn.execute(
+            "UPDATE admin_users SET name = ?, token_hash = ?, updated_at = ? WHERE id = ?",
+            params![name, h, now(), id],
+        )?,
+        None => conn.execute(
+            "UPDATE admin_users SET name = ?, updated_at = ? WHERE id = ?",
+            params![name, now(), id],
+        )?,
+    };
+    Ok(changed == 1)
+}
+
+pub fn admin_user_toggle(conn: &Connection, id: i64, enabled: bool) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE admin_users SET enabled = ?, updated_at = ? WHERE id = ?",
+        params![if enabled { 1 } else { 0 }, now(), id],
+    )?;
+    Ok(changed == 1)
+}
+
+pub fn admin_user_delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute("DELETE FROM admin_users WHERE id = ?", params![id])?;
+    Ok(changed == 1)
+}
+
+/* ==================================================== 最近活动（概览页用） */
 /// 谁在连服务器。不是"在线状态"——没有心跳，只能记"最后一次请求是什么时候、
 /// 从哪个 IP、干了什么"。概览页据此显示"最近活动"，15 分钟内有动作的标在线。
 #[derive(Debug, Clone)]

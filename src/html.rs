@@ -76,41 +76,10 @@ pub fn row(
 
 /* ============================================================ 表单收集页 */
 
-/// 一条提交记录：时间 / 模板 / 人 / 内容（按字段顺序拼成"标签：值"）。
-pub fn form_submission_row(
-    client_time: &str,
-    received_at: &str,
-    template_name: &str,
-    template_version: i64,
-    user_name: &str,
-    pairs: &[(String, String)],
-) -> String {
-    let content = if pairs.is_empty() {
-        r#"<span class="muted">—</span>"#.to_string()
-    } else {
-        pairs
-            .iter()
-            .map(|(k, v)| {
-                format!(
-                    r#"<div class="kv"><b>{}</b>：{}</div>"#,
-                    crate::escape(k),
-                    crate::escape(v)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    };
-    format!(
-        r#"<tr><td>{client_time}<br><span class="muted">收到 {received_at}</span></td>
-<td>{template_name} <span class="muted">v{template_version}</span></td>
-<td>{user_name}</td>
-<td>{content}</td></tr>"#,
-        template_name = crate::escape(template_name),
-        user_name = crate::escape(user_name),
-    )
-}
-
 /// 模板行。应急开关：模板改坏了可以在这里停用它（客户端下次拉取就不再显示）。
+///
+/// 「删除」是**软删除**：模板从列表里消失，但历史提交还认得它的名字，
+/// 已经导出的表格也不受影响。
 pub fn form_template_row(
     id: i64,
     name: &str,
@@ -118,6 +87,7 @@ pub fn form_template_row(
     field_count: usize,
     updated_at: &str,
     is_active: bool,
+    submissions: i64,
 ) -> String {
     let tag = if is_active {
         r#"<span class="tag">启用中</span>"#
@@ -125,15 +95,124 @@ pub fn form_template_row(
         r#"<span class="tag off">已停用</span>"#
     };
     let label = if is_active { "停用" } else { "启用" };
+    let used = if submissions > 0 {
+        format!(r#"<span class="muted">已有 {submissions} 条登记</span>"#)
+    } else {
+        r#"<span class="muted">还没有人填过</span>"#.to_string()
+    };
     format!(
-        r#"<tr><td><b>{name}</b></td><td>v{version}</td><td>{field_count}</td><td>{updated_at}</td>
+        r#"<tr><td><b>{name}</b><br>{used}</td><td>v{version}</td><td>{field_count}</td><td>{updated_at}</td>
 <td>{tag}</td>
-<td><form method="post" action="/admin/forms/template/toggle" style="display:inline">
+<td><div class="row">
+<form method="post" action="/admin/forms/template/toggle" style="display:inline">
 <input type="hidden" name="id" value="{id}"><input type="hidden" name="is_active" value="{want}">
-<button class="ghost" type="submit">{label}</button></form></td></tr>"#,
+<button class="ghost" type="submit">{label}</button></form>
+<form method="post" action="/admin/forms/template/delete" style="display:inline"
+  onsubmit="return confirm('删除模板「{name}」？\n\n模板不再出现在列表里、客户端也拉不到。\n已经填过的登记和导出的表格都保留不变。')">
+<input type="hidden" name="id" value="{id}">
+<button class="danger" type="submit">删除</button></form>
+</div></td></tr>"#,
         name = crate::escape(name),
         want = if is_active { 0 } else { 1 },
     )
+}
+
+/// 一条登记记录（在「表单预览」里）。
+///
+/// 内容只给个摘要 —— 完整内容点「预览」看。
+pub fn form_record_row(
+    id: i64,
+    client_time: &str,
+    user_name: &str,
+    summary: &str,
+) -> String {
+    format!(
+        r#"<tr><td>{client_time}</td><td>{user}</td><td>{summary}</td>
+<td><a class="ghost" href="/admin?tab=register&sub=preview&rec={id}" data-id="{id}"
+  data-title="{user} · {client_time}">预览</a></td></tr>"#,
+        user = crate::escape(user_name),
+        summary = summary,
+    )
+}
+
+/// 「表单预览」里点开某条登记后的编辑表单（也用作弹出层的内容）。
+///
+/// 字段按**提交那一刻的模板快照**渲染 —— 模板后来改了也不影响这一行的列。
+pub fn submission_editor(
+    id: i64,
+    template_name: &str,
+    user_name: &str,
+    client_time: &str,
+    fields: &[EditorField],
+) -> String {
+    let rows: String = fields
+        .iter()
+        .map(|f| {
+            let name = format!("f_{}", f.key);
+            let control = match f.kind.as_str() {
+                "textarea" => format!(
+                    r#"<textarea name="{name}" rows="3">{value}</textarea>"#,
+                    value = crate::escape(&f.value)
+                ),
+                "select" => {
+                    let opts = f
+                        .options
+                        .iter()
+                        .map(|o| {
+                            let sel = if *o == f.value { " selected" } else { "" };
+                            format!(
+                                r#"<option value="{v}"{sel}>{v}</option>"#,
+                                v = crate::escape(o)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    format!(r#"<select name="{name}">{opts}</select>"#)
+                }
+                "number" => format!(
+                    r#"<input type="number" name="{name}" value="{value}" step="any">"#,
+                    value = crate::escape(&f.value)
+                ),
+                "date" => format!(
+                    r#"<input type="date" name="{name}" value="{value}">"#,
+                    value = crate::escape(&f.value)
+                ),
+                _ => format!(
+                    r#"<input type="text" name="{name}" value="{value}">"#,
+                    value = crate::escape(&f.value)
+                ),
+            };
+            format!(
+                r#"<div class="frow"><label>{label}</label>{control}</div>"#,
+                label = crate::escape(&f.label)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<form method="post" action="/admin/forms/submission/save">
+<input type="hidden" name="id" value="{id}">
+<div class="kv" style="margin-bottom:10px">
+  <b>模板</b>：{template}　<b>提交人</b>：{user}　<b>填写时间</b>：{time}
+</div>
+{rows}
+<div class="row" style="margin-top:14px;justify-content:flex-end">
+  <button type="submit">保存修改</button>
+</div>
+</form>"#,
+        template = crate::escape(template_name),
+        user = crate::escape(user_name),
+        time = crate::escape(client_time),
+    )
+}
+
+/// 编辑表单里的一个字段。
+pub struct EditorField {
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+    pub value: String,
+    pub options: Vec<String>,
 }
 
 pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
@@ -161,7 +240,48 @@ pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
     )
 }
 
-/* ================================================ 标签页外壳（v0.3 起） */
+/// 管理端人员行。口令**不显示**（库里只存哈希，本来也显示不出来），
+/// 要改口令就点「改口令」重新设一个。
+pub fn admin_user_row(id: i64, name: &str, enabled: bool, updated_at: &str) -> String {
+    let tag = if enabled {
+        r#"<span class="tag">可用</span>"#
+    } else {
+        r#"<span class="tag off">已停用</span>"#
+    };
+    let label = if enabled { "停用" } else { "启用" };
+    format!(
+        r#"<tr><td><b>{name}</b></td><td>{tag}</td><td>{updated_at}</td>
+<td><div class="row">
+<form method="post" action="/admin/admins/toggle" style="display:inline">
+<input type="hidden" name="id" value="{id}"><input type="hidden" name="enabled" value="{want}">
+<button class="ghost" type="submit">{label}</button></form>
+<form method="post" action="/admin/admins/token" style="display:inline">
+<input type="hidden" name="id" value="{id}">
+<input type="password" name="token" placeholder="新口令" style="width:120px" required>
+<button class="ghost" type="submit">改口令</button></form>
+<form method="post" action="/admin/admins/delete" style="display:inline"
+  onsubmit="return confirm('删除管理员「{name}」？\n\n这个人之后就用这个口令登不进管理页了。')">
+<input type="hidden" name="id" value="{id}">
+<button class="danger" type="submit">删除</button></form></div></td></tr>"#,
+        name = crate::escape(name),
+        want = if enabled { 0 } else { 1 },
+    )
+}
+
+/// 环境变量口令那一条（超级管理员）。它在 compose 的 .env 里，不在库里。
+pub fn admin_env_row(configured: bool) -> String {
+    if configured {
+        r#"<tr><td><b>超级管理员（环境变量口令）</b><br><span class="muted">口令在 NAS 的 .env 里，不在数据库里；改了要重启容器</span></td>
+<td><span class="tag">可用</span></td><td>—</td>
+<td><span class="muted">不能在这里删除</span></td></tr>"#.to_string()
+    } else {
+        r#"<tr><td><b>超级管理员（环境变量口令）</b><br><span class="muted">服务端没有配置 ADMIN_TOKEN，这条不能用来登录</span></td>
+<td><span class="tag off">未配置</span></td><td>—</td>
+<td><span class="muted">在 NAS 的 .env 里设 ADMIN_TOKEN 后重启容器</span></td></tr>"#.to_string()
+    }
+}
+
+/* ================================================ 标签页外壳（v0.4 起两级标签） */
 
 pub const PAGE: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -227,6 +347,34 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
 .dot.on{background:#4E8B22}
 .dot.off{background:#C9CFC0}
 .pane[hidden]{display:none!important}
+
+/* 二级标签：表单登记 / 登录管理 下面各分两页 */
+.subtabs{display:flex;gap:4px;border-bottom:1px solid #E2E8D8;margin-bottom:14px;
+  padding-bottom:0;overflow-x:auto}
+.subtab{flex:none;display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 14px;
+  font-size:13px;color:#66705C;text-decoration:none;border-bottom:2px solid transparent;
+  margin-bottom:-1px;white-space:nowrap}
+.subtab:hover{color:#24400D}
+.subtab.on{color:#24400D;font-weight:500;border-bottom-color:#3E6B1B}
+.subpane[hidden]{display:none!important}
+
+/* 预览/编辑用的弹出层 */
+.sheet{position:fixed;inset:0;background:rgba(35,43,28,.38);display:flex;
+  align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;z-index:50}
+.sheet[hidden]{display:none!important}
+.sheet-box{background:#fff;border-radius:14px;width:100%;max-width:720px;
+  border:1px solid #E2E8D8;box-shadow:0 12px 40px rgba(35,43,28,.18)}
+.sheet-hd{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  padding:16px 20px;border-bottom:1px solid #EFF3E7}
+.sheet-hd h2{margin:0;font-size:14px;color:#24400D;font-weight:500}
+.sheet-bd{padding:16px 20px}
+.sheet-ft{display:flex;gap:8px;justify-content:flex-end;padding:14px 20px;
+  border-top:1px solid #EFF3E7;background:#FAFCF6;border-radius:0 0 14px 14px}
+.frow{display:grid;grid-template-columns:110px 1fr;gap:10px;align-items:center;
+  padding:7px 0;border-bottom:1px solid #F3F6EC}
+.frow label{font-size:13px;color:#66705C}
+.frow input,.frow select,.frow textarea{width:100%}
+.frow textarea{min-height:64px}
 </style></head>
 <body><div class="wrap">
   <div class="top">
@@ -239,47 +387,183 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
   %%FLASH%%
   <nav class="tabs">%%TABS%%</nav>
   <section class="pane" data-pane="overview" %%HIDE_OVERVIEW%%>%%PANE_OVERVIEW%%</section>
+  <section class="pane" data-pane="register" %%HIDE_REGISTER%%>
+    <nav class="subtabs">%%SUB_REGISTER%%</nav>
+    <div class="subpane" data-spane="preview" %%HIDE_REG_PREVIEW%%>%%PANE_REG_PREVIEW%%</div>
+    <div class="subpane" data-spane="templates" %%HIDE_REG_TEMPLATES%%>%%PANE_REG_TEMPLATES%%</div>
+  </section>
   <section class="pane" data-pane="versions" %%HIDE_VERSIONS%%>%%PANE_VERSIONS%%</section>
-  <section class="pane" data-pane="register" %%HIDE_REGISTER%%>%%PANE_REGISTER%%</section>
-  <section class="pane" data-pane="templates" %%HIDE_TEMPLATES%%>%%PANE_TEMPLATES%%</section>
-  <section class="pane" data-pane="users" %%HIDE_USERS%%>%%PANE_USERS%%</section>
+  <section class="pane" data-pane="login" %%HIDE_LOGIN%%>
+    <nav class="subtabs">%%SUB_LOGIN%%</nav>
+    <div class="subpane" data-spane="clients" %%HIDE_LOGIN_CLIENTS%%>%%PANE_LOGIN_CLIENTS%%</div>
+    <div class="subpane" data-spane="admins" %%HIDE_LOGIN_ADMINS%%>%%PANE_LOGIN_ADMINS%%</div>
+  </section>
+</div>
+
+<!-- 预览/编辑某条登记用的弹出层 -->
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-box">
+    <div class="sheet-hd">
+      <h2 id="sheet-title">预览</h2>
+      <button class="ghost" id="sheet-close" type="button">关闭</button>
+    </div>
+    <div class="sheet-bd" id="sheet-body"></div>
+  </div>
 </div>
 <script>
 (function () {
   var tabs = document.querySelectorAll(".tab");
   var panes = document.querySelectorAll(".pane");
-  function show(name) {
+
+  function showSub(pane, subName) {
+    var subs = pane.querySelectorAll(".subtab");
+    var spanes = pane.querySelectorAll(".subpane");
+    for (var i = 0; i < subs.length; i++) {
+      subs[i].classList.toggle("on", subs[i].getAttribute("data-sub") === subName);
+    }
+    for (var j = 0; j < spanes.length; j++) {
+      spanes[j].hidden = spanes[j].getAttribute("data-spane") !== subName;
+    }
+  }
+
+  function currentSub(pane) {
+    var s = pane && pane.querySelector(".subtab.on");
+    return s ? s.getAttribute("data-sub") : "";
+  }
+
+  function setUrl(tab, sub) {
+    var u = new URL(location.href);
+    u.searchParams.set("tab", tab);
+    if (sub) { u.searchParams.set("sub", sub); } else { u.searchParams.delete("sub"); }
+    history.replaceState(null, "", u);
+  }
+
+  function showTop(name) {
     for (var i = 0; i < tabs.length; i++) {
       tabs[i].classList.toggle("on", tabs[i].getAttribute("data-tab") === name);
     }
+    var active = null;
     for (var j = 0; j < panes.length; j++) {
-      panes[j].hidden = panes[j].getAttribute("data-pane") !== name;
+      var on = panes[j].getAttribute("data-pane") === name;
+      panes[j].hidden = !on;
+      if (on) {
+        active = panes[j];
+        var s = panes[j].querySelector(".subtab.on") || panes[j].querySelector(".subtab");
+        if (s) { showSub(panes[j], s.getAttribute("data-sub")); }
+      }
     }
-    var u = new URL(location.href);
-    u.searchParams.set("tab", name);
-    history.replaceState(null, "", u);
+    setUrl(name, active ? currentSub(active) : "");
   }
+
   for (var k = 0; k < tabs.length; k++) {
     tabs[k].addEventListener("click", function (e) {
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
       e.preventDefault();
-      show(this.getAttribute("data-tab"));
+      showTop(this.getAttribute("data-tab"));
+    });
+  }
+
+  var subtabs = document.querySelectorAll(".subtab");
+  for (var m = 0; m < subtabs.length; m++) {
+    subtabs[m].addEventListener("click", function (e) {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+      e.preventDefault();
+      var pane = this.closest(".pane");
+      if (!pane) return;
+      showSub(pane, this.getAttribute("data-sub"));
+      setUrl(pane.getAttribute("data-pane"), this.getAttribute("data-sub"));
+    });
+  }
+
+  /* ---- 预览/编辑某条登记 ----
+     有 JS：点「预览」只取一段 HTML 塞进弹出层，不整页刷新。
+     没 JS：点「预览」走普通链接，服务端把编辑表单渲染在预览区顶部，一样能用。 */
+  var sheet = document.getElementById("sheet");
+  var sheetBody = document.getElementById("sheet-body");
+  var sheetTitle = document.getElementById("sheet-title");
+  var editorHost = document.getElementById("rec-editor-host");
+
+  function openSheet(html, title) {
+    if (!sheet || !sheetBody) return;
+    sheetBody.innerHTML = html;
+    if (sheetTitle && title) { sheetTitle.textContent = title; }
+    sheet.hidden = false;
+  }
+
+  function closeSheet() {
+    if (!sheet) return;
+    sheet.hidden = true;
+    sheetBody.innerHTML = "";
+    // 顺手把地址栏里的 rec= 清掉，刷新不会又弹出来
+    var u = new URL(location.href);
+    u.searchParams.delete("rec");
+    history.replaceState(null, "", u);
+  }
+
+  if (sheet && sheetBody) {
+    // 页面自带一份编辑表单（无 JS 走这条路的产物）：挪进弹出层
+    var inline = document.getElementById("rec-editor");
+    if (inline) {
+      sheetBody.appendChild(inline);
+      sheet.hidden = false;
+    }
+    var close = document.getElementById("sheet-close");
+    if (close) { close.addEventListener("click", closeSheet); }
+    sheet.addEventListener("click", function (e) {
+      if (e.target === sheet) { closeSheet(); }
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !sheet.hidden) { closeSheet(); }
+    });
+  }
+
+  var recLinks = document.querySelectorAll(".rec-open");
+  for (var n = 0; n < recLinks.length; n++) {
+    recLinks[n].addEventListener("click", function (e) {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+      if (!sheet || !window.fetch) return;
+      e.preventDefault();
+      var id = this.getAttribute("data-id");
+      var title = this.getAttribute("data-title") || "预览";
+      var href = this.getAttribute("href");
+      fetch("/admin/forms/submission/" + id + "/edit", { credentials: "same-origin" })
+        .then(function (r) {
+          if (!r.ok) { throw new Error("HTTP " + r.status); }
+          return r.text();
+        })
+        .then(function (html) { openSheet(html, title); })
+        .catch(function () { location.href = href; });
     });
   }
 })();
 </script>
 </body></html>"##;
 
-pub const TABS: [(&str, &str); 5] = [
+pub const TABS: [(&str, &str); 4] = [
     ("overview", "概览"),
-    ("versions", "版本"),
-    ("register", "登记"),
-    ("templates", "模板"),
-    ("users", "名单"),
+    ("register", "表单登记"),
+    ("versions", "版本更新"),
+    ("login", "登录管理"),
 ];
 
+/// 顶层标签下面的二级标签。没有二级标签的标签（概览、版本更新）不在表里。
+pub const SUBTABS: &[(&str, &[(&str, &str)])] = &[
+    ("register", &[("preview", "表单预览"), ("templates", "模板管理")]),
+    ("login", &[("clients", "客户端"), ("admins", "管理端")]),
+];
+
+/// 某个顶层标签下的默认二级标签（URL 没给 `sub` 时用这个）。
+pub fn default_sub(tab: &str) -> &'static str {
+    SUBTABS
+        .iter()
+        .find(|(t, _)| *t == tab)
+        .and_then(|(_, subs)| subs.first())
+        .map(|(k, _)| *k)
+        .unwrap_or("")
+}
+
 /// 标签栏。用 `<a href="?tab=">` 而不是按钮 —— 没有 JS 时点它也能整页跳转。
-pub fn tabs(active: &str, counts: &[(&str, i64); 5]) -> String {
+pub fn tabs(active: &str, counts: &[(&str, i64); 4]) -> String {
     TABS.iter()
         .zip(counts.iter())
         .map(|((key, label), (_, count))| {
@@ -291,6 +575,22 @@ pub fn tabs(active: &str, counts: &[(&str, i64); 5]) -> String {
             };
             format!(
                 r#"<a class="tab{on}" href="/admin?tab={key}" data-tab="{key}">{label}{badge}</a>"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// 二级标签栏。同样用 `<a href>`，无 JS 时也能整页跳转。
+pub fn sub_tabs(top: &str, active_sub: &str) -> String {
+    let Some((_, subs)) = SUBTABS.iter().find(|(t, _)| *t == top) else {
+        return String::new();
+    };
+    subs.iter()
+        .map(|(key, label)| {
+            let on = if *key == active_sub { " on" } else { "" };
+            format!(
+                r#"<a class="subtab{on}" href="/admin?tab={top}&sub={key}" data-sub="{key}">{label}</a>"#
             )
         })
         .collect::<Vec<_>>()

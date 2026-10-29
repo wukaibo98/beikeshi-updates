@@ -39,26 +39,35 @@ impl Auth {
     }
 
     /// 从 Cookie 头里挑出我们的那一条并校验签名。
-    pub fn verify(&self, cookie_header: Option<&str>) -> bool {
-        let Some(value) = extract_cookie(cookie_header, COOKIE) else {
-            return false;
-        };
-        let Some((nonce, sig)) = value.split_once('.') else {
-            return false;
-        };
+    ///
+    /// 返回管理端人员的 id：**0 = 环境变量口令（超级管理员）**，其他是 `admin_users` 表里的 id。
+    pub fn verify(&self, cookie_header: Option<&str>) -> Option<i64> {
+        let value = extract_cookie(cookie_header, COOKIE)?;
+        // 格式：a<id>.<nonce>.<sig>
+        let mut parts = value.splitn(3, '.');
+        let id_part = parts.next()?;
+        let nonce = parts.next()?;
+        let sig = parts.next()?;
         if nonce.is_empty() || sig.is_empty() {
-            return false;
+            return None;
         }
-        constant_time_eq(sig.as_bytes(), self.sign(nonce).as_bytes())
+        let payload = format!("{id_part}.{nonce}");
+        if !constant_time_eq(sig.as_bytes(), self.sign(&payload).as_bytes()) {
+            return None;
+        }
+        // Cookie 里的 id 只是给人看的；真正的权限靠登录时校验过。
+        id_part.strip_prefix('a')?.parse().ok()
     }
 
-    pub fn issue_cookie(&self) -> String {
+    /// 发登录 Cookie。`admin_id` = 0 表示环境变量口令（超级管理员）。
+    pub fn issue_cookie(&self, admin_id: i64) -> String {
         let nonce: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(32)
             .map(char::from)
             .collect();
-        let value = format!("{nonce}.{}", self.sign(&nonce));
+        let payload = format!("a{admin_id}.{nonce}");
+        let value = format!("{payload}.{}", self.sign(&payload));
         format!("{COOKIE}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={MAX_AGE}")
     }
 

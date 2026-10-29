@@ -290,3 +290,164 @@ fn 导出的字节是合法_xlsx() {
     // sheet 名里不能出现 xlsx 禁用的字符
     assert!(xlsx::write_xlsx(&table, "a[b]c:d*e?f/g\\h").is_ok());
 }
+
+/* ============================ 4. 删模板（软删除）——不影响已生成的表格 */
+
+#[test]
+fn 删模板后历史登记和名字都还在() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    db::form_submit_insert(
+        &conn,
+        &db::NewSubmission {
+            submission_id: "sub-0001",
+            template_id: 1,
+            template_version: 1,
+            template_snapshot: &v1,
+            user_id: 1,
+            user_name: "张三",
+            data_json: r#"{"a":"NO1"}"#,
+            client_time: 1_700_000_000,
+            client_id: "",
+        },
+    )
+    .unwrap();
+
+    assert!(db::form_template_delete(&conn, 1).unwrap(), "删除应该成功");
+
+    // 登记一条不少
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM form_submissions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "删模板不能动已经填过的登记");
+
+    // 模板还在库里（软删除），历史记录还认得它的名字
+    let all = db::form_templates_all(&conn).unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(all[0].deleted_at > 0, "应该打上删除时间");
+    assert!(all[0].name.starts_with("客户需求表"), "名字要认得出来：{}", all[0].name);
+
+    // 但列表里已经没有了
+    assert!(db::form_templates(&conn, true).unwrap().is_empty(), "列表里不该再出现");
+    assert!(db::form_templates(&conn, false).unwrap().is_empty(), "客户端更不该看到");
+
+    // 删过的模板不能再收新登记
+    assert!(db::form_template_deleted(&conn, 1).unwrap());
+}
+
+#[test]
+fn 删模板后能用回原来那个名字() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    db::form_template_delete(&conn, 1).unwrap();
+    // 名字腾出来了：可以重新建一个同名模板（UNIQUE 约束不能挡着）
+    let r = db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    assert!(matches!(r, db::TemplateSave::Saved { id: 2, version: 1 }));
+}
+
+/* ============================ 5. 改一条登记（预览里编辑） */
+
+#[test]
+fn 改登记只动内容不动字段定义() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "表", &v1, None, 0).unwrap();
+    db::form_submit_insert(
+        &conn,
+        &db::NewSubmission {
+            submission_id: "sub-0001",
+            template_id: 1,
+            template_version: 1,
+            template_snapshot: &v1,
+            user_id: 1,
+            user_name: "张三",
+            data_json: r#"{"a":"旧值"}"#,
+            client_time: 1_700_000_000,
+            client_id: "",
+        },
+    )
+    .unwrap();
+
+    let id: i64 = conn
+        .query_row("SELECT id FROM form_submissions", [], |r| r.get(0))
+        .unwrap();
+    assert!(db::form_submission_update(&conn, id, r#"{"a":"新值"}"#).unwrap());
+
+    let sub = db::form_submission_by_id(&conn, id).unwrap().unwrap();
+    assert_eq!(sub.data_json, r#"{"a":"新值"}"#);
+    assert_eq!(sub.template_snapshot, v1, "字段定义（快照）不能动，改了列就串了");
+    assert_eq!(sub.user_name, "张三", "提交人不能改");
+}
+
+/* ============================ 6. 管理端人员与口令 */
+
+#[test]
+fn 管理端口令只存哈希() {
+    let conn = fresh();
+    let hash = crate::forms::token_hash("abc123456");
+    assert_ne!(hash, "abc123456", "库里不能是明文");
+    assert_eq!(hash.len(), 64, "sha256 的十六进制是 64 个字");
+
+    db::admin_user_create(&conn, "李会计", &hash).unwrap();
+    let found = db::admin_user_by_hash(&conn, &hash).unwrap().unwrap();
+    assert_eq!(found.name, "李会计");
+    assert!(found.enabled);
+    // 换一个口令就找不到了
+    assert!(db::admin_user_by_hash(&conn, &crate::forms::token_hash("别的")).unwrap().is_none());
+}
+
+#[test]
+fn 停用管理端人员后他的口令登不进来() {
+    let conn = fresh();
+    let hash = crate::forms::token_hash("abc123456");
+    db::admin_user_create(&conn, "李会计", &hash).unwrap();
+    assert!(db::admin_user_toggle(&conn, 1, false).unwrap());
+    let u = db::admin_users(&conn).unwrap();
+    assert!(!u[0].enabled);
+}
+
+#[test]
+fn 改管理端口令后老口令失效() {
+    let conn = fresh();
+    let old = crate::forms::token_hash("abc123456");
+    db::admin_user_create(&conn, "李会计", &old).unwrap();
+    let new = crate::forms::token_hash("xyz987654");
+    db::admin_user_update(&conn, 1, "李会计", Some(&new)).unwrap();
+
+    assert!(db::admin_user_by_hash(&conn, &old).unwrap().is_none(), "老口令要失效");
+    assert!(db::admin_user_by_hash(&conn, &new).unwrap().is_some(), "新口令要能用");
+}
+
+/* ============================ 7. 查询参数空串（筛选表单） */
+
+#[test]
+fn 空串查询参数当成没填() {
+    // 下拉框"全部"选项的值就是空串，筛选表单每次都会带上 template=&user=
+    let uri: axum::http::Uri =
+        "/admin?tab=register&sub=preview&template=&user=&from=&to=".parse().unwrap();
+    let q = axum::extract::Query::<crate::admin::PageQuery>::try_from_uri(&uri).unwrap();
+    assert_eq!(q.template, None, "空串不能变成 400");
+    assert_eq!(q.user, None);
+    assert_eq!(q.tab(), "register");
+    assert_eq!(q.sub("register"), "preview");
+}
+
+#[test]
+fn 查询参数里的整数_空串和乱填都当没填() {
+    // 筛选表单每次提交都带着 template=&user=（"全部"选项的值就是空串）。
+    // 这两个参数以前按 Option<i64> 直接解析，空串会报
+    // "cannot parse integer from empty string" → 整页 400，看起来像"点了没反应"。
+    let uri: axum::http::Uri =
+        "/admin?tab=register&sub=preview&template=&user=7&from=&to=".parse().unwrap();
+    let q = axum::extract::Query::<crate::admin::PageQuery>::try_from_uri(&uri).unwrap();
+    assert_eq!(q.template, None, "空串当成没填");
+    assert_eq!(q.user, Some(7), "正常数字要能读出来");
+    assert_eq!(q.from.as_deref(), Some(""), "字符串参数不受影响");
+
+    // 乱填也不能 400，当成没填
+    let uri2: axum::http::Uri = "/admin?template=abc".parse().unwrap();
+    let q2 = axum::extract::Query::<crate::admin::PageQuery>::try_from_uri(&uri2).unwrap();
+    assert_eq!(q2.template, None);
+}

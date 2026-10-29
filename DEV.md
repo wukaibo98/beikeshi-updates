@@ -46,13 +46,20 @@ admin.rs  ── GET  /admin            页面渲染（未登录 → 登录页�
           ├─ POST /admin/publish/{id}  回滚
           └─ POST /admin/delete/{id}   删除
 db.rs     ── 全部 SQL；表结构与 Python 版兼容（client 列只标记旧记录）
-auth.rs   ── HMAC-SHA256 签名：管理 Cookie / 表单 token / 编辑 token
+          ├─ 表单四表 + admin_users（v0.4 新增）
+          └─ 模板软删除（form_template_delete）
+auth.rs   ── HMAC-SHA256 签名：管理 Cookie（带管理员 id，v0.4）/ 表单 token / 编辑 token
 forms.rs  ── schema 校验、姓名登录、模板存取（乐观锁）、提交（幂等+复验）
-          ├─ GET  /admin/forms            表单管理页（提交/模板/名单三块）
-          └─ GET  /admin/forms/export.xlsx 导出（一次只导一个模板）
+          ├─ GET  /admin/forms            表单管理页（v0.4 起渲染成四个二级面板）
+          ├─ GET  /admin/forms/export.xlsx 导出（一次只导一个模板）
+          ├─ POST /admin/forms/template/delete        模板软删除
+          ├─ GET  /admin/forms/submission/{id}/edit   登记编辑片段（弹层用）
+          ├─ POST /admin/forms/submission/save        登记保存（只改 data_json）
+          └─ POST /admin/admins/{save,toggle,token,delete} 管理端人员与口令
 xlsx.rs   ── rust_xlsxwriter：列并集 → 数字列 → sheet 名清洗
-html.rs   ── 登录页 / 分发页 / 表单页模板（`%%占位%%`）
+html.rs   ── 登录页 / 分发页 / 表单页模板（`%%占位%%`）；v0.4 加两级标签结构
 tests.rs  ── `cargo test`：幂等、快照冻结、乐观锁、白名单、导出列
+tools/shot-admin.js ── 无头 Chrome 截管理页（CDP 注入自签 Cookie，见 §9.3）
 ```
 
 数据流很短，没有 service 层也没有 repository 抽象 —— 这个规模不需要：
@@ -104,7 +111,8 @@ CREATE TABLE checks (                     -- 单行表：客户端检查次数�
 
 ```sql
 form_users (id, name UNIQUE, enabled, created_at)      -- 姓名白名单，登录只查"在不在"
-form_templates (id, name UNIQUE, version, is_active, sort_order, updated_at)
+form_templates (id, name UNIQUE, version, is_active, sort_order, updated_at,
+                deleted_at)                           -- v0.4 加 deleted_at，软删除用
 form_template_versions (template_id, version, schema_json, created_at)  -- 每个版本的字段定义
 form_submissions (id, submission_id UNIQUE, template_id, template_version,
                   template_snapshot, user_id, user_name, data_json,
@@ -124,6 +132,22 @@ form_submissions (id, submission_id UNIQUE, template_id, template_version,
 - **`user_name` 冗余存一份**：改名/删人后历史记录还认得出是谁填的。
 - 四张表都在启动时的 `init_forms()` 里 `CREATE TABLE IF NOT EXISTS`，
   NAS 上那份老库原地加表，不用迁移脚本。
+- **`deleted_at = 0` 表示没删**（不是 NULL）。软删除见 §4.12。
+
+### 3.2 管理端人员表（v0.4 起）
+
+```sql
+admin_users (id, name, token_hash, enabled, created_at, updated_at)
+```
+
+管理端账号与客户端白名单是**两套东西**：
+
+- `form_users` 管的是"哪个客服能填表单"，凭姓名登录，只查在不在名单里。
+- `admin_users` 管的是"谁能进管理页"，凭口令登录，口令**只存 sha256 哈希**。
+
+`admin_users` 与 `form_users` 互不干涉 —— 客服不在管理端名单里照样能填表，
+管理员不在客服白名单里也能进后台。环境变量 `ADMIN_TOKEN` 保留为**超级管理员**
+（内部 id = 0），两个入口都认。
 
 ## 4. 接口实现细节
 
@@ -266,7 +290,7 @@ sheet 名过 31 字符要截断，并清掉 `[]:*?/\` 这些 xlsx 禁用的字�
 
 ### 4.9 管理页是标签页（v0.3 起）
 
-`/admin` 一次渲染五个 `<section>`，切标签由页面里 20 行内联 JS 切 `hidden`：
+`/admin` 一次渲染全部内容，切标签由页面里几十行内联 JS 切 `hidden`：
 
 ```js
 // 标签本身是 <a href="/admin?tab=x">，没有 JS 时点它照样整页跳转
@@ -280,10 +304,12 @@ URL 已经是状态的唯一来源，没必要再来一份。
 三个细节：
 
 - **`.pane[hidden]{display:none!important}`** —— 不加 `!important`，
-  任何 `display:flex` 之类的规则都会让 `hidden` 失效，五个标签会叠在一起。
+  任何 `display:flex` 之类的规则都会让 `hidden` 失效，几个标签会叠在一起。
 - **未知 `tab=` 回落到 `overview`**，不报错。
 - **每个 POST 操作重定向时都带 `tab=`**（加人回 `users`、停用模板回 `templates`、
   导出出错回 `register`），否则一操作就跳回概览，还得再点一次。
+
+v0.4 改成了**两级标签**，见 §4.11。
 
 ### 4.10 "谁在连服务器"
 
@@ -298,6 +324,119 @@ URL 已经是状态的唯一来源，没必要再来一份。
 - **在线判定**：`now - at < 15 分钟`。**没有心跳**，这只是"最近有请求"，
   页面上一律如实显示"N 分钟前"，不假装在实时在线。
 - **只留 7 天**，每次写入顺手清理（这张表只服务于"现在谁在连"，留历史没意义）。
+
+### 4.11 管理页两级标签（v0.4）
+
+顶层从五个（概览/版本/登记/模板/名单）收成四个，登记和名单各自下面再分二级：
+
+```
+概览
+表单登记 ├ 表单预览   ← 看表、预览编辑、导出 xlsx
+        └ 模板管理   ← 建模板、停用、删除
+版本更新
+登录管理 ├ 客户端     ← 就是原来的"名单"，姓名白名单
+        └ 管理端     ← 新增：管理员账号 + 口令
+```
+
+结构上是**两级独立的容器**，不是嵌套的 tab：
+
+```html
+<section class="pane" data-pane="register" hidden>
+  <nav class="subtabs"><a class="subtab" data-sub="preview" href="?tab=register&sub=preview">表单预览</a></nav>
+  <div class="subpane" data-spane="preview" hidden>…</div>
+  <div class="subpane" data-spane="templates" hidden>…</div>
+</section>
+```
+
+要点：
+
+- **URL 同时带两个参数**：`?tab=register&sub=preview`。二级标签没写 `sub` 时
+  走 `default_sub(tab)`（登记 → 预览，登录 → 客户端）。
+- **两级都靠 `hidden` 属性**，JS 里 `showTop()` / `showSub()` 各自管一摊，
+  切二级不动顶层、切顶层不动二级。
+- **二级标签也用 `<a href>`**：无 JS 时点它照样整页跳转，整页可寻址。
+- **重定向必须带 `sub`**：改完模板回 `?tab=register&sub=templates`，
+  改完口令回 `?tab=login&sub=admins`。只带 `tab` 会被丢回二级默认页，
+  操作完找不到自己刚改的那一栏。
+- **未知 `sub=` 回落到该顶层的默认二级**，不报错、不 400。
+
+### 4.12 模板软删除（v0.4）
+
+需求是"删除模板不影响已经生成的表格"。硬删做不到 —— `form_submissions.template_id`
+指向模板行，删了历史记录就查不出模板名，导出也没法取到列定义。
+
+所以用**软删除**：
+
+```sql
+UPDATE form_templates
+   SET deleted_at = ?, is_active = 0, updated_at = ?,
+       name = substr(name, 1, 24) || '（已删除）'
+ WHERE id = ? AND deleted_at = 0;
+```
+
+四个动作缺一不可：
+
+| 动作 | 目的 |
+|---|---|
+| `deleted_at = now()` | 标记删除，所有正常查询都带 `deleted_at = 0` 过滤 |
+| `is_active = 0` | 客户端拉清单时不再下发这个模板 |
+| 改名加「（已删除）」后缀 | **腾出 `name` 的 UNIQUE 约束**，让"删了重做"能用回原来那个名字 |
+| 保留行本身 | `form_submissions.template_id` 照样能解析出模板名，导出取得到列定义 |
+
+配套的三条规则：
+
+- **历史记录认名字走 `form_templates_all()`**（含已删除的），不走 `form_templates()`。
+  少了这一步，已删模板的历史记录就显示成空白。
+- **提交时拦已删模板**：`form_template_deleted(conn, id)` 为真时拒绝新登记，
+  报"这个表单已经被删除了，不能再提交"。
+- **导出照常**：导出走每条提交自带的 `template_snapshot`，跟模板在不在完全无关。
+  已删模板的历史记录照样能导出。
+
+### 4.13 管理端人员与口令（v0.4）
+
+管理端账号存在 `admin_users` 表（见 §3.2），口令**只存 sha256 哈希**，明文不落库。
+
+登录（`admin.rs::login`）两个入口都认：
+
+```rust
+// 1) 环境变量 ADMIN_TOKEN = 超级管理员，内部 id = 0
+// 2) admin_users 表里查 sha256(given) 命中且 enabled = 1
+```
+
+关键设计：
+
+- **口令最小长度 6 位**（`MIN_TOKEN_LEN`），太短直接拒。改口令时校验
+  两次输入是否一致，不一致也拒 —— 两个输入框存在的意义就是防手滑。
+- **改口令走独立路由**（`/admin/admins/token`），跟改其它字段分开，
+  免得编辑别的地方时把口令清空。
+- **Cookie 带身份**：`bks_admin = a{id}.{nonce}.{sig}`，HMAC-SHA256 签名。
+  `auth::verify()` 返回 `Option<i64>`，id 就是登录的管理员。
+  ⚠️ **v0.4 改了 Cookie 格式**（老的是 `{nonce}.{sig}`），部署后**旧 Cookie 全部失效**，
+  管理员需要重新登录一次。这是有意的：老 Cookie 不带身份，没法判断是谁改的。
+- **超级管理员（id = 0）不在 `admin_users` 表里**，UI 上单独一行只读展示
+  （`admin_env_row`），不能停用也不能删除 —— 否则会把自己锁在门外。
+
+### 4.14 登记编辑与导出（v0.4）
+
+**编辑登记**：点「预览」弹出 `.sheet` 遮罩层，里面按该条记录的
+`template_snapshot` 渲染成**可编辑表单**（不是只读表格）。
+
+- **只改 `data_json`，不动快照**。改了列定义就跟同模板其它行串列了。
+- 保存前用 `validate_data` **再校验一遍**，必填漏填会被挡：
+  报"没存上：必填（登记人）；必填（订单号）"。
+- 有 JS 时走 `fetch('/admin/forms/submission/{id}/edit')` 取 HTML 片段填进弹层；
+  **无 JS 时走服务端整页渲染**（`#rec-editor` 内联）。两条路都得有，
+  否则禁用 JS 就完全没法编辑。
+
+**导出 xlsx**：按模板分组，每个分组自带一个「导出这个模板」按钮。
+
+- **工具条上的导出按钮，没选模板时不给链接**，只显示一行提示文字。
+  原因见 §10 踩坑表："导出无反应"其实是整页 400，点链接跳回来看到的
+  是页面顶部的一条报错，离按钮很远，人只会觉得"点了没反应"。
+- 每个分组那个「导出这个模板」按钮**永远可用**（它自带模板参数）。
+- 导出的筛选参数由 `export_url(q, template)` 统一拼，
+  免得漏掉 `from` / `to` 导致导出的行数跟页面上看到的不一致。
+
 
 ## 5. 管理页模板
 
@@ -519,12 +658,29 @@ v0.3.0 标签页改版后又跑了一遍：五个 `?tab=` 各只有一段可见�
 ### 9.2 单元测试
 
 ```bash
-~/.cargo/bin/cargo test --release     # 12 项
+~/.cargo/bin/cargo test --release     # 22 项
 ```
 
 测的都是"错了也不报错"的地方：重复提交只落一条、模板升版后旧快照仍在、
-乐观锁被拒时库没被改、名单外登录失败、坏 schema 存不进、导出列并集缺列留空。
+乐观锁被拒时库没被改、名单外登录失败、坏 schema 存不进、导出列并集缺列留空、
+删模板后历史记录和名字都还在、改登记只动内容不动字段定义、
+管理端口令只存哈希、停用/改口令后老口令登不进来、查询参数空串当没填。
 **改 `forms.rs` / `db.rs` / `xlsx.rs` 之后必须跑**，这些是静默错误，界面上看不出来。
+
+### 9.3 无头 Chrome 截管理页（v0.4 起）
+
+管理页改版后光看 curl 返回的 HTML 看不出对不对（两级标签、弹层、遮罩层
+这类交互问题，HTML 静态看是"都在"的）。用 `tools/shot-admin.js` 截图：
+
+```bash
+node tools/shot-admin.js http://127.0.0.1:18080 /tmp/admin.png
+```
+
+- 走 **Node 22 内置 `WebSocket`** 直接连 CDP，不装 puppeteer（省依赖）。
+- **必须用 `Network.setCookie` 注入自签 Cookie**，不能用登录表单。
+  原因是 `file://` → `http://` 属跨站，Chrome 的第三方 cookie 策略会把
+  `Set-Cookie` 拦掉，截出来还是登录页。
+- Cookie 格式是 v0.4 的 `a{id}.{nonce}.{sig}`，签名密钥是 `DATA_DIR/secret.key`。
 
 ## 10. 踩过的坑（改这里前必读）
 
@@ -545,6 +701,10 @@ v0.3.0 标签页改版后又跑了一遍：五个 `?tab=` 各只有一段可见�
 | 删人时把历史提交一起删 | 记录里冗余存了 `user_name`，只需删人；连提交一起删等于毁账 |
 | 把清单发给旧客户端 | 旧 Python 客户端没有 `client` 校验，会拿新版 exe 把自己替换掉 —— 所以缺参数一律 404 |
 | `ALTER TABLE` 那段别删 | NAS 上的库是旧版建的，靠它补列 |
+| 查询参数空串把整页打成 400 | 下拉框"全部"选项的值是空串，`?template=` → serde 报 `cannot parse integer from empty string` → **整页 400**。必须用 `opt_i64` 自定义反序列化，空串和乱填一律当 `None` |
+| 软删除被 `name UNIQUE` 卡住 | 删掉"客户需求表"后同名新建报"已经有同名模板了"。删除时把名字改成 `原名（已删除）` 腾出约束 |
+| JS 找 `#rec-editor` 找不到 | 服务端渲染时没包这层外壳 → 弹层永远打不开，编辑器一直内联在页面上 |
+| 报错离按钮太远 = "点了没反应" | 导出失败跳回页面顶部的报错条，用户视线还在底部的按钮上。**无条件的操作不给链接，改成提示文字** |
 | Location 头塞中文 | 只能 ASCII；跳转消息一律百分号编码（`admin.rs::encode`） |
 | 上传失败不删文件 | `packages/` 会攒孤儿文件，且 `/packages/{name}` 还能下到它们（虽然清单里没有） |
 | 目录穿越 | 下载只接受字符白名单（字母数字 + `._-`），从字符层杜绝，不靠事后规范化 |

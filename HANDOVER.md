@@ -3,11 +3,20 @@
 > 写给下一个接手的人/智能体。读完这份，你能不改错地把这套发版链路继续用下去。
 > 实现细节见 [DEV.md](DEV.md)，部署与发版流程见 [README.md](README.md)。
 
-**当前状态：服务端 v0.2.0。** 更新分发那条链路已经**真的跑在 NAS 上**（2026-10-28 15:52 部署完成，
-`docker compose pull && up -d`，容器内 `bks-updates 0.1.1` → 本次升到 0.2.0）。
-v0.2.0 新增**表单收集**（姓名登录 + 模板存取 + 提交 + 导出 xlsx）：服务端这一半
-代码、单测（12 项）、curl 冒烟（36 项）都已完成并在本机验过，**客户端那一半还没动**。
-下一步是客户端的填写页与模板编辑器 —— 见 §6.3。**
+**当前状态：服务端 v0.4.0。** 更新分发那条链路已经**真的跑在 NAS 上**
+（2026-10-29 12:1x 部署完成，容器 `bks-updates 0.4.0` Up (healthy)，
+`/health` 返回 ok）。
+
+v0.4.0 把管理页改成**两级标签**：顶层四个【概览】【表单登记】【版本更新】【登录管理】，
+【表单登记】下分【表单预览】【模板管理】，【登录管理】下分【客户端】【管理端】。
+新增能力：登记可预览并编辑、可导出 xlsx（修了"点了没反应"的空参数 400）、
+模板可停用与**软删除**（删了不影响已生成的表格）、管理端可增删人员并修改口令
+（口令只存 sha256 哈希）。单测 22 项全过。
+
+⚠️ **v0.4 改了管理页 Cookie 格式**（`a{id}.{nonce}.{sig}`，带管理员身份），
+部署后旧 Cookie 全部失效，**管理员需重新登录一次**。
+
+下一步见 §6。
 
 ---
 
@@ -34,7 +43,7 @@ open http://127.0.0.1:18080/admin                                  # 登录页
 
 # 4. 子命令
 BIND=127.0.0.1:18080 target/release/bks-updates --health; echo $?   # 0
-target/release/bks-updates --version                               # bks-updates 0.1.0
+target/release/bks-updates --version                               # bks-updates 0.4.0
 ```
 
 ### 代码地图
@@ -123,8 +132,8 @@ GH_TOKEN=ghp_xxx python3 ~/AI/WorkBuddy/tools/gh_push.py . <owner>/<repo> "提�
 git fetch origin main && git reset --hard origin/main
 ```
 
-> 当前状态（2026-10-29 11:50）：**github.com 和 api.github.com 都通**（直连 0.8s），
-> `git push` 正常。服务端仓库已对齐到远端真实历史（`e700db3` → `f8fa81f`），
+> 当前状态（2026-10-29 12:1x）：**github.com 和 api.github.com 都通**（直连 0.8s），
+> `git push` 正常。服务端仓库已对齐到远端真实历史（`e700db3` → `f8fa81f` → `c2a9a6d`），
 > **本地与远端一致**，以后正常 `git push` 就行。
 > 分叉的收尾办法（比 `reset --hard` 温和，保留本地提交）：
 > `git fetch origin && git branch backup/pre-align-$(date +%Y%m%d) HEAD && git reset --hard origin/main && git cherry-pick <本地独有的提交>`。
@@ -250,19 +259,26 @@ NAS（飞牛 OS）
 - [x] ~~v0.2.0 上 NAS~~ 已完成（2026-10-28 22:25），容器内 `--version` 0.2.0；
 - [x] ~~v0.3.0 标签页改版~~ 2026-10-28 23:27 已上 NAS，容器内 `--version` 0.3.0，
       标签栏 / 活动表 / 旧地址 302 都在 NAS 上复验过；
+- [x] ~~v0.4.0 管理页两级标签~~ 2026-10-29 已上 NAS，容器内 `--version` 0.4.0，
+      四个顶层 + 两组二级标签、登记预览编辑、导出 xlsx、模板软删除、管理端人员口令
+      全部在 NAS 上复验过（详见 §8）；部署前备份在 `backup-20261029-pre040/`；
 - [ ] 名单里现在有一个自测留下的「吴凯波」（id=1）。留着能用（就是你本人），
-      不要就在 `?tab=users` 点删除；
-- [ ] 去 `/admin?tab=users` 把客服姓名加进去（**姓名必须与本人说的完全一致**），加完客户端才能登录；
+      不要就在 `?tab=login&sub=clients` 点删除；
+- [ ] 去 `/admin?tab=login&sub=clients` 把客服姓名加进去
+      （**姓名必须与本人说的完全一致**），加完客户端才能登录；
+- [ ] 管理端（`/admin?tab=login&sub=admins`）目前只有环境变量里的超级管理员，
+      建议给实际管事的人各建一个账号，别共用一个口令。
 
 ### 6.2 P0 — 把网页版客户端发上去
 
-- [ ] 上传 `贝可施客服小工具-v0.2.0.exe`（**67,422,649 字节**，
-      sha256 `7d0dde85eadefebcdbd09e185c39386a3e04ea06ab820a682a9e113dfc12ced1`），
-      版本填 `0.2.0`（现在没有客户端可选了，只有一条线）；
-- [ ] 核对清单：`/latest.json?client=web` 里的 `size` / `sha256` 与上面一致；
+- [x] ~~上传 v0.2.0 的 exe~~ 已被 v0.5.0 取代（2026-10-29 用户自己上传的）：
+      `贝可施客服小工具-v0.5.0.exe`，**67,519,663 字节**，
+      sha256 `0ef1f9a6…`（完整值见客户端仓库 `HANDOVER.md` §8）。
+      已核对 `/latest.json?client=web` 返回 version 0.5.0 / size 67519663 / sha256 一致；
 - [ ] 拿一台装旧版的机器实跑一遍：启动 8 秒后应该静默下载 → 出现「重启并更新」→
       点完新版起来（**这是整条链路唯一没有被真机验证过的一段**）；
-- [ ] 顺带决定：Python 版 v1.1.2 的安装包（14,488,998 字节 / `da7b4e55…`）要不要一起发到 python 线。
+- [x] ~~Python 版 v1.1.2 要不要一起发~~ 不发 —— 只有一条 `web` 线，
+      `python` 线只作历史记录留着（§3「只有一条版本线」）。
 
 ### 6.3 P0 — 表单收集：客户端那一半（服务端已完成）
 
@@ -280,6 +296,9 @@ NAS（飞牛 OS）
       `.env` 在 `.gitignore` 里；本机用这套 compose 起过一整套（拉镜像 → healthy → 上传 → 读清单）验证通过。
       **NAS 上那份旧 compose 里的明文口令要顺手改掉**；
 - [ ] NAS 上给 `data/` 加定时备份（`updates.db` + `secret.key` + `packages/` 三样就够）；
+      ⚠️ **备份必须连 `-wal` 一起拷** —— WAL 模式下停容器后 `updates.db` 只有 4096 字节，
+      真实数据在 `updates.db-wal` 里。要拷就 `docker cp` 四个文件：
+      `updates.db` + `updates.db-wal` + `updates.db-shm` + `secret.key`；
 - [ ] 考虑在 Lucky 上给 `/admin` 加 IP 白名单或 basic auth（登录接口现在没有频率限制）。
 
 ### 6.5 P2 — 代码
@@ -320,14 +339,60 @@ NAS（飞牛 OS）
 | 提交一直 422 | 看 `fields` 字段里的具体错误；若提示"表单版本已失效"，是客户端缓存的模板版本太旧 |
 | 客户端"待上传"清不掉 | 服务端只回 200（`created`/`duplicate`）才算成功；若一直 4xx，检查 token 是否过期 |
 | 导出重定向回页面 | 没选模板（一次只导一个），或该筛选下没有记录 —— 看地址栏 `err=` 的提示 |
+| **导出"点了没反应"** | v0.4 前：筛选表单的"全部模板"选项值是空串，`?template=` → serde 报 `cannot parse integer from empty string` → **整页 400**，而报错条在页面顶部、按钮在底部，看着就像没反应。已用 `opt_i64` 修；工具条上没选模板时现在直接不给链接 |
 | 概览"谁在连"一直是空的 | 客户端还没发过请求；或反代没传 `X-Forwarded-For`（IP 全是反代的） |
-| 五个标签同时显示 / 切换无效 | `.pane[hidden]` 的 `!important` 被改掉了，或页面 JS 被拦 |
-| 操作完跳回概览 | 重定向漏了 `tab=`；各操作应回自己的标签（加人→users、停用模板→templates） |
+| 标签同时显示 / 切换无效 | `.pane[hidden]` / `.subpane[hidden]` 的 `!important` 被改掉了，或页面 JS 被拦 |
+| 二级标签点了没反应 | `?tab=register&sub=preview` 里 `sub` 拼错；未知 `sub` 会回落到该顶层默认二级（登记→预览，登录→客户端） |
+| 操作完跳回概览 | 重定向漏了 `tab=`（或漏了 `sub=`）；各操作应回自己的标签（加人→login/clients、停用模板→register/templates） |
+| 管理端口令登不进来 | 先确认是不是用了环境变量 `ADMIN_TOKEN`（那是超级管理员 id=0）；表里账号可能被停用，或口令已改过 |
+| 改了口令后老口令还能登 | 不该发生。库里只存 sha256 哈希，改口令走 `/admin/admins/token` 独立路由，不走通用保存 |
+| 停用模板后客户端还在拉 | 看 `deleted_at` / `is_active` 两个字段。软删除要同时置 `is_active=0`，客户端清单才不下发 |
+| 删了模板但同名新建报"已存在" | 软删除必须把名字改成 `原名（已删除）` 腾出 `name` 的 UNIQUE 约束 |
+| 删了模板后历史记录模板名变空 | 历史认名字要走 `form_templates_all()`（含已删除），不能走 `form_templates()` |
+| 管理页登进去又跳回登录页 | v0.4 改了 Cookie 格式，老 Cookie 全部失效，**重新登录一次**即可 |
+| 弹层打不开，编辑器一直内联 | 服务端渲染时少了 `#rec-editor` 这层外壳，JS 找不到就退回了内联模式 |
 | 导出列对不上 | 用提交自带的快照取列；若出现串列，说明有记录没存快照（v0.2.0 之后不会发生） |
 
 ---
 
 ## 8. 实测记录
+
+### 2026-10-29 中午（v0.4.0 管理页改版）
+
+**测试**：`cargo test` **22/22 全过**（原 14 项 + 新增 8 项）：
+
+| 新增用例 | 验的是 |
+|---|---|
+| 删模板后历史登记和名字都还在 | 软删除不毁历史 |
+| 删模板后能用回原来那个名字 | 软删除要腾出 UNIQUE 约束 |
+| 改登记只动内容不动字段定义 | 编辑不能碰 `template_snapshot` |
+| 管理端口令只存哈希 | 库里不能有明文 |
+| 停用管理端人员后他的口令登不进来 | `enabled` 真的生效 |
+| 改管理端口令后老口令失效 | 改口令真的换掉了凭据 |
+| 空串查询参数当成没填 | 修 `?template=` 整页 400 |
+| 查询参数里的整数空串和乱填都当没填 | `opt_i64` 端到端 |
+
+**本地实测**（`DATA_DIR=/tmp/bks-t`、端口 18080）：
+
+- 四个顶层标签 + 两组二级标签全部渲染，`?tab=register&sub=templates` 这类 URL 直接访问正常。
+- 点「预览」弹层打开，表格可编辑；清空必填后保存被挡，报
+  `没存上：必填（登记人）；必填（订单号）`。
+- 导出 xlsx 实测 **HTTP 200 / 5803 字节**。
+- 模板软删除实测：`deleted_at=1793247342`、`is_active=0`，提交数仍为 2，
+  历史记录仍显示「客户需求表」，导出照常 200，客户端拉取 `{"templates":[]}`，
+  再提交被拒「这个表单已经被删除了，不能再提交」。
+- 管理端人员：添加成功、两次口令不一致被挡、短口令（<6 位）被挡、
+  新口令能登录（200）、错口令 401，库里存的是 sha256 哈希 `a03c32fc…`。
+- 无头 Chrome 截图（`tools/shot-admin.js`）验证四个标签页与预览弹层渲染正常。
+
+**部署 NAS**：本地 `docker build`（1 分 10 秒）→ `docker save | gzip` → `ssh "cat > 文件"`
+→ `docker load` → `compose up -d --force-recreate`。容器 `bks-updates 0.4.0` Up (healthy)，
+`/health` = ok。部署前已备份到 `backup-20261029-pre040/`（**四个文件，含 WAL**）。
+
+**数据完整性核对**（把 NAS 上 `updates.db` + `-wal` + `-shm` + `secret.key` 拷回本地用
+python sqlite3 打开）：表 `['releases','sqlite_sequence','checks','form_users','form_templates',
+'form_template_versions','form_submissions','activity','admin_users']`；
+`form_templates` 列含 `deleted_at`；模板 2 个、名单 11 人、登记 1 条、版本 0.4.0/0.5.0 —— **一条没丢**。
 
 ### 2026-10-28 晚（v0.2.0 表单，`target/release/bks-updates` 2,639,072 字节）
 
@@ -466,3 +531,8 @@ docker build --platform linux/amd64 \
 - [ ] 知道客户端里的两个更新地址在本仓库之外（`../beikeshi-cs-web`）
 - [ ] 提交前 `git status` 确认 `target/`、`data/`、`*.db`、`.env` 没进仓库
 - [ ] 口令/密钥不写进仓库；`ADMIN_TOKEN` 走环境变量
+- [ ] 知道管理页现在是**两级标签**，URL 带 `?tab=&sub=`；改完重定向**两个参数都要带**
+- [ ] 知道模板是**软删除**（`deleted_at`），删除时必须改名腾出 `name` 的 UNIQUE 约束
+- [ ] 知道查询参数可能传空串，`?template=` 这类要用 `opt_i64` 兜住（否则整页 400）
+- [ ] 备份数据库时**连 `-wal` 一起拷**，否则拷回来的库是空的
+- [ ] 推 GitHub 用 `GIT_ASKPASS`（见 §2.2），**macOS 钥匙串存 GitHub 令牌 git 认不出来**

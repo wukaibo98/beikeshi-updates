@@ -290,9 +290,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/forms", get(redirect_forms))
         .route("/admin/users/delete", post(forms::user_delete))
         .route("/admin/forms/template/toggle", post(forms::admin_template_toggle))
+        .route("/admin/forms/template/delete", post(forms::admin_template_delete))
+        .route("/admin/forms/submission/save", post(forms::submission_save))
+        .route(
+            "/admin/forms/submission/{id}/edit",
+            get(forms::submission_edit),
+        )
         .route("/admin/forms/export.xlsx", get(forms::export))
         .route("/admin/users/save", post(forms::user_save))
         .route("/admin/users/toggle", post(forms::user_toggle))
+        .route("/admin/admins/save", post(forms::admin_user_save))
+        .route("/admin/admins/toggle", post(forms::admin_user_toggle))
+        .route("/admin/admins/token", post(forms::admin_user_token))
+        .route("/admin/admins/delete", post(forms::admin_user_delete))
         .route("/form/login", post(forms::login))
         .route("/form/edit-login", post(forms::edit_login))
         .route("/form/templates", get(forms::templates))
@@ -343,10 +353,28 @@ pub fn iso(ts: i64) -> String {
 
 /// 管理页要用的口令校验。
 pub fn is_admin(headers: &HeaderMap, state: &AppState) -> bool {
+    admin_id(headers, state).is_some()
+}
+
+/// 当前登录的是谁（管理端人员 id）。`Some(0)` = 环境变量口令（超级管理员）。
+pub fn admin_id(headers: &HeaderMap, state: &AppState) -> Option<i64> {
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok());
     state.auth.verify(cookie)
+}
+
+/// 查询参数里的整数。
+///
+/// **空串当成"没填"** —— 下拉框里"全部模板"这个选项的值就是空串，
+/// 筛选表单每次提交都会带上 `template=&user=`。按 `Option<i64>` 直接解析，
+/// serde 会报 `cannot parse integer from empty string`，整页直接 400。
+pub fn opt_i64<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(raw.and_then(|s| s.trim().parse::<i64>().ok()))
 }
 
 pub fn flash(ok: Option<String>, err: Option<String>) -> String {
