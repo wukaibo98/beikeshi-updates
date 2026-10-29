@@ -555,6 +555,78 @@ DELETE FROM form_templates WHERE id = ?;
 - `form_template_versions` 要一起删：那是这个模板的字段定义历史，模板都没了，
   留着只是垃圾，还会让人误以为能回滚到一个已经不存在模板的版本。
 
+### 4.18 NAS 上已经有 OnlyOffice 了（2026-10-29 侦察结论，暂未接入）
+
+> 这一节是**侦察记录**，不是实现。结论是"随时可以接"，但**还没接**，
+> 也没有改任何代码 —— 用户决定先存档，需要时再动手。
+
+**背景**：v0.5.0 决定"不引入开源 office"（理由见 §4.15）。这个结论是**基于当时
+NAS 上只有文本编辑器**得出的。2026-10-29 用户在绿联应用中心新装了
+**「在线文档」**（`com.ugreen.office` v1.20.1.0028），**前提变了，结论要重估**。
+
+**实测事实**（全部在 NAS 上跑命令验证过，不是看文档猜的）：
+
+| 项目 | 结果 |
+|---|---|
+| 应用 | `com.ugreen.office`，内含 `onlyoffice/documentserver/`（272MB 安装包） |
+| 是不是 Docker | **不是**，绿联原生应用（`isDockerApp: false`） |
+| 进程 | `DocService/docservice` + `FileConverter/converter` + **专用 PostgreSQL**（`/usr/ugreen/local/com.ugreen.office/psql/db`）+ redismq 队列 |
+| API 存活 | `GET /ugoffice/healthcheck` → **200 `true`** |
+| 浏览器可达 | Lucky 把 `/ugoffice/`、`/ugreen/v1/office/` **正确路由**到 UGOS 的 50312 口（443 上 307 跳转可达） |
+| JWT | **开着**。`local.json` 里 `token.inbox/outbox: true`、`tokenRequiredParams: true` |
+| 原生 API | **被绿联封装层挡了**：`/web-apps/apps/api/documents`、`/cooking/convert-to`、`/info/config` 全部 404（`info/config` 是 nginx 明确 `return 404`） |
+| 绿联自己的接口 | `GET /ugreen/v1/office/openfile?path=…&office_token=…`，token 由 `getOfficeToken` 签发 |
+
+**网络拓扑**（搞错了会白折腾）：
+
+```
+浏览器
+  │ https://bks.beikeshi.cn:443   (Lucky，host 网络模式)
+  │   ├─ /latest.json, /admin  → Lucky 规则 → 127.0.0.1:50205 → bks-updates 容器
+  │   └─ /ugoffice/, /ugreen/v1/office/ → 307 → https://…:50312 (UGOS 自己的 nginx)
+  │                                        └─ /ugoffice/ → unix:/tmp/ugoffice.sock → OnlyOffice
+  │                                        └─ /ugreen/v1/office/ → unix:/var/ugreen/office_serv.sock
+  └─ 绿联 nginx 只监听 80（HTTPS 全部由 Lucky/UGOS 接管）
+```
+
+⚠️ **Lucky 会抢路径**：`/ugreen/v1/editor/`（文本编辑器）在 54321 上实测是
+**404 `Server: LuckyWeb`** —— Lucky 把它分发到了我们的 axum 服务，它不认识这个路径。
+但 `/ugoffice/` 走的是另一条规则，能正确到 UGOS。**加新路径前先在 NAS 上实测一遍
+它落到谁**，别想当然。
+
+**三条接入路线**：
+
+| | A. 直接嵌 | B. xlsx 文件往返 | C. 纯前端网格 |
+|---|---|---|---|
+| 做法 | 服务端调 `getOfficeToken` → 拼 `openfile` URL → iframe | 服务端导出 xlsx 到用户可写目录 → 用户在绿联在线文档里改 → 服务端读回 | SheetJS（约 1MB）打进服务端静态资源 |
+| 改登记数据 | ✅ | ✅ | ✅ |
+| 体验 | 真 Office | 真 Office（要跳出管理页） | 只有网格，无公式无格式 |
+| 新增部署面 | 0 | 0 | 0 |
+| 服务端要加的依赖 | 无 | `calamine`（只读 xlsx，约 1MB） | 无 |
+| 主要坎 | ① `getOfficeToken` 要 UGOS 登录态（服务端得存凭据）② **保存回调未知** —— OnlyOffice 存盘要 POST 到 `callback` 才能写回服务端，而原生 API 被挡，绿联封装层是否提供回调**还没验证** | 跳出管理页；data 目录 root-only 要用 `/volume1/工具箱` 之类可写目录；要定"读回"机制（轮询 mtime 或用户点导入） | 没有 OnlyOffice 的公式、格式、合并单元格 |
+
+**⚠️ 语义红线：路径 B 不能用来改模板结构。**
+`template_snapshot` 是整套设计里最不能妥协的一条（历史数据永不串列）。
+让用户在 xlsx 里改列再导回就会破坏快照冻结，且**历史数据串列后无法修复**。
+路径 B 只适用于**改 `data_json` 的值**（改登记数据）。
+要改结构，走现有字段编辑器或路径 C。
+
+**没做的验证**（下次要做时先补上）：
+
+1. 绿联在线文档能不能在浏览器里新建 xlsx → 存到 `/volume1/工具箱/` → 再打开编辑 → 保存
+   （**这是路径 B 成不成立的前提**，无法用命令行代替，只能人工点）
+2. 绿联封装层有没有提供 OnlyOffice 的 `callback`（**这是路径 A 成不成立的前提**）
+3. `getOfficeToken` 到底要什么凭据、有效期多久
+
+**读 NAS 上 root 私有文件的办法**（`local.json` 这类）：
+用户在 `docker` 组里，可以起特权容器读：
+```bash
+docker run --rm --entrypoint sh -v /volume1/@appstore/com.ugreen.office:/o:ro ugreen/lucky:v3 \
+  -c 'cat /o/onlyoffice/documentserver/server/Common/config/local.json'
+```
+⚠️ `--entrypoint sh` 不能省 —— `ugreen/lucky:v3` 默认入口是 LuckyWeb，命令会被忽略。
+⚠️ Docker Hub 在这台机器上被拦，跑不了 `alpine` / `curlimages`，只能用**本地已有**的镜像。
+
 
 ## 5. 管理页模板
 

@@ -255,7 +255,7 @@ NAS（飞牛 OS）
 | **管理页做成标签页** | 用户要求"跟客户端类似"。内容一次渲染完 + 20 行 JS 切换（不刷新），URL 是状态唯一来源 |
 | **"在线"只是最近 15 分钟有请求** | 没有心跳，不能假装实时。页面如实显示"N 分钟前" |
 | **删人不删历史提交** | 提交记录冗余存了 `user_name`，删了人还认得出是谁填的。删提交等于毁账 |
-| **不引入开源 Office**（2026-10-29） | OnlyOffice 镜像 1–2GB 还要 Postgres+Redis，LibreOffice headless 几百 MB —— NAS 上等于多一个部署面、多一组漏洞面。而这里要编辑的是**只有 6 种字段类型的结构化表单**，不是任意 Excel 文件；"改数据"的需求已由登记编辑弹层满足。要 Excel 级体验该做的是纯前端 SheetJS（约 1MB，不新增部署面），或干脆往客户端做 |
+| **不引入开源 Office**（2026-10-29） | OnlyOffice 镜像 1–2GB 还要 Postgres+Redis，LibreOffice headless 几百 MB —— NAS 上等于多一个部署面、多一组漏洞面。而这里要编辑的是**只有 6 种字段类型的结构化表单**，不是任意 Excel 文件；"改数据"的需求已由登记编辑弹层满足。要 Excel 级体验该做的是纯前端 SheetJS（约 1MB，不新增部署面），或干脆往客户端做。**⚠️ 但这个结论的前提后来变了**：用户当天在绿联应用中心装了「在线文档」，那就是**完整的 OnlyOffice Document Server**（原生安装，已在 NAS 上跑着，`/ugoffice/healthcheck` = true）。"不引入"现在只针对"再压一套新的"。接入方案见 DEV.md §4.18（**尚未接入**） |
 | **永久删除模板不删历史登记** | 删模板是"不想要这张表了"，不是"连填过的记录一起抹掉"。真删模板行之前先把模板名冗余进 `form_submissions.template_name`，历史记录仍认得出表名。**且必须先软删过**才允许永久删除 |
 | **上传记录只显示 200 条** | 这条记录是给人抽查一眼用的，不是当报表用。全量渲染几万行会把浏览器拖死；要看全部请走导出 xlsx |
 
@@ -340,6 +340,17 @@ NAS（飞牛 OS）
 - [x] **第一批自动化测试已加**（2026-10-28，`src/tests.rs` + `xlsx.rs` 内，`cargo test --release` 12 项）；
 - [ ] 还没覆盖的：文件名白名单、版本号校验、清单拼接（lan/public 缺失的三种组合）、
       `detect_package` 的头尾扫描边界。要测这些得把纯逻辑抽到 `lib.rs`（现在是单 bin）；
+- [ ] **NAS 上已经有一个现成的 OnlyOffice 可以接**（2026-10-29 侦察，**未接入**）：
+      绿联应用中心的「在线文档」（`com.ugreen.office`）= 完整 OnlyOffice Document Server，
+      原生安装（非 Docker），`/ugoffice/healthcheck` 返回 `true`。
+      目标锁定为**在网页里改登记数据**（真 Excel 体验）。
+      三条路线：① 直接嵌（iframe 调绿联 `openfile`）② xlsx 文件往返（服务端加 `calamine`）
+      ③ 纯前端 SheetJS。**动手前先补三个验证**（DEV.md §4.18 末尾列了）：
+      绿联在线文档能否存取 `/volume1/工具箱/` 里的 xlsx（决定路线②成不成立）、
+      绿联封装层有没有 OnlyOffice 的 `callback`（决定路线①成不成立）、
+      `getOfficeToken` 要什么凭据。
+      ⚠️ **语义红线**：无论哪条路线，**只能改登记数据，不能改模板结构** ——
+      后者会破坏 `template_snapshot` 冻结，历史数据一旦串列无法修复。
 - [ ] 下载计数现在每个请求 +1（客户端重试会虚高），可以按 IP/时间窗去重，或干脆改成"仅计数"；
 - [ ] `Dockerfile` 的 `rust:1-alpine` 是浮动 tag，建议钉到具体小版本（可复现构建）；
 - [ ] 管理页目前没有"仅上传不发布"，也没有删除前的二次确认以外的保护 —— 够用，先别加复杂度；
@@ -395,6 +406,8 @@ NAS（飞牛 OS）
 | 【永久删除】点了没反应 / 报错 | 模板必须**先软删除**（`deleted_at>0`），否则返回 `not_deleted`。这是故意的闸门 |
 | 永久删除后历史登记认不出表名 | `form_submissions.template_name` 没被补上。检查 `form_template_purge` 里 UPDATE 是否在 DELETE 之前执行 |
 | 永久删除后 `form_template_versions` 还有残留 | 该模板的字段定义历史应一并清掉（`DELETE FROM form_template_versions WHERE template_id=?`） |
+| 新路径 404 且 `Server: LuckyWeb` | **Lucky 抢了路径**。它把不认识的路径分发到了我们的 axum 服务（例：`/ugreen/v1/editor/` 实测就是 404 LuckyWeb），而 `/ugoffice/` 走另一条规则能到 UGOS。加新路径前先在 NAS 上 `curl` 一遍看它落到谁，别想当然 |
+| 想在 NAS 上读 root 私有文件 | 用户在 `docker` 组，可起特权容器读：`docker run --rm --entrypoint sh -v <路径>:/o:ro ugreen/lucky:v3 -c 'cat /o/…'`。**`--entrypoint sh` 不能省**（lucky 镜像默认入口是 LuckyWeb，命令会被忽略）。**Docker Hub 在这台机器被拦**，只能用本地已有的镜像 |
 
 ---
 
