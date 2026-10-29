@@ -186,6 +186,36 @@ fn 提交数据按模板复验() {
     assert!(validate_data(&s, &not_num).contains_key("n"));
 }
 
+#[test]
+fn 姓名类型能存也能填() {
+    // 「姓名」是新增的字段类型：客户端会自动填当前登录人
+    let s = parse(&schema(
+        r#"[{"key":"who","label":"登记人","type":"name","required":true},
+            {"key":"day","label":"发生日期","type":"date"}]"#,
+    ));
+    assert!(validate_schema(&s).is_ok(), "姓名类型不该被当成非法类型");
+
+    let ok = serde_json::from_str(r#"{"who":"吴凯波","day":"2026-10-29"}"#).unwrap();
+    assert!(validate_data(&s, &ok).is_empty());
+
+    // 必填时还是要填
+    let missing = serde_json::from_str(r#"{"day":"2026-10-29"}"#).unwrap();
+    let errs = validate_data(&s, &missing);
+    assert_eq!(errs.get("who").map(|s| s.as_str()), Some("必填"));
+
+    // 超长要挡住（默认 30 字）
+    let long_name = "啊".repeat(31);
+    let long = serde_json::from_str(&format!(r#"{{"who":"{long_name}"}}"#)).unwrap();
+    let errs = validate_data(&s, &long);
+    assert!(errs.contains_key("who"), "姓名超过 30 字要挡住");
+}
+
+#[test]
+fn 不认识的字段类型存不进去() {
+    let s = parse(&schema(r#"[{"key":"a","label":"A","type":"phone"}]"#));
+    assert!(validate_schema(&s).is_err(), "未知类型必须拒掉");
+}
+
 /* ------------------------------------------------------------ 6. 导出列 */
 
 #[test]

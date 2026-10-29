@@ -55,7 +55,14 @@ pub struct Field {
     pub placeholder: Option<String>,
 }
 
-pub const KINDS: [&str; 5] = ["text", "textarea", "number", "select", "date"];
+/// 支持的字段类型。
+///
+/// `name` 是「姓名」：客户端填写页会自动填入当前登录人的姓名，
+/// 服务端只当它是普通文本校验（默认最多 30 字）。
+pub const KINDS: [&str; 6] = ["text", "textarea", "number", "select", "date", "name"];
+
+/// 姓名字段默认最多几个字（客户端 form-render.js 里也是 30）。
+pub const NAME_MAX: usize = 30;
 
 /// 模板能不能存。返回人话错误，直接显示在客户端编辑器里。
 pub fn validate_schema(schema: &Schema) -> Result<(), String> {
@@ -139,6 +146,12 @@ pub fn validate_data(schema: &Schema, data: &Map<String, Value>) -> BTreeMap<Str
         match f.kind.as_str() {
             "text" | "textarea" => {
                 let limit = f.max_length.unwrap_or(if f.kind == "textarea" { 500 } else { 200 });
+                if text.chars().count() > limit {
+                    errs.insert(f.key.clone(), format!("最多 {limit} 字"));
+                }
+            }
+            "name" => {
+                let limit = f.max_length.unwrap_or(NAME_MAX);
                 if text.chars().count() > limit {
                     errs.insert(f.key.clone(), format!("最多 {limit} 字"));
                 }
