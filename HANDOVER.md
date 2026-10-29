@@ -4,7 +4,7 @@
 > 实现细节见 [DEV.md](DEV.md)，部署与发版流程见 [README.md](README.md)。
 
 **当前状态：服务端 v0.4.0。** 更新分发那条链路已经**真的跑在 NAS 上**
-（2026-10-29 12:1x 部署完成，容器 `bks-updates 0.4.0` Up (healthy)，
+（2026-10-29 12:25 部署完成，容器 `bks-updates 0.4.0` Up (healthy)，
 `/health` 返回 ok）。
 
 v0.4.0 把管理页改成**两级标签**：顶层四个【概览】【表单登记】【版本更新】【登录管理】，
@@ -143,7 +143,7 @@ GH_TOKEN=ghp_xxx python3 ~/AI/WorkBuddy/tools/gh_push.py . <owner>/<repo> "提�
 第 3 条是最容易踩的 —— 脚本内部就是靠"本地用 `hash-object` 构造出与远端逐字节相同的
 对象"来对上的，不是靠 `git commit`。
 
-> 当前状态（2026-10-29 12:4x）：**github.com 不通、api.github.com 通**。
+> 当前状态（2026-10-29 13:05）：**github.com 不通、api.github.com 通**。
 > 服务端仓库 v0.4.0（`e3b5c5a`）已用路 2 推上去，**本地与远端 SHA 相同，无分叉**。
 > 分叉的收尾办法（比 `reset --hard` 温和，保留本地提交）：
 > `git fetch origin && git branch backup/pre-align-$(date +%Y%m%d) HEAD && git reset --hard origin/main && git cherry-pick <本地独有的提交>`。
