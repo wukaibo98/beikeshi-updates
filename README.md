@@ -10,7 +10,7 @@ GET /admin                       # 管理页：上传 / 发布 / 回滚 / 删除
 GET /admin/forms                 # 表单收集：提交记录 / 名单 / 导出 xlsx
 ```
 
-当前服务端版本 **0.3.0**（跟客户端版本无关）。跑在 NAS 上，镜像
+当前服务端版本 **0.3.1**（跟客户端版本无关）。跑在 NAS 上，镜像
 `ghcr.io/wukaibo98/beikeshi-updates:latest`，容器内端口 8080，NAS 映射到 **50205**；
 公网经 Lucky 反代到 `https://bks.beikeshi.cn:54321`。
 
@@ -100,7 +100,7 @@ GET /latest.json?client=python → 404「未知客户端：python」
 | GET | `/admin` | 管理页；未登录时显示登录页 |
 | POST | `/admin/login` | 表单 `token=...`，对就发 7 天有效的签名 Cookie；错返回 401 |
 | POST | `/admin/logout` | 退出 |
-| POST | `/admin/upload` | multipart：`version` / `notes` / `file`，**上传即发布** |
+| POST | `/admin/upload` | multipart：`version` / `notes` / `file`，**上传即发布**。单个包上限 300MB（v0.3.1 修了"大文件传到一半被截断"的问题） |
 | POST | `/admin/publish/{id}` | 把某个历史版本切回"当前"（回滚） |
 | POST | `/admin/delete/{id}` | 删除版本（连文件一起删；删的若是当前版本，自动把同客户端最新的一条顶上来） |
 

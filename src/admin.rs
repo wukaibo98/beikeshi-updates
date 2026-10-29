@@ -9,7 +9,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{db, html, is_admin, AppState};
 
-const MAX_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
+/// 单个包的上限。body 限制要略大于它（见 main.rs 的 DefaultBodyLimit），
+/// 否则超大文件会被拦在更外层、连"文件太大"这句提示都出不来。
+pub(crate) const MAX_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
+
+/// 小于这个数就当上传不完整。
+/// 安装包不可能只有几十 KB，出现这种情况几乎一定是中途断了 ——
+/// 宁可拒绝，也不要把一个残缺的包发布出去。
+const MIN_PACKAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Deserialize)]
 pub struct LoginForm {
@@ -364,26 +371,46 @@ async fn save_upload(
     let mut hasher = Sha256::new();
     let mut size: u64 = 0;
 
-    while let Some(chunk) = field.chunk().await.map_err(|e| format!("接收数据失败：{e}"))? {
+    loop {
+        let chunk = match field.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) =>
+            {
+                // 中断了（网络断了、请求体被拦在更外层）：半个文件必须删掉，
+                // 否则 packages/ 里会一直堆着 .upload-*.tmp
+                let _ = tokio::fs::remove_file(&temp).await;
+                return Err(format!("接收数据失败：{e}"));
+            }
+        };
+
         size += chunk.len() as u64;
         if size > MAX_UPLOAD_BYTES {
             let _ = tokio::fs::remove_file(&temp).await;
-            return Err("文件超过 300MB".into());
+            return Err(format!("文件超过 {}MB", MAX_UPLOAD_BYTES / 1024 / 1024));
         }
         hasher.update(&chunk);
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| format!("写文件失败：{e}"))?;
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
+        {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(format!("写文件失败：{e}"));
+        }
     }
 
-    tokio::io::AsyncWriteExt::flush(&mut file)
-        .await
-        .map_err(|e| format!("写文件失败：{e}"))?;
+    if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await
+    {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(format!("写文件失败：{e}"));
+    }
     drop(file);
 
-    if size == 0 {
+    if size < MIN_PACKAGE_BYTES {
         let _ = tokio::fs::remove_file(&temp).await;
-        return Err("文件是空的".into());
+        return Err(if size == 0 {
+            "文件是空的".to_string()
+        } else {
+            format!("只有 {size} 字节，上传可能中途断了，请重传")
+        });
     }
 
     let target = state.cfg.pkg_dir.join(&filename);

@@ -275,7 +275,7 @@ NAS（飞牛 OS）
 | 清单 400 未知客户端 | 请求里的 `client` 不在 `python` / `web` 里（拼错、大小写之外的怪值） |
 | 登录一直 401 | `ADMIN_TOKEN` 环境变量没设或和输入的不一致；`docker compose exec` 进去看不到环境变量就说明没生效 |
 | 登录成功但立刻又回登录页 | 浏览器没存 Cookie（HttpOnly + SameSite=Lax）；换 `curl -c jar` 验证是服务端问题还是浏览器问题 |
-| 上传后列表没有新版本 | 看 303 跳转带的是 `err=` 还是 `ok=`：版本号格式、>300MB、空文件都会走 `err` |
+| 上传后列表没有新版本 | 看 303 跳转带的是 `err=` 还是 `ok=`：版本号格式、>300MB、空文件、小于 64KB 都会走 `err` |
 | 下载 404 | `packages/` 里文件被删了（删除版本会连文件一起删）；清单里那条记录却还在 → 重新上传 |
 | 下载 400 文件名不合法 | 名字里有白名单外的字符（中文、空格、`..`） |
 | 客户端下了但校验失败 | 清单 `sha256` 与文件不符：手工 `shasum -a 256` 对一遍；上传时是边写边算的，正常不会错，怀疑磁盘/网络中途出问题 |
@@ -285,6 +285,7 @@ NAS（飞牛 OS）
 | 手工改库报 "readonly database" | `data/` 是 root:644，`吴凯波` 账号写不了。要么停容器后借 `ugreen/lucky:v3` 的 root shell 改权限（`docker run --rm --entrypoint /bin/sh -v .../data:/d ugreen/lucky:v3 -c "chmod 777 /d"`），要么别手工改 |
 | 手工改库后发现表没了 | **别删 `updates.db-wal`**：WAL 模式下建表/写入先落在 wal 里，删掉等于丢掉最近所有变更。真要改就先停容器让 SQLite 正常 checkpoint |
 | 镜像里的程序"什么都不做" | Dockerfile 的 `touch src/main.rs` 丢了，cargo 复用了空壳 `main` 的缓存 |
+| **上传大文件报"连接被重置"** | v0.3.1 前是 axum 默认 body 限制 2MB 导致截断。升级到 0.3.1 即可；若还不行，检查 Lucky 的 `client_max_body_size` 之类上传限制 |
 | 表单登录 403 | 姓名不在 `form_users` 或被停用；去 `/admin/forms` 最下面的名单里加（**姓名要完全一致**，含空格） |
 | 模板保存 409 | 乐观锁：别人/别的机器先改了。刷新拿到新 `version` 再存；**库不会被改**，不会静默覆盖 |
 | 模板保存 403 | `edit_token` 缺失或过期（7 天）。重新输一次管理口令 |

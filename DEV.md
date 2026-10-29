@@ -2,7 +2,7 @@
 
 > 面向改这个服务的人。部署与日常发版见 [README.md](README.md)，交接要点与待办见 [HANDOVER.md](HANDOVER.md)。
 
-**服务端 v0.3.0 ｜ Rust 1.75+ / axum 0.8 / rusqlite(bundled) / tokio ｜ 静态二进制 → scratch 镜像**
+**服务端 v0.3.1 ｜ Rust 1.75+ / axum 0.8 / rusqlite(bundled) / tokio ｜ 静态二进制 → scratch 镜像**
 **代码 1172 行（main 327 / admin 389 / db 206 / html 159 / auth 91）**
 
 ---
@@ -167,6 +167,25 @@ client = web → 按 (is_current=1, client='web') 取一行；没有 → 404 {"e
   比事后规范化 `canonicalize` 更省心。
 - 流式：大包不会把服务端内存吃满（内网 67MB 的 exe 实测没问题）。
 - 下载计数是"尽力而为"：写库失败不影响下发（`let _ =`）。
+
+#### 请求体大小限制（v0.3.1 修的坑）
+
+axum 的 **`DefaultBodyLimit` 默认是 2MB**。64MB 的安装包传到 2MB 就被截断，
+`Multipart::chunk()` 直接返回错误，浏览器看到的是**"连接被重置"**，
+而不是一句"文件太大" —— 排查时极易误判成网络问题。
+
+修法是在 Router 上放宽到略大于单包上限（300MB + 20MB）：
+
+```rust
+.layer(DefaultBodyLimit::max((admin::MAX_UPLOAD_BYTES + 20 * 1024 * 1024) as usize))
+```
+
+另外三条配套：
+
+- **错误路径必须删临时文件**。中断时会在 `packages/` 留下 `.upload-<ts>.tmp` 半个文件，
+  不删就一直堆着。
+- **启动时清一次** `.upload-*.tmp`（进程被打断时它们删不掉）。
+- **小于 64KB 直接拒**：安装包不可能这么小，出现就说明传断了，宁可拒绝也不发布残缺包。
 
 ### 4.3 `POST /admin/upload`
 
@@ -483,6 +502,8 @@ v0.3.0 标签页改版后又跑了一遍：五个 `?tab=` 各只有一段可见�
 | `is_current` 更新漏 client 条件 | 库里还有旧版记录，不加条件会把它们的历史标记也清掉，回滚时才发现 |
 | 导出按位置填列而不是按 key | 模板一改版就串列，且历史数据无法修复 —— 必须按快照取列 |
 | 提交不存快照 | 同上。快照是这套设计里最不能妥协的一条 |
+| 忘了 axum 默认 body 限制是 2MB | 大包传一半就被截断，浏览器报"连接被重置"，看起来像网络问题 |
+| 上传出错不删临时文件 | `packages/` 里堆满 `.upload-*.tmp` |
 | 把 `duplicate` 当错误返回 | 客户端只有看到成功才清队列，一直重试会让"待上传"永远清不掉 |
 | 允许保存离线编辑的模板 | 模板是全局配置，离线改会分叉成两套 —— 断网时保存按钮应置灰 |
 | `.pane[hidden]` 不加 `!important` | 被别的 display 规则盖掉，五个标签会同时显示 |

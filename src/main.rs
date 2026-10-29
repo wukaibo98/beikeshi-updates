@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -244,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(env_or("DATA_DIR", "/data"));
     let pkg_dir = data_dir.join("packages");
     std::fs::create_dir_all(&pkg_dir)?;
+    clean_upload_leftovers(&pkg_dir);
 
     let conn = db::open(&data_dir.join("updates.db"))?;
     let auth = auth::Auth::load_or_create(&data_dir.join("secret.key"))?;
@@ -299,12 +300,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/form/template/toggle", post(forms::template_toggle))
         .route("/form/submit", post(forms::submit))
         .route("/form/mine", get(forms::mine))
+        // 默认是 2MB：64MB 的安装包传到一半就被截断，浏览器看到的是"连接被重置"。
+        // 放宽到略大于单包上限，超限的请求会被干净地拒掉（413）而不是悄悄截断。
+        .layer(DefaultBodyLimit::max(
+            (admin::MAX_UPLOAD_BYTES + 20 * 1024 * 1024) as usize,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("监听 {bind}");
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+/// 清掉上次上传中断留下的半个文件。
+/// 正常路径会自己删，但进程被打断（重启容器、断电）时它们就留在 packages/ 里了。
+fn clean_upload_leftovers(pkg_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(pkg_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".upload-") && name.ends_with(".tmp")
+        {
+            let _ = std::fs::remove_file(entry.path());
+            println!("清掉半个上传文件 {name}");
+        }
+    }
 }
 
 /* ---------------------------------------------------------------- 杂项 */
