@@ -343,6 +343,39 @@ scratch 镜像里**没有 shell、没有 curl、没有 wget**，所以：
   （注意它读 `BIND`；本地手动测时要么带上 `BIND=...`，要么会去连默认的 `0.0.0.0:8080`。）
 - `--version` 打印 `bks-updates <版本>`，方便 `docker run --rm image --version` 查镜像版本。
 
+### 8.0 部署到 NAS：本地构建 + tar 传输（推荐路径）
+
+**以后都用本地构建，不等 GitHub Actions**（用户 2026-10-29 明确要求）。
+Actions 留着当备用（比如要多架构镜像时才用）。
+
+```bash
+# 1. 本机构建（国内要换镜像源）
+docker build --platform linux/amd64 \
+  --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine \
+  -t bks-updates:local -t ghcr.io/wukaibo98/beikeshi-updates:latest .
+
+# 2. 导出（镜像只有 ~5MB，压完 1.7MB）
+docker save bks-updates:local | gzip -1 > /tmp/bks-updates.tar.gz
+
+# 3. 传到 NAS
+scp 不可用（SFTP 的路径基准跟 shell 不一致，会报 "No such file or directory"），
+#   用 ssh + cat 最稳：
+ssh -i ~/.ssh/id_ed25519_bks "吴凯波@192.168.124.3" \
+  "cat > /volume1/docker/bkstools/bks-updates.tar.gz" < /tmp/bks-updates.tar.gz
+
+# 4. NAS 上导入并重启
+gunzip -c bks-updates.tar.gz | docker load
+docker tag bks-updates:local ghcr.io/wukaibo98/beikeshi-updates:latest
+cd /volume1/docker/bkstools && docker compose up -d
+```
+
+要点：
+
+- **compose 的 image 名保持 `ghcr.io/...:latest`**，导入后打同样的 tag，
+  `docker compose up -d` 就会用本地镜像（默认 `pull_policy: missing`，本地有就不拉）。
+- **先 `docker compose stop` 再 load**，让 SQLite 正常 checkpoint（别删 wal，那个坑踩过）。
+- 每次升级前备份 `data/updates.db` 和 `data/secret.key` 到 `backup/`。
+
 ## 8. 构建与镜像
 
 `Dockerfile` 是多阶段，第一段就一个技巧值得记住：**先只拷 `Cargo.toml`/`Cargo.lock`

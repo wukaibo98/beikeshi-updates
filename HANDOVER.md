@@ -214,8 +214,9 @@ NAS（飞牛 OS）
       digest `sha256:8c6ffcfa2c2cc6b4bb079883c1098349ce26b0ca06a8742b57985b640df410e4`，
       清单里有 `linux/amd64` + `linux/arm64` 两套。本机**匿名** `docker pull` 验证通过（3.68MB），
       跑起来 `/health` 200、`--version` 0.1.0；
-- [ ] **同一个包以后要能被 Actions 覆盖**：首次成功 push 之后不要再删包，否则会重演 §2 第 7 条的 403
-      （v0.2.0 推送时会再验证一次，跑绿了就可以勾掉）；
+- [x] ~~镜像构建~~ **改成本机构建**（2026-10-29 用户明确要求）：本地 `docker build` →
+      `docker save` → `ssh cat` 传 NAS → `docker load`。镜像只有 ~5MB，压完 1.7MB，传输几乎瞬间。
+      Actions 降级为备用（要多架构镜像时才用）。步骤见 DEV.md §8.0；
 - [x] ~~NAS 部署~~ 已完成（2026-10-28 15:52），`/health` 200、管理页能登录、能看到历史版本；
 - [x] ~~老库迁移~~ 实测：拿一份只有 `releases` 表的老库启动，四张 form 表自动建好，`releases` 数据原样保留；
 - [ ] NAS 上 `ADMIN_TOKEN` 换成真口令（compose 里现在是部署时填的那个，改完要重启容器）；
