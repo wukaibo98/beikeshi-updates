@@ -105,7 +105,7 @@ target/release/bks-updates --version                               # bks-updates
 
 ### 2.1 推送这本仓库要注意网络
 
-这台机器上 **`github.com`（git 用的 443）经常连不上，而 `api.github.com` 一直通**。
+这台机器上 **`github.com`（git 用的 443)经常连不上，而 `api.github.com` 一直通**。
 表现是 `git push` 卡 75 秒后报 `Failed to connect to github.com port 443`。两条路：
 
 ```bash
@@ -123,9 +123,36 @@ GH_TOKEN=ghp_xxx python3 ~/AI/WorkBuddy/tools/gh_push.py . <owner>/<repo> "提�
 git fetch origin main && git reset --hard origin/main
 ```
 
-> 当前状态（2026-10-28 13:56）：网络恢复后已 `git fetch && git reset --hard origin/main`，
-> **本地与远端一致**（`eabbe62`）。以后正常 `git push` 就行；再遇到 443 不通就还走 `gh_push.py`，
-> 等通了按上面两行收一次。
+> 当前状态（2026-10-29 11:50）：**github.com 和 api.github.com 都通**（直连 0.8s），
+> `git push` 正常。服务端仓库已对齐到远端真实历史（`e700db3` → `f8fa81f`），
+> **本地与远端一致**，以后正常 `git push` 就行。
+> 分叉的收尾办法（比 `reset --hard` 温和，保留本地提交）：
+> `git fetch origin && git branch backup/pre-align-$(date +%Y%m%d) HEAD && git reset --hard origin/main && git cherry-pick <本地独有的提交>`。
+
+### 2.2 没有 gh CLI 时的推法（`GIT_ASKPASS`）
+
+本机没装 `gh`，钥匙串里默认也没有 GitHub 凭据。**macOS 钥匙串用 `security` 存容易匹配不上**
+（`security add-internet-password -P https` 存进去 `ptcl` 字段仍是 0，git 的 osxkeychain helper
+按 protocol=https 查不到，最后报 `could not read Password`）。用 `GIT_ASKPASS` 最省事：
+
+```bash
+export GH_TOKEN='ghp_xxx'
+export GIT_ASKPASS=~/AI/WorkBuddy/tools/gh_askpass.sh   # 脚本里只有账号，令牌走环境变量
+export GIT_TERMINAL_PROMPT=0
+git fetch origin && git push origin main
+```
+
+`tools/gh_askpass.sh` 内容（**不含任何令牌**，令牌永远只从 `$GH_TOKEN` 读）：
+
+```sh
+#!/bin/sh
+case "$1" in
+  *Username*|*username*) echo "wukaibo98" ;;
+  *) printf '%s\n' "$GH_TOKEN" ;;
+esac
+```
+
+令牌撤销后本机就没有可用凭据了，重新推要再配一次。
 
 ---
 
