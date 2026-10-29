@@ -303,6 +303,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/forms/template/save", post(forms::template_save_web))
         .route("/admin/forms/submission/save", post(forms::submission_save))
         .route(
+            "/admin/forms/submission/grid-save",
+            post(forms::grid_save),
+        )
+        .route(
             "/admin/forms/submission/{id}/edit",
             get(forms::submission_edit),
         )

@@ -117,24 +117,6 @@ pub fn form_template_row(
     )
 }
 
-/// 一条登记记录（在「表单预览」里）。
-///
-/// 内容只给个摘要 —— 完整内容点「预览」看。
-pub fn form_record_row(
-    id: i64,
-    client_time: &str,
-    user_name: &str,
-    summary: &str,
-) -> String {
-    format!(
-        r#"<tr><td>{client_time}</td><td>{user}</td><td>{summary}</td>
-<td><a class="ghost" href="/admin?tab=register&sub=preview&rec={id}" data-id="{id}"
-  data-title="{user} · {client_time}">预览</a></td></tr>"#,
-        user = crate::escape(user_name),
-        summary = summary,
-    )
-}
-
 /// 「表单预览」里点开某条登记后的编辑表单（也用作弹出层的内容）。
 ///
 /// 字段按**提交那一刻的模板快照**渲染 —— 模板后来改了也不影响这一行的列。
@@ -213,6 +195,66 @@ pub struct EditorField {
     pub kind: String,
     pub value: String,
     pub options: Vec<String>,
+}
+
+/// 「表单预览」网格里的一列。
+///
+/// 列的来源是**当前模板的字段定义**（不是每条登记自带的快照）——
+/// 这样同一模板的所有行才对得齐。老登记里多出来的字段会以 `legacy` 列附在后面。
+pub struct GridCol {
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+    pub options: Vec<String>,
+    /// true = 当前模板已经没有这个字段了（只读，改回去会跟别的行对不上）
+    pub legacy: bool,
+}
+
+/// 网格的一个单元格。
+///
+/// **故意渲染成纯文本而不是 input**：没 JS 时它就是只读的文本，编辑入口走
+/// 行尾那个「改」链接（整页打开登记编辑表单）；有 JS 时 `bindGrid()` 会把
+/// 这些 `<td>` 换成真正的控件。一份 HTML 两种用法，跟模板编辑器同一个套路。
+pub fn grid_cell(col: &GridCol, value: &str, editable: bool) -> String {
+    if !editable {
+        return format!(r#"<td class="gc ro">{}</td>"#, crate::escape(value));
+    }
+    format!(
+        r#"<td class="gc" data-key="{key}" data-kind="{kind}" data-opts="{opts}">{value}</td>"#,
+        key = crate::escape(&col.key),
+        kind = crate::escape(&col.kind),
+        opts = crate::escape(&col.options.join("\u{0001}")),
+        value = crate::escape(value),
+    )
+}
+
+/// 网格的表头：三列只读元数据 + 模板字段 + 状态 + 「改」。
+pub fn grid_head(cols: &[GridCol]) -> String {
+    let mut s = String::from(
+        r#"<tr><th class="gnum"></th><th>提交人</th><th>填写时间</th>"#,
+    );
+    for c in cols {
+        let tag = if c.legacy {
+            r#" <span class="tag off">旧</span>"#
+        } else {
+            ""
+        };
+        s.push_str(&format!(
+            "<th>{}{}</th>",
+            crate::escape(&c.label),
+            tag
+        ));
+    }
+    s.push_str(r#"<th class="gst">状态</th><th class="gact">改</th></tr>"#);
+    s
+}
+
+/// 网格里"这条还没有记录"的那一行。
+pub fn grid_empty_row(cols: usize) -> String {
+    format!(
+        r#"<tr><td colspan="{n}" class="muted" style="padding:16px 10px">这个筛选下还没有记录</td></tr>"#,
+        n = cols + 5
+    )
 }
 
 pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
@@ -518,6 +560,28 @@ code{background:#F1F5E9;padding:1px 5px;border-radius:4px;font-size:12px}
 .tplrow td .ghost{height:24px;padding:0 7px;margin-left:3px}
 .tpl-del{font-size:12px;color:#A32D2D;white-space:nowrap}
 .tpl-del input{width:auto}
+
+/* 表单预览的网格（改登记数据，不是改字段）*/
+.gridwrap{overflow-x:auto;border:1px solid #EFF3E7;border-radius:10px}
+table.grid{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
+table.grid th{font-weight:400;color:#66705C;font-size:12px;text-align:left;
+  padding:6px 8px;border-bottom:1px solid #EFF3E7;background:#FAFCF6;white-space:nowrap}
+table.grid td{padding:0;border-bottom:1px solid #EFF3E7;vertical-align:middle}
+table.grid tr:last-child td{border-bottom:0}
+.gnum{width:36px;text-align:center;color:#98A08F;background:#F8FAF3;padding:7px 4px!important}
+.gst{width:72px;font-size:12px;color:#3E6B1B;padding:7px 8px!important;white-space:nowrap}
+.gact{width:44px;padding:7px 6px!important;text-align:center}
+td.ro{background:#F8FAF3;color:#5F5E5A;padding:7px 8px!important}
+.gc{padding:0 4px}
+.gc input,.gc select{width:100%;border:1px solid transparent;background:transparent;
+  border-radius:6px;padding:6px 7px;font:inherit;font-size:13px;color:#232B1C;outline:none}
+.gc input:hover,.gc select:hover{border-color:#D8E0CC;background:#fff}
+.gc input:focus,.gc select:focus{border-color:#3E6B1B;background:#F6F9F0}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#EF9F27;margin-right:4px}
+.dot[hidden]{display:none}
+.gridfoot{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+.gsave{background:#EAF3DE;color:#27500A;border-radius:10px;padding:5px 12px;font-size:12px}
+.gerr{background:#FCEBEB;color:#791F1F;border-radius:10px;padding:5px 12px;font-size:12px}
 "##;
 
 pub const PAGE: &str = r##"<!DOCTYPE html>
@@ -797,6 +861,119 @@ pub const PAGE: &str = r##"<!DOCTYPE html>
         .catch(function () { location.href = href; });
     });
   }
+  /* ---- 表单预览的网格（改登记数据）----
+     有 JS：把文本单元格换成 input/select/date，改完失焦自动存。
+     没 JS：这些格子就是纯文本，编辑入口是行尾那个「改」链接
+     （整页打开登记编辑表单，服务端照样能存）。 */
+  function gridMarkDirty(tr, on) {
+    var dot = tr.querySelector(".dot");
+    var st = tr.querySelector(".gst");
+    if (dot) { dot.hidden = !on; }
+    if (st && on) { st.textContent = "● 未存"; st.style.color = "#BA7517"; }
+  }
+
+  function gridMakeEditable(td, card) {
+    var kind = td.getAttribute("data-kind") || "text";
+    var opts = (td.getAttribute("data-opts") || "").split("\u0001");
+    var val = td.textContent || "";
+    td.textContent = "";
+    var el;
+    if (kind === "select") {
+      el = document.createElement("select");
+      if (!val) {
+        var blank = document.createElement("option");
+        blank.value = ""; blank.textContent = "—"; blank.selected = true;
+        el.appendChild(blank);
+      }
+      var has = false;
+      for (var o = 0; o < opts.length; o++) {
+        if (opts[o] === "") { continue; }
+        var op = document.createElement("option");
+        op.value = opts[o]; op.textContent = opts[o];
+        if (opts[o] === val) { op.selected = true; has = true; }
+        el.appendChild(op);
+      }
+      if (val && !has) {
+        var extra = document.createElement("option");
+        extra.value = val; extra.textContent = val; extra.selected = true;
+        el.appendChild(extra);
+      }
+    } else {
+      el = document.createElement("input");
+      if (kind === "date") { el.type = "date"; }
+      else if (kind === "number") { el.type = "number"; el.step = "any"; el.inputMode = "decimal"; }
+      else { el.type = "text"; }
+      el.value = val;
+    }
+    el.className = "ginput";
+    el.setAttribute("data-key", td.getAttribute("data-key"));
+    el.setAttribute("data-orig", val);
+    td.appendChild(el);
+    el.addEventListener("change", function () {
+      var tr = td.parentNode;
+      if (this.value === this.getAttribute("data-orig")) { gridMarkDirty(tr, false); return; }
+      gridMarkDirty(tr, true);
+      gridSaveRow(tr, card);
+    });
+  }
+
+  function gridRowData(tr) {
+    var inputs = tr.querySelectorAll(".ginput");
+    var d = {};
+    for (var i = 0; i < inputs.length; i++) {
+      d[inputs[i].getAttribute("data-key")] = inputs[i].value;
+    }
+    return d;
+  }
+
+  function gridSaveRow(tr, card) {
+    var id = tr.getAttribute("data-sub");
+    if (!id || !window.fetch) { return; }
+    var saved = card.querySelector('[data-role="saved"]');
+    var err = card.querySelector('[data-role="err"]');
+    if (err) { err.hidden = true; }
+    if (saved) { saved.hidden = false; saved.textContent = "正在保存…"; }
+    fetch("/admin/forms/submission/grid-save", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: parseInt(id, 10), data: gridRowData(tr) })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var st = tr.querySelector(".gst");
+        if (j && j.ok) {
+          gridMarkDirty(tr, false);
+          var inputs = tr.querySelectorAll(".ginput");
+          for (var i = 0; i < inputs.length; i++) {
+            inputs[i].setAttribute("data-orig", inputs[i].value);
+          }
+          if (st) { st.textContent = "✓ " + (j.at || ""); st.style.color = "#3E6B1B"; }
+          if (saved) { saved.textContent = "✓ 已保存 " + (j.at || ""); }
+          window.setTimeout(function () { if (saved) { saved.hidden = true; } }, 4000);
+        } else {
+          if (st) { st.textContent = "● 没存上"; st.style.color = "#A32D2D"; }
+          if (err) { err.hidden = false; err.textContent = (j && j.msg) || "保存失败"; }
+        }
+      })
+      .catch(function () {
+        var st2 = tr.querySelector(".gst");
+        if (st2) { st2.textContent = "● 没存上"; st2.style.color = "#A32D2D"; }
+        if (err) { err.hidden = false; err.textContent = "网络不通，这一行还没存上"; }
+      });
+  }
+
+  function bindGrid() {
+    var cards = document.querySelectorAll(".gridcard");
+    for (var c = 0; c < cards.length; c++) {
+      var cells = cards[c].querySelectorAll("td.gc[data-key]");
+      for (var i = 0; i < cells.length; i++) {
+        gridMakeEditable(cells[i], cards[c]);
+      }
+    }
+  }
+
+  bindGrid();
 })();
 </script>
 </body></html>"##;

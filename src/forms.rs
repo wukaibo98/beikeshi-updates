@@ -716,6 +716,51 @@ fn export_url(q: &AdminQuery, template: Option<i64>) -> String {
 }
 
 /// 一条登记的摘要：取前几个字段拼成"标签：值"，太长截断。
+/// 「表单预览」网格的列。
+///
+/// 列从**当前模板的字段定义**来（不是每条登记自带的快照）—— 这样同一模板的
+/// 所有行才对得齐，改起来也像在改一张表。老登记里多出来、当前模板已经没有的
+/// 字段，按出现次数附在后面并标「旧」：**只读**，改回去会跟别的行对不上。
+pub fn grid_columns(
+    cur: Option<&Schema>,
+    parsed: &[(Option<Schema>, Map<String, Value>)],
+) -> Vec<html::GridCol> {
+    let mut cols: Vec<html::GridCol> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(s) = cur {
+        for f in &s.fields {
+            seen.insert(f.key.clone());
+            cols.push(html::GridCol {
+                key: f.key.clone(),
+                label: f.label.clone(),
+                kind: f.kind.clone(),
+                options: f.options.clone().unwrap_or_default(),
+                legacy: false,
+            });
+        }
+    }
+    let mut extra: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, data) in parsed {
+        for k in data.keys() {
+            if !seen.contains(k) {
+                *extra.entry(k.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut extra: Vec<(String, usize)> = extra.into_iter().collect();
+    extra.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (k, _) in extra {
+        cols.push(html::GridCol {
+            key: k.clone(),
+            label: k,
+            kind: "text".to_string(),
+            options: Vec::new(),
+            legacy: true,
+        });
+    }
+    cols
+}
+
 fn record_summary(schema: Option<&Schema>, data: &Map<String, Value>) -> String {
     let mut parts: Vec<String> = Vec::new();
     match schema {
@@ -793,11 +838,14 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                 })
         };
 
-        /* ---- 表单预览：每个模板一张表 + 三个按钮 ----
+        /* ---- 表单预览：每个模板一张**网格** + 三个按钮 ----
            编辑（改表格结构）/ 上传记录（新窗口）/ 导出（xlsx）。
            列出**所有**没删掉的模板 —— 一条都没填过的也能编辑、导出；
            另外，已经删掉但当前筛选下还有登记的，也要列出来（不然那些记录
-           在页面上就再也找不到了）。 */
+           在页面上就再也找不到了）。
+
+           网格改的是**登记数据**（列 = 当前模板的字段），不是字段定义。
+           记录列表搬到「上传记录」里去了，这里只留可编辑的网格。 */
         let templates = db::form_templates(&conn, true).unwrap_or_default();
         let shown: Vec<&db::FormTemplate> = match q.template {
             Some(tid) => templates.iter().filter(|t| t.id == tid).collect(),
@@ -818,29 +866,67 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
         let preview_groups: String = group_list
             .iter()
             .map(|(tid, tpl_name, deleted)| {
-                let list: Vec<&db::FormSubmission> =
+                let subs: Vec<&db::FormSubmission> =
                     rows.iter().filter(|r| r.template_id == *tid).collect();
-                let body: String = list
+                // 每条登记的快照与数据（老登记的列可能跟现在的模板不一样）
+                let parsed: Vec<(Option<Schema>, Map<String, Value>)> = subs
                     .iter()
                     .map(|r| {
-                        let schema: Option<Schema> =
-                            serde_json::from_str(&r.template_snapshot).ok();
-                        let data: Map<String, Value> =
-                            serde_json::from_str::<Value>(&r.data_json)
-                                .ok()
-                                .and_then(|v| v.as_object().cloned())
-                                .unwrap_or_default();
-                        html::form_record_row(
-                            r.id,
-                            &crate::admin::short_time(r.client_time, state.cfg.tz_offset_min),
-                            &r.user_name,
-                            &crate::escape(&record_summary(schema.as_ref(), &data)),
+                        let sc: Option<Schema> = serde_json::from_str(&r.template_snapshot).ok();
+                        let d: Map<String, Value> = serde_json::from_str::<Value>(&r.data_json)
+                            .ok()
+                            .and_then(|v| v.as_object().cloned())
+                            .unwrap_or_default();
+                        (sc, d)
+                    })
+                    .collect();
+                // 列从**当前模板**的字段定义来，这样同模板所有行才对得齐；
+                // 模板已经删了，就退回调组内第一条登记的快照。
+                let cur: Option<Schema> = if *deleted {
+                    parsed.first().and_then(|(s, _)| s.clone())
+                } else {
+                    templates_all
+                        .iter()
+                        .find(|t| t.id == *tid && t.deleted_at == 0)
+                        .and_then(|t| serde_json::from_str(&t.schema_json).ok())
+                };
+                let cols = grid_columns(cur.as_ref(), &parsed);
+                let body: String = subs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let (_, data) = &parsed[i];
+                        let cells: String = cols
+                            .iter()
+                            .map(|c| {
+                                let v = data.get(&c.key).map(value_text).unwrap_or_default();
+                                html::grid_cell(c, &v, !c.legacy)
+                            })
+                            .collect();
+                        let time = crate::admin::short_time(
+                            r.client_time,
+                            state.cfg.tz_offset_min,
+                        );
+                        format!(
+                            r#"<tr data-sub="{id}">
+  <td class="gnum"><span class="dot" hidden></span>{n}</td>
+  <td class="ro">{user}</td><td class="ro">{time}</td>
+  {cells}
+  <td class="gst">已存</td>
+  <td class="gact"><a class="ghost rec-open" href="/admin?tab=register&amp;sub=preview&amp;rec={id}"
+    data-id="{id}" data-title="{user} · {time}">改</a></td>
+</tr>"#,
+                            id = r.id,
+                            n = i + 1,
+                            user = crate::escape(&r.user_name),
+                            time = time,
+                            cells = cells,
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("");
                 let body = if body.is_empty() {
-                    r#"<tr><td colspan="4" class="muted">这个筛选下还没有记录</td></tr>"#.to_string()
+                    html::grid_empty_row(cols.len())
                 } else {
                     body
                 };
@@ -859,24 +945,34 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                 } else {
                     ""
                 };
+                let hint = if subs.len() >= 200 {
+                    r#"<span class="muted" style="margin-left:8px">仅显示最近 200 条</span>"#
+                } else {
+                    ""
+                };
                 format!(
-                    r#"<div class="card">
-  <h2>{name}{tag}<span class="muted">{n} 条</span>
+                    r#"<div class="card gridcard">
+  <h2>{name}{tag}<span class="muted">{n} 条</span>{hint}
     <span class="row" style="float:right">
       {edit_btn}
       <a class="ghost" href="/admin/forms/template/{tid}/records" target="_blank" rel="noopener">上传记录</a>
       <a class="ghost" href="/admin/forms/export.xlsx?template={tid}" title="导出这个模板的全部登记">导出</a>
     </span></h2>
-  <table>
-    <tr><th>填写时间</th><th>提交人</th><th>内容</th><th>操作</th></tr>
-    {body}
-  </table>
+  <div class="gridwrap"><table class="grid">{head}{body}</table></div>
+  <div class="gridfoot">
+    <span class="gsave" data-role="saved" hidden></span>
+    <span class="gerr" data-role="err" hidden></span>
+    <span class="muted" style="margin-left:auto">改完一个格子就自动存；灰底格子只读</span>
+  </div>
 </div>"#,
                     name = crate::escape(tpl_name),
                     tag = tag,
-                    n = list.len(),
+                    n = subs.len(),
+                    hint = hint,
                     tid = tid,
                     edit_btn = edit_btn,
+                    head = html::grid_head(&cols),
+                    body = body,
                 )
             })
             .collect::<Vec<_>>()
@@ -1033,7 +1129,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
 
     let preview = format!(
         r##"<div class="card">
-    <h2>表单预览<span class="muted">共 {total} 条；每个模板右上有【编辑】【上传记录】【导出】三个按钮</span></h2>
+    <h2>表单预览<span class="muted">共 {total} 条 · 格子可以直接改，改完自动存；记录列表在【上传记录】里看</span></h2>
     <form method="get" action="/admin" class="row" style="margin-bottom:12px">
       <input type="hidden" name="tab" value="register">
       <input type="hidden" name="sub" value="preview">
@@ -1764,23 +1860,82 @@ pub async fn submission_save(
         return redirect_err("register", "preview", "请先登录");
     }
 
+    // `f_<key>` 还原成字段 key（网格那个 JSON 接口直接收 key，不走这层）
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in &form.fields {
+        if let Some(key) = k.strip_prefix("f_") {
+            values.insert(key.to_string(), v.clone());
+        }
+    }
+
     let conn = state.conn.lock().unwrap();
-    let Some(sub) = db::form_submission_by_id(&conn, form.id).ok().flatten() else {
-        return redirect_err("register", "preview", "没有这条登记");
+    match apply_submission_edit(&conn, form.id, &values) {
+        Ok(()) => redirect_ok("register", "preview", "已保存"),
+        Err(msg) => redirect_err("register", "preview", &format!("没存上：{msg}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GridSaveReq {
+    id: i64,
+    /// key 就是字段 key（不是 `f_key`）。没提到的字段保持原样不动。
+    #[serde(default)]
+    data: BTreeMap<String, String>,
+}
+
+/// 网格里改完一个格子就自动存（fetch JSON，不整页跳）。
+/// 校验规则和写入路径跟弹层那个 POST **完全一样**，只是换了种收发方式。
+pub async fn grid_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<GridSaveReq>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return (StatusCode::FORBIDDEN, "请先登录").into_response();
+    }
+    let conn = state.conn.lock().unwrap();
+    match apply_submission_edit(&conn, req.id, &req.data) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "at": crate::admin::short_time(db::now(), state.cfg.tz_offset_min),
+        }))
+        .into_response(),
+        Err(msg) => Json(json!({ "ok": false, "msg": msg })).into_response(),
+    }
+}
+
+/// 改一条登记 —— 弹层 POST 和网格 JSON **共用**这一个函数。
+///
+/// 几条规矩：
+/// - 只改 `data_json`，**快照不动**（改了列就跟同模板其他行对不上了）；
+/// - 按**提交那一刻的快照**校验，校验不过就什么都不改；
+/// - 以库里现有内容为底，只覆盖传进来的字段 —— 没提到的键（比如老版本
+///   遗留的字段）原样保留，不会被清空。
+pub(crate) fn apply_submission_edit(
+    conn: &rusqlite::Connection,
+    id: i64,
+    values: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let Some(sub) = db::form_submission_by_id(conn, id).ok().flatten() else {
+        return Err("没有这条登记".to_string());
     };
 
-    // 按**提交那一刻的快照**校验：改完还得是一份合法的登记
     let schema: Schema = match serde_json::from_str(&sub.template_snapshot) {
         Ok(s) => s,
-        Err(_) => return redirect_err("register", "preview", "这条登记的字段定义坏了，改不了"),
+        Err(_) => return Err("这条登记的字段定义坏了，改不了".to_string()),
     };
 
-    let mut data = Map::new();
+    let mut data: Map<String, Value> = serde_json::from_str::<Value>(&sub.data_json)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
     for f in &schema.fields {
-        let raw = form.fields.get(&format!("f_{}", f.key));
-        if let Some(v) = raw {
+        if let Some(v) = values.get(&f.key) {
             let v = v.trim();
-            if !v.is_empty() {
+            if v.is_empty() {
+                // 清空 = 删掉这个键，跟客服在客户端填表时的语义一致
+                data.remove(&f.key);
+            } else {
                 data.insert(f.key.clone(), Value::String(v.to_string()));
             }
         }
@@ -1802,15 +1957,12 @@ pub async fn submission_save(
             .map(|(k, v)| format!("{v}（{}）", label_of(k)))
             .collect::<Vec<_>>()
             .join("；");
-        return redirect_err("register", "preview", &format!("没存上：{msg}"));
+        return Err(msg);
     }
 
     let data_json = Value::Object(data).to_string();
-    match db::form_submission_update(&conn, form.id, &data_json) {
-        Ok(true) => redirect_ok("register", "preview", "已保存"),
-        Ok(false) => redirect_err("register", "preview", "没有这条登记"),
-        Err(e) => redirect_err("register", "preview", &format!("保存失败：{e}")),
-    }
+    db::form_submission_update(conn, id, &data_json).map_err(|e| format!("保存失败：{e}"))?;
+    Ok(())
 }
 
 /* ------------------------------------------------- 管理端人员与口令 */

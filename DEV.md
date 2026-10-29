@@ -60,13 +60,17 @@ forms.rs  ── schema 校验、姓名登录、模板存取（乐观锁）、�
           ├─ POST /admin/forms/template/purge        模板永久删除（v0.5）
           ├─ GET  /admin/forms/submission/{id}/edit   登记编辑片段（弹层用）
           ├─ POST /admin/forms/submission/save        登记保存（只改 data_json）
+          ├─ POST /admin/forms/submission/grid-save   网格失焦即存（v0.6，JSON）
           └─ POST /admin/admins/{save,toggle,token,delete} 管理端人员与口令
 xlsx.rs   ── rust_xlsxwriter：列并集 → 数字列 → sheet 名清洗
 html.rs   ── 登录页 / 分发页 / 表单页模板（`%%占位%%`）；v0.4 加两级标签结构；
           v0.5 加 CSS 抽出（pub const CSS）、模板编辑器模板（template_editor）、
-          已删除模板行（deleted_template_row）、上传记录独立页（RECORDS_PAGE）
-tests.rs  ── `cargo test`：幂等、快照冻结、乐观锁、白名单、导出列
+          已删除模板行（deleted_template_row）、上传记录独立页（RECORDS_PAGE）；
+          v0.6 加网格列模型（GridCol）、单元格/表头/空行（grid_cell / grid_head /
+          grid_empty_row）、网格的 JS 增强（bindGrid，见 PAGE 尾部）
+tests.rs  ── `cargo test`：幂等、快照冻结、乐观锁、白名单、导出列、网格改登记
 tools/shot-admin.js ── 无头 Chrome 截管理页（CDP 注入自签 Cookie，见 §9.3）
+tools/grid-cdp-test.js ── 网格交互实测（12 项，见 §9.4）
 ```
 
 数据流很短，没有 service 层也没有 repository 抽象 —— 这个规模不需要：
@@ -628,6 +632,72 @@ docker run --rm --entrypoint sh -v /volume1/@appstore/com.ugreen.office:/o:ro ug
 ⚠️ Docker Hub 在这台机器上被拦，跑不了 `alpine` / `curlimages`，只能用**本地已有**的镜像。
 
 
+### 4.19 表单预览的网格（v0.6，改登记数据）
+
+「表单预览」从**记录列表**改成**网格**：一行 = 一条登记，一列 = 模板的一个字段，
+单元格可以直接改。**改的是登记数据（`data_json`），不是字段定义。**
+
+#### 列是怎么来的
+
+列 = **当前模板的字段定义**（`form_template_versions.schema_json`），不是每条登记自带的
+快照 —— 这样同一模板的所有行才对得齐。模板已经删了（软删/永久删）就退回调组内
+第一条登记的快照。
+
+老登记里多出来、当前模板已经没有的字段，按出现次数附在最后并标「**旧**」：
+那一列**只读**（`grid_cell(..., editable=false)`）。为什么不给改：当前模板已经没有
+这个字段了，改回去就跟别的行对不上；但数据一个字节都不丢，导出和上传记录里都看得到。
+
+```rust
+pub fn grid_columns(cur: Option<&Schema>, parsed: &[(Option<Schema>, Map<String, Value>)]) -> Vec<html::GridCol>
+```
+
+#### 有 JS / 无 JS 双路径（跟模板编辑器同一个套路）
+
+服务端**只渲染一份 HTML**：单元格是带 `data-key` / `data-kind` / `data-opts` 的 `<td>`，
+内容是纯文本。
+
+- **没 JS**：就是纯文本 + 行尾「改」链接 → 整页跳 `?rec={id}` → 服务端渲染登记编辑表单
+  （老机制，`/admin/forms/submission/save`）。
+- **有 JS**：`bindGrid()` 把每个 `<td>` 换成 `input` / `select` / `input[type=date]` /
+  `input[type=number]`，绑 `change`（= 失焦且值变了）→ `gridSaveRow()` → fetch JSON。
+
+控件按 `data-kind` 选：`select` → `<select>`（选项来自 `data-opts`，用 `\u0001` 分隔，
+避免选项值里带 `|` 被切错）、`date` → date、`number` → number，其余 → text。
+
+`data-opts` 用 `\u0001` 而不是 `|`：选项值是用户填的，带竖杠不稀奇，被切错就静默丢选项。
+
+#### 保存
+
+```
+POST /admin/forms/submission/grid-save   {"id":1,"data":{"field_3":"64545"}}
+→ {"ok":true,"at":"10-29 15:15"}  或  {"ok":false,"msg":"必填（客户需求）"}
+```
+
+`data` 的 key 就是**字段 key**（不是 `f_key`）。没提到的字段**原样保留** ——
+网格一次只交一行，不能把没提到的键清掉（尤其老版本遗留的字段）。
+
+弹层那个 `POST /admin/forms/submission/save` 和它**共用** `apply_submission_edit()`：
+
+```rust
+pub(crate) fn apply_submission_edit(conn, id, values: &BTreeMap<String,String>) -> Result<(), String>
+```
+
+三条规矩（也是测试重点）：
+1. 只改 `data_json`，**快照一个字节都不动**；
+2. 按**提交那一刻的快照**校验，校验不过就什么都不改（报错带字段中文名）；
+3. 以库里现有内容为底，只覆盖传进来的字段。
+
+前端状态：行首橙点（`.dot`）= 还没存上；状态列 `✓ HH:MM` = 存好了；
+卡片底部一条 `gsave` / `gerr` 提示（4 秒后自动消失）。**值没变不发请求**
+（拿 `data-orig` 对比），免得白刷保存时间。
+
+#### 几个明确不做的事
+
+- **没有"新增一行"** —— 填新登记是客户端填表的职责，网页端只改已经填过的。
+- **前三列只读**（`#` / 提交人 / 填写时间）—— 元数据不该手改。
+- **网格最多 200 条**（跟上传记录的 `RECORDS_WINDOW` 对齐），超了在卡片标题旁提示。
+
+
 ## 5. 管理页模板
 
 `html.rs` 里两个 `&'static str`（`LOGIN` / `ADMIN`），用 `%%KEY%%` 占位：
@@ -848,7 +918,7 @@ v0.3.0 标签页改版后又跑了一遍：五个 `?tab=` 各只有一段可见�
 ### 9.2 单元测试
 
 ```bash
-~/.cargo/bin/cargo test --release     # 28 项
+~/.cargo/bin/cargo test --release     # 32 项
 ```
 
 测的都是"错了也不报错"的地方：重复提交只落一条、模板升版后旧快照仍在、
@@ -866,6 +936,15 @@ v0.5 新增 6 项：
 | `永久删除后模板行没了但登记和名字都还在` | 模板行真删，登记一条不少，名字认得出 |
 | `没删过的模板不能永久删除` | 返回 `NotDeleted`（闸门有效） |
 | `永久删除会清掉字段定义的历史版本` | `form_template_versions` 里该模板的行被清掉 |
+
+v0.6 新增 4 项（都在测 `apply_submission_edit`，网格和弹层共用它）：
+
+| 测试 | 测什么 |
+|---|---|
+| `网格的列_当前模板字段在前_旧字段附在后面并标旧` | 列按「当前模板字段 + 旧字段」排，旧字段带 `legacy`，下拉列带选项 |
+| `网格改登记_只改传进来的字段_没提到的和旧字段都原样保留` | 只覆盖传进来的；没提到的键、老字段都不被清空；快照不动 |
+| `网格改登记_清空必填会被拒_而且库里的东西一点没改` | 校验不过就 `Err`，报错带中文名，库里原样 |
+| `网格改登记_改一条不影响同模板的其它行` | 改 id=1 不动 id=2 |
 
 **改 `forms.rs` / `db.rs` / `xlsx.rs` 之后必须跑**，这些是静默错误，界面上看不出来。
 
@@ -899,6 +978,30 @@ node tools/shot-admin.js http://127.0.0.1:18080/admin/forms/template/1/records /
 点击是用 `Runtime.evaluate` 执行 `document.querySelector(sel).click()`，
 找不到元素会返回 `NOT_FOUND` —— **参数写错时不会报错，只会截到没弹层的页面**，
 所以截图后要肉眼看一眼弹层在不在。点击后等 1.8 秒再截（等 fetch 回来填弹层）。
+
+⚠️ **`baseUrl` 要带到 `/admin`**：只写 `http://127.0.0.1:18080` 会命中 `/` 的 307 重定向，
+截出来是「概览」标签，看不出问题在哪（v0.6 踩过）。
+
+### 9.4 网格交互的 CDP 实测（v0.6 起）
+
+截图只能证明"页面长这样"，证明不了"改了真的存进去了"。用 `tools/grid-cdp-test.js`：
+
+```bash
+# 本地起服务 + 造几条登记后：
+node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
+```
+
+它做 12 项检查：控件是否按字段类型建出来（text/date/select/number 各自的数量）、
+下拉选中值是不是当前值、有没有残留没换掉的文本格、改值后**立刻**亮未存标记、
+保存成功后标记消失且状态列显示时间、底部出现已保存提示、
+**值没变不重复保存**、清空必填被拒且提示带中文名、下拉改动能存上、
+「改」链接打开弹层。退出码非 0 就是有 FAIL。
+
+写这个脚本时踩到的两个自己的坑：
+- **别把测试值写死**。上一轮跑完会把测试值留在库里，下一轮 `data-orig` 正好等于它，
+  `change` 就被"值没变"的分支吃掉，看起来像功能坏了。先读 `data-orig` 再生成不同的值。
+- **`dispatchEvent(new Event('change'))` 才能模拟失焦保存**。直接 `el.value = x` 不派发任何事件。
+
 
 ## 10. 踩过的坑（改这里前必读）
 
@@ -938,6 +1041,12 @@ node tools/shot-admin.js http://127.0.0.1:18080/admin/forms/template/1/records /
 | GitHub API 归一化提交日期 | API 存的是 UTC。git author 行里**时间戳是绝对纪元秒**，`+0800` 只是显示标签 —— 归一化是**只改标签不动时间戳**，减 8 小时会变成另一个时刻 |
 | GitHub API 不补 message 尾换行 | 本地 `git commit` 总带尾 `\n`，API 不会补。要 SHA 完全一致只能用 `git hash-object -t commit -w --stdin` 精确写字节，`git commit --amend` 做不到 |
 | `git diff-tree -z` 的输出格式 | `-z` 模式下是 `"<header>\0<path>\0"` **成对交替**，不是 tab 分隔。按 tab 切会切错行 |
+| 网格的 `data-opts` 用 `\|` 分隔 | 选项值是用户填的，带竖杠不稀奇，被切错就静默丢选项。改用 `\u0001` |
+| 网格测试把值写死 | 上一轮跑完测试值留在库里，下一轮 `data-orig` 正好等于它 → `change` 被"值没变"分支吃掉，看着像功能坏了。先读原值再生成不同的值 |
+| 截图 `baseUrl` 只写到端口 | 命中 `/` 的 307 → 截到「概览」标签。要写到 `/admin` |
+| `docker build` 报 `DeadlineExceeded` | 国内直连 Docker Hub 超时。换源：`docker build --build-arg RUST_IMAGE=docker.m.daocloud.io/library/rust:1-alpine .` |
+| 备份只拷 `updates.db` | 停容器后 db 只有 4096 字节，真实数据在 `-wal` 里。必须四个文件一起：`updates.db` + `-wal` + `-shm` + `secret.key` |
+| `docker cp` 到不存在的容器 | `docker cp <容器>:<路径> <另一个容器>:<路径>` 会静默失败。正确做法：先 `docker cp` 到宿主 `/tmp`，再挪进备份目录（`/tmp` 是 root 写的，SSH 用户能读） |
 
 ## 11. 与客户端的关系
 

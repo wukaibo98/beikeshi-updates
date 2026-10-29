@@ -649,3 +649,134 @@ fn 永久删除会清掉字段定义的历史版本() {
         .unwrap();
     assert_eq!(n, 0, "永久删除要把字段定义的历史版本也清掉");
 }
+
+/* --------------------------- v0.6：表单预览的网格（改登记数据，不是改字段） */
+
+use serde_json::{Map, Value};
+
+/// 造一条登记，返回它的行 id
+fn insert_sub(conn: &Connection, snapshot: &str, data_json: &str) -> i64 {
+    db::form_submit_insert(
+        conn,
+        &db::NewSubmission {
+            template_name: "测试模板",
+            submission_id: "sid-grid",
+            template_id: 1,
+            template_version: 1,
+            template_snapshot: snapshot,
+            user_id: 1,
+            user_name: "张三",
+            data_json,
+            client_time: 1_700_000_000,
+            client_id: "pc",
+        },
+    )
+    .unwrap();
+    conn.query_row(
+        "SELECT id FROM form_submissions WHERE submission_id = 'sid-grid'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn 网格的列_当前模板字段在前_旧字段附在后面并标旧() {
+    let cur = parse(&schema(
+        r#"[{"key":"a","label":"甲","type":"text"},{"key":"b","label":"乙","type":"select","options":["x","y"]}]"#,
+    ));
+    // 这条登记是旧版本提交的：多一个 c，少一个 b
+    let data: Map<String, Value> = serde_json::from_str(r#"{"a":"1","c":"3"}"#).unwrap();
+    let cols = crate::forms::grid_columns(Some(&cur), &[(Some(cur.clone()), data)]);
+    assert_eq!(
+        cols.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b", "c"],
+        "列必须是「当前模板字段 + 多出来的旧字段」，不能按登记的列"
+    );
+    assert!(!cols[0].legacy && !cols[1].legacy);
+    assert!(cols[2].legacy, "c 是当前模板没有的字段，得标成旧列（只读）");
+    assert_eq!(
+        cols[1].options,
+        vec!["x".to_string(), "y".to_string()],
+        "下拉列要带上选项，前端才知道渲染成什么控件"
+    );
+}
+
+#[test]
+fn 网格改登记_只改传进来的字段_没提到的和旧字段都原样保留() {
+    let conn = fresh();
+    let snap = schema(r#"[{"key":"a","label":"甲","type":"text"},{"key":"b","label":"乙","type":"text"}]"#);
+    let id = insert_sub(&conn, &snap, r#"{"a":"原值","b":"乙值","old":"旧数据"}"#);
+
+    let mut v = std::collections::BTreeMap::new();
+    v.insert("a".to_string(), " 新值 ".to_string());
+    crate::forms::apply_submission_edit(&conn, id, &v).unwrap();
+
+    let row = db::form_submission_by_id(&conn, id).unwrap().unwrap();
+    let data: Value = serde_json::from_str(&row.data_json).unwrap();
+    assert_eq!(data["a"], "新值", "要存上，而且首尾空格得去掉");
+    assert_eq!(data["b"], "乙值", "没提到的字段不能被清空");
+    assert_eq!(data["old"], "旧数据", "旧字段要原样留着，不然数据就丢了");
+    assert_eq!(
+        row.template_snapshot, snap,
+        "只改 data_json，快照一个字节都不能动"
+    );
+}
+
+#[test]
+fn 网格改登记_清空必填会被拒_而且库里的东西一点没改() {
+    let conn = fresh();
+    let snap = schema(r#"[{"key":"a","label":"甲","type":"text","required":true}]"#);
+    let id = insert_sub(&conn, &snap, r#"{"a":"原值"}"#);
+
+    let mut v = std::collections::BTreeMap::new();
+    v.insert("a".to_string(), "".to_string());
+    let r = crate::forms::apply_submission_edit(&conn, id, &v);
+    assert!(r.is_err(), "必填被清空必须拒掉");
+    assert!(
+        r.unwrap_err().contains("甲"),
+        "报错要带上字段的中文名，不然不知道是哪一栏"
+    );
+
+    let row = db::form_submission_by_id(&conn, id).unwrap().unwrap();
+    let data: Value = serde_json::from_str(&row.data_json).unwrap();
+    assert_eq!(data["a"], "原值", "校验不过就不能改库");
+}
+
+#[test]
+fn 网格改登记_改一条不影响同模板的其它行() {
+    let conn = fresh();
+    let snap = schema(r#"[{"key":"a","label":"甲","type":"text"}]"#);
+    let id1 = insert_sub(&conn, &snap, r#"{"a":"第一行"}"#);
+    // 换个 submission_id 再插一条（同一模板）
+    db::form_submit_insert(
+        &conn,
+        &db::NewSubmission {
+            template_name: "测试模板",
+            submission_id: "sid-grid-2",
+            template_id: 1,
+            template_version: 1,
+            template_snapshot: &snap,
+            user_id: 1,
+            user_name: "李四",
+            data_json: r#"{"a":"第二行"}"#,
+            client_time: 1_700_000_100,
+            client_id: "pc",
+        },
+    )
+    .unwrap();
+
+    let mut v = std::collections::BTreeMap::new();
+    v.insert("a".to_string(), "改过的第一行".to_string());
+    crate::forms::apply_submission_edit(&conn, id1, &v).unwrap();
+
+    let other: String = conn
+        .query_row(
+            "SELECT data_json FROM form_submissions WHERE submission_id = 'sid-grid-2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let data: Value = serde_json::from_str(&other).unwrap();
+    assert_eq!(data["a"], "第二行", "改一行不能把别的行带上");
+}
