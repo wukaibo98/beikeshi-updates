@@ -115,26 +115,36 @@ target/release/bks-updates --version                               # bks-updates
 ### 2.1 推送这本仓库要注意网络
 
 这台机器上 **`github.com`（git 用的 443)经常连不上，而 `api.github.com` 一直通**。
-表现是 `git push` 卡 75 秒后报 `Failed to connect to github.com port 443`。两条路：
+表现是 `git push` 卡 75 秒后报 `Failed to connect to github.com port 443`。三条路：
 
 ```bash
-# 通路时：正常推
+# 路 1（首选）：通路时正常推
 git push
 
-# 不通时：走 REST API 全量快照推送（自动遵守 .gitignore）
+# 路 2（不产生分叉）：github.com 不通时，用 API 精确推已有的本地提交
+GH_TOKEN=ghp_xxx python3 ~/AI/WorkBuddy/tools/gh_push_exact.py . wukaibo98/beikeshi-updates main
+
+# 路 3（会产生分叉，慎用）：走 REST API 全量快照推送（自动遵守 .gitignore）
 GH_TOKEN=ghp_xxx python3 ~/AI/WorkBuddy/tools/gh_push.py . <owner>/<repo> "提交信息"
 ```
 
-`gh_push.py` 会用远端 main 的 HEAD 当父提交，所以**它产生的提交在本地不存在** ——
-一旦用过它，本地和远端历史就分叉了（内容一致，sha 不同）。等网络通的时候收一次：
+**路 2 是新增的，优先用它** —— `gh_push_exact.py` 把本地那个提交的对象原样搬到远端，
+**SHA 与本地完全相同，不会产生历史分叉**（路 3 会：它用远端 HEAD 当父提交，
+造出的提交在本地不存在，内容一致但 sha 不同）。
 
-```bash
-git fetch origin main && git reset --hard origin/main
-```
+`gh_push_exact.py` 靠三件事做到 SHA 一致：
 
-> 当前状态（2026-10-29 12:1x）：**github.com 和 api.github.com 都通**（直连 0.8s），
-> `git push` 正常。服务端仓库已对齐到远端真实历史（`e700db3` → `f8fa81f` → `c2a9a6d`），
-> **本地与远端一致**，以后正常 `git push` 就行。
+| # | 事项 | 坑 |
+|---|---|---|
+| 1 | blob / tree 逐个上传 | blob SHA 由内容决定，两边必然一致 |
+| 2 | 提交日期归一化成 UTC | GitHub 存的是 `+0000`。git 的 author 行里**时间戳是绝对纪元秒**、`+0800` 只是显示标签，所以是**只改标签不动时间戳** |
+| 3 | message 不带尾部换行 | 本地 `git commit` 总带尾换行，GitHub API **不会补**。要用 `git hash-object -t commit -w --stdin` 精确写字节，不能用 `git commit --amend` |
+
+第 3 条是最容易踩的 —— 脚本内部就是靠"本地用 `hash-object` 构造出与远端逐字节相同的
+对象"来对上的，不是靠 `git commit`。
+
+> 当前状态（2026-10-29 12:4x）：**github.com 不通、api.github.com 通**。
+> 服务端仓库 v0.4.0（`e3b5c5a`）已用路 2 推上去，**本地与远端 SHA 相同，无分叉**。
 > 分叉的收尾办法（比 `reset --hard` 温和，保留本地提交）：
 > `git fetch origin && git branch backup/pre-align-$(date +%Y%m%d) HEAD && git reset --hard origin/main && git cherry-pick <本地独有的提交>`。
 
