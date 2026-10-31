@@ -77,28 +77,31 @@ impl Auth {
 
     /* ------------------------------------------------ 表单用 token */
 
-    /// 表单登录后的用户 token：`u<user_id>.<exp>.<sig>`。
+    /// 表单登录后的用户 token：`u<user_id>.<auth_version>.<exp>.<sig>`。
     /// 客户端把它放在 `X-Bks-Form` 请求头里（不用 Cookie：客户端是原生 HTTP，没有浏览器会话）。
     /// 无状态，服务端重启不影响已登录的人。
-    pub fn issue_form_token(&self, user_id: i64, ttl_secs: i64) -> (String, i64) {
+    pub fn issue_form_token(&self, user_id: i64, auth_version: i64, ttl_secs: i64) -> (String, i64) {
         let exp = crate::db::now() + ttl_secs;
-        let payload = format!("u{user_id}.{exp}");
+        let payload = format!("u{user_id}.{auth_version}.{exp}");
         let token = format!("{payload}.{}", self.sign(&payload));
         (token, exp)
     }
 
-    /// 校验通过返回 user_id。
-    pub fn verify_form_token(&self, token: &str) -> Option<i64> {
+    /// 校验通过返回 (user_id, auth_version)。
+    pub fn verify_form_token(&self, token: &str) -> Option<(i64, i64)> {
         let (payload, sig) = token.rsplit_once('.')?;
         if !constant_time_eq(sig.as_bytes(), self.sign(payload).as_bytes()) {
             return None;
         }
         let rest = payload.strip_prefix('u')?;
-        let (id, exp) = rest.split_once('.')?;
+        let mut fields = rest.splitn(3, '.');
+        let id = fields.next()?;
+        let version = fields.next()?.parse::<i64>().ok()?;
+        let exp = fields.next()?;
         if exp.parse::<i64>().ok()? < crate::db::now() {
             return None;
         }
-        id.parse().ok()
+        Some((id.parse().ok()?, version))
     }
 
     /// 编辑模板用的 token（管理员输一次口令换来的）：`e.<exp>.<sig>`。

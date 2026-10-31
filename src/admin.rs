@@ -101,15 +101,23 @@ pub async fn page(
     let tz = state.cfg.tz_offset_min;
 
     let (overview, versions, counts, subtitle) = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
 
-        /* ---- 概览：谁在连服务器 ---- */
+        /* ---- 概览：按账号名单展示真实心跳在线状态；一人多设备列多台 ---- */
         let now = db::now();
-        let acts = db::recent_activity(&conn, now - 7 * 86400, 50);
-        let act_rows = if acts.is_empty() {
-            r#"<tr><td colspan="4" class="muted">还没有客户端连过。客户端启动后会检查更新，那时这里就会出现。</td></tr>"#.to_string()
+        let users = db::form_users(&conn).unwrap_or_default();
+        let sessions = db::online_sessions(&conn);
+        let online_rows = if users.is_empty() {
+            r#"<tr><td colspan="4" class="muted">登录管理中还没有客户端账号。</td></tr>"#.to_string()
         } else {
-            acts.iter().map(|a| html::activity_row(a, now, tz)).collect::<Vec<_>>().join("")
+            users.iter().map(|u| {
+                let devices: Vec<_> = sessions.iter().filter(|s| s.user_id == u.id && now.saturating_sub(s.last_seen) <= 180).collect();
+                let status = if !u.enabled { r#"<span class="tag off">已停用</span>"#.to_string() }
+                    else if devices.is_empty() { r#"<span class="tag off">离线</span>"#.to_string() }
+                    else { format!(r#"<span class="tag">在线 · {} 台设备</span>"#, devices.len()) };
+                let device_info = if devices.is_empty() { "—".to_string() } else { devices.iter().map(|s| format!("{} · {} · {}", crate::escape(&s.client_id), crate::escape(&s.ip), short_time(s.last_seen, tz))).collect::<Vec<_>>().join("<br>") };
+                format!("<tr><td>{}</td><td>{status}</td><td>{device_info}</td></tr>", crate::escape(&u.name))
+            }).collect::<Vec<_>>().join("")
         };
 
         let stats = db::form_stats(&conn);
@@ -148,10 +156,10 @@ pub async fn page(
 
         let overview = format!(
             r##"<div class="card">
-    <h2>谁在连服务器<span class="muted">15 分钟内有动作的标在线；没有心跳，只能记最后一次请求</span></h2>
+    <h2>客户端登录状态<span class="muted">心跳每分钟更新，3 分钟没有心跳算离线；同一账号可显示多台设备</span></h2>
     <table>
-      <tr><th>谁 / 机器</th><th>IP</th><th>最后动作</th><th>时间</th></tr>
-      {act_rows}
+      <tr><th>账号</th><th>状态</th><th>在线设备 · IP · 最近心跳</th></tr>
+      {online_rows}
     </table>
   </div>
   <div class="card">
@@ -172,6 +180,7 @@ pub async fn page(
             lan = crate::escape(&lan),
             public = crate::escape(&public),
             manifest = crate::escape(&manifest),
+            online_rows = online_rows,
         );
 
         /* ---- 版本 ---- */
@@ -305,7 +314,7 @@ pub async fn login(
         admin_id = Some(0);
     } else if !given.is_empty() {
         let hash = crate::forms::token_hash(given);
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         if let Ok(Some(u)) = db::admin_user_by_hash(&conn, &hash) {
             if u.enabled {
                 admin_id = Some(u.id);
@@ -397,7 +406,7 @@ pub async fn upload(
     let package = crate::detect_package(&state.cfg.pkg_dir.join(&filename));
 
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::insert_release(&conn, &version, &filename, size, &sha, &notes, &package)
     };
 
@@ -497,7 +506,7 @@ pub async fn publish(
     }
 
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::publish(&conn, id)
     };
 
@@ -522,7 +531,7 @@ pub async fn delete(
     }
 
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::delete(&conn, id)
     };
 

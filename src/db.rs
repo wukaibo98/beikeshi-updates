@@ -224,6 +224,16 @@ pub struct FormUser {
     pub id: i64,
     pub name: String,
     pub enabled: bool,
+    pub has_password: bool,
+    pub auth_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FormLoginUser {
+    pub id: i64,
+    pub name: String,
+    pub password_hash: String,
+    pub auth_version: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +283,8 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS form_users (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             name       TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL DEFAULT '',
+            auth_version INTEGER NOT NULL DEFAULT 1,
             enabled    INTEGER NOT NULL DEFAULT 1,
             created_at INTEGER NOT NULL
         );
@@ -316,6 +328,13 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
             detail    TEXT NOT NULL DEFAULT '',
             at        INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS form_sessions (
+            user_id INTEGER NOT NULL,
+            client_id TEXT NOT NULL,
+            ip TEXT NOT NULL DEFAULT '',
+            last_seen INTEGER NOT NULL,
+            PRIMARY KEY(user_id, client_id)
+        );
         CREATE INDEX IF NOT EXISTS idx_activity_at ON activity(at);",
     )?;
 
@@ -325,6 +344,9 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE form_templates ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
         // 冗余存一份模板名。模板被「永久删除」之后，提交记录靠这一列还认得出是哪张表。
         "ALTER TABLE form_submissions ADD COLUMN template_name TEXT NOT NULL DEFAULT ''",
+        // Password login for client accounts. Existing allowlist entries need an admin-set password.
+        "ALTER TABLE form_users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE form_users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1",
     ] {
         let _ = conn.execute(sql, []);
     }
@@ -334,54 +356,93 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
 /* ---------------------------------------------------------- 用户 */
 
 pub fn form_users(conn: &Connection) -> rusqlite::Result<Vec<FormUser>> {
-    let mut stmt = conn.prepare("SELECT id, name, enabled FROM form_users ORDER BY id")?;
+    let mut stmt = conn.prepare("SELECT id, name, enabled, password_hash, auth_version FROM form_users ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         Ok(FormUser {
             id: r.get(0)?,
             name: r.get(1)?,
             enabled: r.get::<_, i64>(2)? == 1,
+            has_password: !r.get::<_, String>(3)?.is_empty(),
+            auth_version: r.get(4)?,
         })
     })?;
     rows.collect()
 }
 
 /// 登录用：只看启用的。
+#[cfg(test)]
 pub fn form_user_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<FormUser>> {
     conn.query_row(
-        "SELECT id, name, enabled FROM form_users WHERE name = ? AND enabled = 1",
+        "SELECT id, name, enabled, password_hash, auth_version FROM form_users WHERE name = ? AND enabled = 1",
         params![name],
-        |r| Ok(FormUser { id: r.get(0)?, name: r.get(1)?, enabled: true }),
+        |r| Ok(FormUser {
+            id: r.get(0)?, name: r.get(1)?, enabled: true,
+            has_password: !r.get::<_, String>(3)?.is_empty(), auth_version: r.get(4)?,
+        }),
     )
     .optional()
 }
 
 pub fn form_user_find(conn: &Connection, id: i64) -> rusqlite::Result<Option<FormUser>> {
-    conn.query_row("SELECT id, name, enabled FROM form_users WHERE id = ?", params![id], |r| {
-        Ok(FormUser { id: r.get(0)?, name: r.get(1)?, enabled: r.get::<_, i64>(2)? == 1 })
+    conn.query_row("SELECT id, name, enabled, password_hash, auth_version FROM form_users WHERE id = ?", params![id], |r| {
+        Ok(FormUser {
+            id: r.get(0)?, name: r.get(1)?, enabled: r.get::<_, i64>(2)? == 1,
+            has_password: !r.get::<_, String>(3)?.is_empty(), auth_version: r.get(4)?,
+        })
     })
     .optional()
 }
 
+#[derive(Debug, Clone)]
+pub struct OnlineSession { pub user_id: i64, pub client_id: String, pub ip: String, pub last_seen: i64 }
+
+pub fn touch_form_session(conn: &Connection, user_id: i64, client_id: &str, ip: &str) {
+    let _ = conn.execute("INSERT INTO form_sessions(user_id, client_id, ip, last_seen) VALUES(?, ?, ?, ?) ON CONFLICT(user_id, client_id) DO UPDATE SET ip=excluded.ip, last_seen=excluded.last_seen", params![user_id, client_id, ip, now()]);
+}
+
+pub fn online_sessions(conn: &Connection) -> Vec<OnlineSession> {
+    let mut stmt = match conn.prepare("SELECT user_id, client_id, ip, last_seen FROM form_sessions ORDER BY user_id, client_id") { Ok(s) => s, Err(_) => return Vec::new() };
+    stmt.query_map([], |r| Ok(OnlineSession { user_id:r.get(0)?, client_id:r.get(1)?, ip:r.get(2)?, last_seen:r.get(3)? })).and_then(|rows| rows.collect()).unwrap_or_default()
+}
+
 /// 新增或改名。名字唯一冲突时返回 Err（调用方翻成人话）。
-pub fn form_user_save(conn: &Connection, id: Option<i64>, name: &str) -> rusqlite::Result<i64> {
+pub fn form_user_save(conn: &Connection, id: Option<i64>, name: &str, password_hash: Option<&str>) -> rusqlite::Result<i64> {
     match id {
         Some(id) => {
-            conn.execute("UPDATE form_users SET name = ? WHERE id = ?", params![name, id])?;
+            conn.execute("UPDATE form_users SET name = ?, auth_version = auth_version + 1 WHERE id = ?", params![name, id])?;
             Ok(id)
         }
         None => {
             conn.execute(
-                "INSERT INTO form_users (name, enabled, created_at) VALUES (?, 1, ?)",
-                params![name, now()],
+                "INSERT INTO form_users (name, password_hash, enabled, created_at) VALUES (?, ?, 1, ?)",
+                params![name, password_hash.unwrap_or_default(), now()],
             )?;
             Ok(conn.last_insert_rowid())
         }
     }
 }
 
+pub fn form_user_login_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<FormLoginUser>> {
+    conn.query_row(
+        "SELECT id, name, password_hash, auth_version FROM form_users WHERE name = ? AND enabled = 1",
+        params![name],
+        |r| Ok(FormLoginUser {
+            id: r.get(0)?, name: r.get(1)?, password_hash: r.get(2)?, auth_version: r.get(3)?,
+        }),
+    ).optional()
+}
+
+pub fn form_user_set_password(conn: &Connection, id: i64, password_hash: &str) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE form_users SET password_hash = ?, auth_version = auth_version + 1 WHERE id = ?",
+        params![password_hash, id],
+    )?;
+    Ok(changed == 1)
+}
+
 pub fn form_user_toggle(conn: &Connection, id: i64, enabled: bool) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE form_users SET enabled = ? WHERE id = ?",
+        "UPDATE form_users SET enabled = ?, auth_version = auth_version + 1 WHERE id = ?",
         params![if enabled { 1 } else { 0 }, id],
     )?;
     Ok(())
@@ -948,24 +1009,6 @@ pub fn admin_user_delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 /* ==================================================== 最近活动（概览页用） */
 /// 谁在连服务器。不是"在线状态"——没有心跳，只能记"最后一次请求是什么时候、
 /// 从哪个 IP、干了什么"。概览页据此显示"最近活动"，15 分钟内有动作的标在线。
-#[derive(Debug, Clone)]
-pub struct Activity {
-    pub kind: String,
-    pub who: String,
-    pub ip: String,
-    pub client_id: String,
-    pub detail: String,
-    pub at: i64,
-}
-
-pub fn activity_kind_label(kind: &str) -> &'static str {
-    match kind {
-        "login" => "登录",
-        "submit" => "提交登记",
-        _ => "检查更新",
-    }
-}
-
 /// 记一条。`who` 为空表示还没登录（只在检查更新）。
 pub fn record_activity(
     conn: &Connection,
@@ -981,36 +1024,6 @@ pub fn record_activity(
     );
     // 顺手清掉 7 天前的：这张表只服务于"最近谁在连"，留历史没意义还会一直长
     let _ = conn.execute("DELETE FROM activity WHERE at < ?", params![now() - 7 * 86400]);
-}
-
-/// 按"机器"聚合（同一 IP + 客户端标识算一台），每台只留最近一条。
-///
-/// SQLite 保证 `MAX(at)` 那一行对应的其它列跟着取那一行的值，
-/// 所以不用窗口函数也能拿到"最后一次动作是什么"。
-pub fn recent_activity(conn: &Connection, since: i64, limit: i64) -> Vec<Activity> {
-    let mut stmt = match conn.prepare(
-        "SELECT kind, who, ip, client_id, detail, MAX(at) AS at
-           FROM activity
-          WHERE at >= ?
-          GROUP BY ip, client_id
-          ORDER BY at DESC
-          LIMIT ?",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map(params![since, limit], |r| {
-        Ok(Activity {
-            kind: r.get(0)?,
-            who: r.get(1)?,
-            ip: r.get(2)?,
-            client_id: r.get(3)?,
-            detail: r.get(4)?,
-            at: r.get(5)?,
-        })
-    })
-    .and_then(|rows| rows.collect())
-    .unwrap_or_default()
 }
 
 /// 概览页顶部那几个数字。

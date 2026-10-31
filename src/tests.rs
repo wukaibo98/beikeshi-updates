@@ -129,7 +129,7 @@ fn 版本过期时保存被拒且不动库() {
 #[test]
 fn 不在名单里的人登录失败() {
     let conn = fresh();
-    db::form_user_save(&conn, None, "张三").unwrap();
+    db::form_user_save(&conn, None, "张三", None).unwrap();
 
     assert!(db::form_user_by_name(&conn, "张三").unwrap().is_some());
     assert!(
@@ -779,4 +779,119 @@ fn 网格改登记_改一条不影响同模板的其它行() {
         .unwrap();
     let data: Value = serde_json::from_str(&other).unwrap();
     assert_eq!(data["a"], "第二行", "改一行不能把别的行带上");
+}
+
+/* ---------------------------- v1.6：物流快递字段 + 按快递分工作表 */
+
+fn express_schema(extra: &str) -> String {
+    schema(&format!(
+        r#"[{{"key":"exp","label":"物流","type":"express"{extra}}}]"#
+    ))
+}
+
+#[test]
+fn 物流字段_必填时单号和快递公司都得有() {
+    let s = parse(&express_schema(r#","required":true"#));
+    let none = serde_json::Map::new();
+    let errs = validate_data(&s, &none);
+    assert!(errs.contains_key("exp"), "必填的物流字段不能空着");
+
+    let mut only_number = serde_json::Map::new();
+    only_number.insert("exp".into(), serde_json::json!({"tracking_number":"SF123","carrier":""}));
+    let errs = validate_data(&s, &only_number);
+    assert!(errs.contains_key("exp"), "填了单号没选快递公司，一样不算填完");
+
+    let mut ok = serde_json::Map::new();
+    ok.insert("exp".into(), serde_json::json!({"tracking_number":"SF123","carrier":"顺丰"}));
+    assert!(validate_data(&s, &ok).is_empty(), "两个都填了就该过");
+}
+
+#[test]
+fn 物流字段_单号和快递公司都有长度上限() {
+    let s = parse(&express_schema(""));
+    let mut too_long = serde_json::Map::new();
+    too_long.insert(
+        "exp".into(),
+        serde_json::json!({"tracking_number":"x".repeat(61),"carrier":"顺丰"}),
+    );
+    assert!(validate_data(&s, &too_long).contains_key("exp"), "单号超过 60 字要拦");
+
+    let mut carrier_long = serde_json::Map::new();
+    carrier_long.insert(
+        "exp".into(),
+        serde_json::json!({"tracking_number":"SF1","carrier":"快".repeat(31)}),
+    );
+    assert!(validate_data(&s, &carrier_long).contains_key("exp"), "快递公司超过 30 字要拦");
+}
+
+#[test]
+fn 按快递分表_只能勾在物流字段上且最多一个() {
+    // 勾在 text 字段上 → 拒
+    let s = schema(
+        r#"[{"key":"a","label":"甲","type":"text","groupByCarrier":true}]"#,
+    );
+    let err = validate_schema(&parse(&s)).unwrap_err();
+    assert!(err.contains("物流快递"), "只有物流字段能按快递分组，实际：{err}");
+
+    // 两个物流字段都勾 → 拒
+    let s = schema(
+        r#"[{"key":"e1","label":"物流1","type":"express","groupByCarrier":true},
+            {"key":"e2","label":"物流2","type":"express","groupByCarrier":true}]"#,
+    );
+    let err = validate_schema(&parse(&s)).unwrap_err();
+    assert!(err.contains("最多"), "一个模板最多一个分组字段，实际：{err}");
+
+    // 一个物流字段勾 → 过
+    let s = express_schema(r#","groupByCarrier":true"#);
+    assert!(validate_schema(&parse(&s)).is_ok());
+}
+
+#[test]
+fn 网格改物流字段_把单号加竖线拆回对象() {
+    let conn = fresh();
+    let snap = express_schema("");
+    let id = insert_sub(&conn, &snap, r#"{"exp":{"tracking_number":"旧单号","carrier":"圆通"}}"#);
+
+    let mut v = std::collections::BTreeMap::new();
+    v.insert("exp".to_string(), "SF999 | 顺丰".to_string());
+    crate::forms::apply_submission_edit(&conn, id, &v).unwrap();
+
+    let row = db::form_submission_by_id(&conn, id).unwrap().unwrap();
+    let data: Value = serde_json::from_str(&row.data_json).unwrap();
+    assert_eq!(data["exp"]["tracking_number"], "SF999");
+    assert_eq!(data["exp"]["carrier"], "顺丰", "必须还是对象，不能变成字符串");
+}
+
+#[test]
+fn 网格改物流字段_只填了单号也能存下来() {
+    let conn = fresh();
+    let snap = express_schema(""); // 非必填
+    let id = insert_sub(&conn, &snap, r#"{"exp":{"tracking_number":"旧","carrier":"圆通"}}"#);
+
+    let mut v = std::collections::BTreeMap::new();
+    v.insert("exp".to_string(), "YT123".to_string());
+    crate::forms::apply_submission_edit(&conn, id, &v).unwrap();
+
+    let row = db::form_submission_by_id(&conn, id).unwrap().unwrap();
+    let data: Value = serde_json::from_str(&row.data_json).unwrap();
+    assert_eq!(data["exp"]["tracking_number"], "YT123");
+    assert_eq!(data["exp"]["carrier"], "", "没写竖线就只认单号，不能把整串塞进单号");
+}
+
+#[test]
+fn 多工作表导出_重名的表自动加后缀() {
+    let t = crate::xlsx::Table {
+        headers: vec!["A".into()],
+        keys: vec!["a".into()],
+        rows: vec![vec!["1".into()]],
+    };
+    // 同一个名字给三次：第一张叫「顺丰」，后面两张要变成「顺丰-2」「顺丰-3」
+    let sheets = [(&t, "顺丰".to_string()), (&t, "顺丰".to_string()), (&t, "顺丰".to_string())];
+    let bytes = crate::xlsx::write_xlsx_sheets(&sheets).unwrap();
+    assert_eq!(&bytes[0..2], b"PK", "应该是一个合法 xlsx");
+
+    // 换成真正会撞名的长名字也要能存下去
+    let long = "很长的快递公司名称".repeat(3); // 超过 31 字
+    let sheets = [(&t, long.clone()), (&t, long.clone())];
+    assert!(crate::xlsx::write_xlsx_sheets(&sheets).is_ok(), "长名字撞名不能报错");
 }

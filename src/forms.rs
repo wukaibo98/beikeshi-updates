@@ -5,6 +5,8 @@
 //! 对应版本的 schema 再验一遍，版本号还要能对上（快照冻结，见 `db::form_template_schema`）。
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::Form;
@@ -12,6 +14,8 @@ use std::net::SocketAddr;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
+use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -53,13 +57,15 @@ pub struct Field {
     pub options: Option<Vec<String>>,
     #[serde(default)]
     pub placeholder: Option<String>,
+    #[serde(default, rename = "groupByCarrier")]
+    pub group_by_carrier: bool,
 }
 
 /// 支持的字段类型。
 ///
 /// `name` 是「姓名」：客户端填写页会自动填入当前登录人的姓名，
 /// 服务端只当它是普通文本校验（默认最多 30 字）。
-pub const KINDS: [&str; 6] = ["text", "textarea", "number", "select", "date", "name"];
+pub const KINDS: [&str; 7] = ["text", "textarea", "number", "select", "date", "name", "express"];
 
 /// 字段类型的中文名（管理页的模板编辑器下拉框用）。
 pub fn kind_label(kind: &str) -> &'static str {
@@ -70,6 +76,7 @@ pub fn kind_label(kind: &str) -> &'static str {
         "select" => "下拉",
         "date" => "日期",
         "name" => "姓名",
+        "express" => "物流快递",
         _ => "单行文本",
     }
 }
@@ -87,6 +94,7 @@ pub fn validate_schema(schema: &Schema) -> Result<(), String> {
     }
 
     let mut seen = HashSet::new();
+    let mut grouped_carrier_fields = 0usize;
     for f in &schema.fields {
         if !valid_key(&f.key) {
             return Err(format!(
@@ -107,6 +115,10 @@ pub fn validate_schema(schema: &Schema) -> Result<(), String> {
         if !KINDS.contains(&f.kind.as_str()) {
             return Err(format!("字段「{label}」的类型「{}」不支持", f.kind));
         }
+        if f.group_by_carrier && f.kind != "express" {
+            return Err(format!("只有物流快递字段「{label}」可以按快递公司分工作表"));
+        }
+        if f.group_by_carrier { grouped_carrier_fields += 1; }
         if f.kind == "select" {
             let empty = f
                 .options
@@ -125,6 +137,7 @@ pub fn validate_schema(schema: &Schema) -> Result<(), String> {
             }
         }
     }
+    if grouped_carrier_fields > 1 { return Err("一个模板最多只能选择一个按快递分组的字段".into()); }
     Ok(())
 }
 
@@ -143,6 +156,18 @@ pub fn validate_data(schema: &Schema, data: &Map<String, Value>) -> BTreeMap<Str
 
     for f in &schema.fields {
         let raw = data.get(&f.key);
+        if f.kind == "express" {
+            let (number, carrier) = raw.and_then(Value::as_object).map(|v| (
+                v.get("tracking_number").and_then(Value::as_str).unwrap_or("").trim(),
+                v.get("carrier").and_then(Value::as_str).unwrap_or("").trim(),
+            )).unwrap_or(("", ""));
+            if f.required && (number.is_empty() || carrier.is_empty()) {
+                errs.insert(f.key.clone(), "请填写物流单号并选择物流公司".into());
+            }
+            if number.chars().count() > 60 { errs.insert(f.key.clone(), "物流单号最多 60 字".into()); }
+            if carrier.chars().count() > 30 { errs.insert(f.key.clone(), "物流公司最多 30 字".into()); }
+            continue;
+        }
         let text = match raw {
             None | Some(Value::Null) => String::new(),
             Some(Value::String(s)) => s.trim().to_string(),
@@ -244,10 +269,60 @@ fn header_token<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// （只在 token 里认 user_id 不够：停用一个客服后他的 token 不能还能提交。）
 fn current_user(state: &AppState, headers: &HeaderMap) -> Option<db::FormUser> {
     let token = header_token(headers, HEADER_FORM)?;
-    let user_id = state.auth.verify_form_token(token)?;
-    let conn = state.conn.lock().unwrap();
+    let (user_id, auth_version) = state.auth.verify_form_token(token)?;
+    let conn = state.conn.get().unwrap();
     let user = db::form_user_find(&conn, user_id).ok().flatten()?;
-    if user.enabled { Some(user) } else { None }
+    if user.enabled && user.auth_version == auth_version { Some(user) } else { None }
+}
+
+const PASSWORD_MIN_CHARS: usize = 10;
+const PASSWORD_MAX_BYTES: usize = 512;
+const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+const LOGIN_MAX_FAILURES: u32 = 5;
+static LOGIN_FAILURES: OnceLock<Mutex<BTreeMap<String, (u32, Instant)>>> = OnceLock::new();
+
+fn login_is_limited(ip: &str) -> bool {
+    let now = Instant::now();
+    let mut attempts = LOGIN_FAILURES.get_or_init(Default::default).lock().unwrap();
+    if let Some((count, since)) = attempts.get(ip) {
+        if now.duration_since(*since) < LOGIN_WINDOW && *count >= LOGIN_MAX_FAILURES {
+            return true;
+        }
+    }
+    attempts.retain(|_, (_, since)| now.duration_since(*since) < LOGIN_WINDOW);
+    false
+}
+
+fn note_login_failure(ip: &str) {
+    let now = Instant::now();
+    let mut attempts = LOGIN_FAILURES.get_or_init(Default::default).lock().unwrap();
+    let entry = attempts.entry(ip.to_string()).or_insert((0, now));
+    if now.duration_since(entry.1) >= LOGIN_WINDOW { *entry = (0, now); }
+    entry.0 = entry.0.saturating_add(1);
+}
+
+fn clear_login_failures(ip: &str) {
+    if let Some(attempts) = LOGIN_FAILURES.get() {
+        if let Ok(mut attempts) = attempts.lock() { attempts.remove(ip); }
+    }
+}
+
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default().hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string()).map_err(|e| e.to_string())
+}
+
+fn password_matches(password: &str, encoded_hash: &str) -> bool {
+    let Ok(hash) = PasswordHash::new(encoded_hash) else { return false };
+    Argon2::default().verify_password(password.as_bytes(), &hash).is_ok()
+}
+
+fn validate_new_password(password: &str, confirmation: &str) -> Result<(), &'static str> {
+    if password.chars().count() < PASSWORD_MIN_CHARS { return Err("密码至少 10 个字符") }
+    if password.len() > PASSWORD_MAX_BYTES { return Err("密码过长") }
+    if password != confirmation { return Err("两次输入的密码不一致") }
+    Ok(())
 }
 
 fn is_editor(state: &AppState, headers: &HeaderMap) -> bool {
@@ -270,9 +345,23 @@ fn bad(code: StatusCode, msg: impl Into<String>) -> Response {
 pub struct LoginReq {
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    password: String,
     /// 客户端机器标识（可选）。概览页按 IP + 它聚合，能区分同一 IP 下的多台机器
     #[serde(default)]
     client_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct HeartbeatReq { #[serde(default)] client_id: String }
+
+pub async fn heartbeat(State(state): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>, Json(req): Json<HeartbeatReq>) -> Response {
+    let Some(user) = current_user(&state, &headers) else { return bad(StatusCode::FORBIDDEN, "登录已失效，请重新登录") };
+    let client_id = req.client_id.trim();
+    if client_id.is_empty() || client_id.len() > 64 { return bad(StatusCode::BAD_REQUEST, "设备标识无效") }
+    let conn = state.conn.get().unwrap();
+    db::touch_form_session(&conn, user.id, client_id, &crate::peer_ip(&headers, Some(addr)));
+    ok(json!({"ok":true,"server_time":db::now()}))
 }
 
 pub async fn login(
@@ -288,18 +377,36 @@ pub async fn login(
     if name.chars().count() > 20 {
         return bad(StatusCode::BAD_REQUEST, "姓名太长");
     }
+    let ip = crate::peer_ip(&headers, Some(addr));
+    if login_is_limited(&ip) {
+        return bad(StatusCode::TOO_MANY_REQUESTS, "登录尝试过多，请 15 分钟后再试");
+    }
 
     let user = {
-        let conn = state.conn.lock().unwrap();
-        db::form_user_by_name(&conn, name).ok().flatten()
+        let conn = state.conn.get().unwrap();
+        db::form_user_login_by_name(&conn, name).ok().flatten()
     };
     let Some(user) = user else {
-        // 不在名单里 / 已停用：同一句提示，不告诉对方"有这个人但停用了"
-        return bad(StatusCode::FORBIDDEN, "姓名不在名单里，请联系管理员");
+        note_login_failure(&ip);
+        return bad(StatusCode::UNAUTHORIZED, "账号或密码错误");
     };
+    if user.password_hash.is_empty() {
+        return bad(StatusCode::FORBIDDEN, "账号尚未设置密码，请联系管理员");
+    }
+    let password = req.password.clone();
+    let encoded_hash = user.password_hash.clone();
+    let valid = match tokio::task::spawn_blocking(move || password_matches(&password, &encoded_hash)).await {
+        Ok(valid) => valid,
+        Err(_) => return bad(StatusCode::INTERNAL_SERVER_ERROR, "登录暂时不可用，请稍后重试"),
+    };
+    if !valid {
+        note_login_failure(&ip);
+        return bad(StatusCode::UNAUTHORIZED, "账号或密码错误");
+    }
+    clear_login_failures(&ip);
 
     {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::record_activity(
             &conn,
             "login",
@@ -310,13 +417,68 @@ pub async fn login(
         );
     }
 
-    let (token, exp) = state.auth.issue_form_token(user.id, FORM_TOKEN_TTL);
+    let (token, exp) = state.auth.issue_form_token(user.id, user.auth_version, FORM_TOKEN_TTL);
     ok(json!({
         "user_id": user.id,
         "name": user.name,
         "token": token,
         "expires_at": exp,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordReq {
+    #[serde(default)]
+    current_password: String,
+    #[serde(default)]
+    new_password: String,
+    #[serde(default)]
+    new_password2: String,
+}
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordReq>,
+) -> Response {
+    let Some(user) = current_user(&state, &headers) else {
+        return bad(StatusCode::FORBIDDEN, "登录已失效，请重新登录");
+    };
+    if let Err(msg) = validate_new_password(&req.new_password, &req.new_password2) {
+        return bad(StatusCode::BAD_REQUEST, msg);
+    }
+    let login_record = {
+        let conn = state.conn.get().unwrap();
+        db::form_user_login_by_name(&conn, &user.name).ok().flatten()
+    };
+    let Some(login_record) = login_record else { return bad(StatusCode::FORBIDDEN, "登录已失效") };
+    let old_password = req.current_password.clone();
+    let encoded_hash = login_record.password_hash.clone();
+    let new_password = req.new_password.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if !password_matches(&old_password, &encoded_hash) {
+            return Err("当前密码不正确".to_string());
+        }
+        hash_password(&new_password)
+    }).await;
+    let hash = match result {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(msg)) => return bad(StatusCode::UNAUTHORIZED, msg),
+        Err(_) => return bad(StatusCode::INTERNAL_SERVER_ERROR, "密码修改失败，请重试"),
+    };
+    let changed = {
+        let conn = state.conn.get().unwrap();
+        db::form_user_set_password(&conn, user.id, &hash)
+    };
+    match changed {
+        Ok(true) => {
+            let auth_version = login_record.auth_version + 1;
+            let (token, exp) = state.auth.issue_form_token(user.id, auth_version, FORM_TOKEN_TTL);
+            ok(json!({ "user_id": user.id, "name": user.name, "token": token, "expires_at": exp }))
+        }
+        Ok(false) => bad(StatusCode::NOT_FOUND, "账号不存在"),
+        Err(_) => bad(StatusCode::INTERNAL_SERVER_ERROR, "密码修改失败，请重试"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -369,7 +531,7 @@ pub async fn templates(
     }
 
     let list = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_templates(&conn, want_all).unwrap_or_default()
     };
 
@@ -432,7 +594,7 @@ pub async fn template_save(
     };
 
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_template_save(
             &conn,
             req.id,
@@ -470,7 +632,7 @@ pub async fn template_toggle(
         return bad(StatusCode::FORBIDDEN, "需要先输入管理口令");
     }
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_template_toggle(&conn, req.id, req.is_active)
     };
     match result {
@@ -509,7 +671,7 @@ pub async fn submit(
 
     // 取提交时那一版的字段定义 —— 客户端离线几天也不会串列
     let schema_json = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         // 模板被删了（软删除）就不该再收新登记
         if db::form_template_deleted(&conn, req.template_id).unwrap_or(false) {
             return bad(StatusCode::UNPROCESSABLE_ENTITY, "这个表单已经被删除了，不能再提交");
@@ -543,7 +705,7 @@ pub async fn submit(
     let client_id: String = req.client_id.chars().take(64).collect();
 
     let created = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         let tpl_name = db::form_template_by_id(&conn, req.template_id)
             .ok()
             .flatten()
@@ -608,7 +770,7 @@ pub async fn mine(
         ..Default::default()
     };
     let rows = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_submissions(&conn, &filter).unwrap_or_default()
     };
     let items: Vec<Value> = rows
@@ -761,36 +923,6 @@ pub fn grid_columns(
     cols
 }
 
-fn record_summary(schema: Option<&Schema>, data: &Map<String, Value>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    match schema {
-        Some(s) => {
-            for f in s.fields.iter().take(4) {
-                let v = data.get(&f.key).map(value_text).unwrap_or_default();
-                if v.is_empty() {
-                    continue;
-                }
-                parts.push(format!("{}：{}", f.label, v));
-            }
-        }
-        None => {
-            for (k, v) in data.iter().take(4) {
-                let t = value_text(v);
-                if !t.is_empty() {
-                    parts.push(format!("{k}：{t}"));
-                }
-            }
-        }
-    }
-    let text = parts.join("　");
-    if text.chars().count() > 90 {
-        let cut: String = text.chars().take(90).collect();
-        format!("{cut}…")
-    } else {
-        text
-    }
-}
-
 /// 四段内容，供 `admin::page` 拼进标签页。
 pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
     let (from, to) = q.range();
@@ -814,7 +946,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
         tpl_editor_html,
         deleted_rows,
     ) = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
 
         let rows = db::form_submissions(&conn, &filter).unwrap_or_default();
         let total = db::form_submissions_count(&conn, &filter).unwrap_or(0);
@@ -838,14 +970,13 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                 })
         };
 
-        /* ---- 表单预览：每个模板一张**网格** + 三个按钮 ----
+        /* ---- 表单预览：每个模板一张摘要卡 + 三个按钮 ----
            编辑（改表格结构）/ 上传记录（新窗口）/ 导出（xlsx）。
            列出**所有**没删掉的模板 —— 一条都没填过的也能编辑、导出；
            另外，已经删掉但当前筛选下还有登记的，也要列出来（不然那些记录
            在页面上就再也找不到了）。
 
-           网格改的是**登记数据**（列 = 当前模板的字段），不是字段定义。
-           记录列表搬到「上传记录」里去了，这里只留可编辑的网格。 */
+           登记数据网格在「上传记录」页面中显示和编辑。 */
         let templates = db::form_templates(&conn, true).unwrap_or_default();
         let shown: Vec<&db::FormTemplate> = match q.template {
             Some(tid) => templates.iter().filter(|t| t.id == tid).collect(),
@@ -868,68 +999,6 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
             .map(|(tid, tpl_name, deleted)| {
                 let subs: Vec<&db::FormSubmission> =
                     rows.iter().filter(|r| r.template_id == *tid).collect();
-                // 每条登记的快照与数据（老登记的列可能跟现在的模板不一样）
-                let parsed: Vec<(Option<Schema>, Map<String, Value>)> = subs
-                    .iter()
-                    .map(|r| {
-                        let sc: Option<Schema> = serde_json::from_str(&r.template_snapshot).ok();
-                        let d: Map<String, Value> = serde_json::from_str::<Value>(&r.data_json)
-                            .ok()
-                            .and_then(|v| v.as_object().cloned())
-                            .unwrap_or_default();
-                        (sc, d)
-                    })
-                    .collect();
-                // 列从**当前模板**的字段定义来，这样同模板所有行才对得齐；
-                // 模板已经删了，就退回调组内第一条登记的快照。
-                let cur: Option<Schema> = if *deleted {
-                    parsed.first().and_then(|(s, _)| s.clone())
-                } else {
-                    templates_all
-                        .iter()
-                        .find(|t| t.id == *tid && t.deleted_at == 0)
-                        .and_then(|t| serde_json::from_str(&t.schema_json).ok())
-                };
-                let cols = grid_columns(cur.as_ref(), &parsed);
-                let body: String = subs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| {
-                        let (_, data) = &parsed[i];
-                        let cells: String = cols
-                            .iter()
-                            .map(|c| {
-                                let v = data.get(&c.key).map(value_text).unwrap_or_default();
-                                html::grid_cell(c, &v, !c.legacy)
-                            })
-                            .collect();
-                        let time = crate::admin::short_time(
-                            r.client_time,
-                            state.cfg.tz_offset_min,
-                        );
-                        format!(
-                            r#"<tr data-sub="{id}">
-  <td class="gnum"><span class="dot" hidden></span>{n}</td>
-  <td class="ro">{user}</td><td class="ro">{time}</td>
-  {cells}
-  <td class="gst">已存</td>
-  <td class="gact"><a class="ghost rec-open" href="/admin?tab=register&amp;sub=preview&amp;rec={id}"
-    data-id="{id}" data-title="{user} · {time}">改</a></td>
-</tr>"#,
-                            id = r.id,
-                            n = i + 1,
-                            user = crate::escape(&r.user_name),
-                            time = time,
-                            cells = cells,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                let body = if body.is_empty() {
-                    html::grid_empty_row(cols.len())
-                } else {
-                    body
-                };
                 // 已删除的模板不能编辑（行都软删了），只留「上传记录」和「导出」
                 let edit_btn = if *deleted {
                     String::new()
@@ -958,12 +1027,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
       <a class="ghost" href="/admin/forms/template/{tid}/records" target="_blank" rel="noopener">上传记录</a>
       <a class="ghost" href="/admin/forms/export.xlsx?template={tid}" title="导出这个模板的全部登记">导出</a>
     </span></h2>
-  <div class="gridwrap"><table class="grid">{head}{body}</table></div>
-  <div class="gridfoot">
-    <span class="gsave" data-role="saved" hidden></span>
-    <span class="gerr" data-role="err" hidden></span>
-    <span class="muted" style="margin-left:auto">改完一个格子就自动存；灰底格子只读</span>
-  </div>
+  <p class="muted">填写记录已移到「上传记录」页面查看和编辑。</p>
 </div>"#,
                     name = crate::escape(tpl_name),
                     tag = tag,
@@ -971,8 +1035,6 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                     hint = hint,
                     tid = tid,
                     edit_btn = edit_btn,
-                    head = html::grid_head(&cols),
-                    body = body,
                 )
             })
             .collect::<Vec<_>>()
@@ -1034,11 +1096,11 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
         let users = db::form_users(&conn).unwrap_or_default();
         let user_rows: String = users
             .iter()
-            .map(|u| html::form_user_row(u.id, &u.name, u.enabled))
+            .map(|u| html::form_user_row(u.id, &u.name, u.enabled, u.has_password))
             .collect::<Vec<_>>()
             .join("");
         let user_rows = if user_rows.is_empty() {
-            r#"<tr><td colspan="3" class="muted">还没有人，加了名字客服才能登录</td></tr>"#.to_string()
+            r#"<tr><td colspan="3" class="muted">还没有人，添加账号并设置初始密码后才能登录</td></tr>"#.to_string()
         } else {
             user_rows
         };
@@ -1202,8 +1264,10 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
     <h2>客户端（谁能填表）</h2>
     <form method="post" action="/admin/users/save" class="row" style="margin-bottom:12px">
       <input type="text" name="name" placeholder="中文姓名" required>
+      <input type="password" name="password" placeholder="初始密码（至少 10 位）" minlength="10" required>
+      <input type="password" name="password2" placeholder="确认初始密码" minlength="10" required>
       <button type="submit">添加</button>
-      <span class="muted">必须和客服本人说的完全一致；不在名单里的人登录会失败</span>
+      <span class="muted">姓名是登录账号；管理员设置初始密码，客服可登录后修改</span>
     </form>
     <table>
       <tr><th>姓名</th><th>状态</th><th>操作</th></tr>
@@ -1215,7 +1279,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
     /* ------------------------------------------------------------ 管理端 */
 
     let admins = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         let rows = db::admin_users(&conn).unwrap_or_default();
         let body: String = rows
             .iter()
@@ -1283,6 +1347,9 @@ fn value_text(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),
+        Value::Object(obj) if obj.contains_key("tracking_number") && obj.contains_key("carrier") => {
+            format!("{} | {}", obj.get("tracking_number").and_then(Value::as_str).unwrap_or(""), obj.get("carrier").and_then(Value::as_str).unwrap_or(""))
+        }
         other => other.to_string(),
     }
 }
@@ -1295,6 +1362,10 @@ pub struct UserSaveForm {
     id: Option<i64>,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    password2: String,
 }
 
 pub async fn user_save(
@@ -1312,10 +1383,24 @@ pub async fn user_save(
     if name.chars().count() > 20 {
         return redirect_err("login", "clients", "姓名最多 20 个字");
     }
+    let password_hash = if form.id.is_none() {
+        if let Err(msg) = validate_new_password(&form.password, &form.password2) {
+            return redirect_err("login", "clients", msg);
+        }
+        match tokio::task::spawn_blocking({
+            let password = form.password.clone();
+            move || hash_password(&password)
+        }).await {
+            Ok(Ok(hash)) => Some(hash),
+            _ => return redirect_err("login", "clients", "密码设置失败，请重试"),
+        }
+    } else {
+        None
+    };
 
     let result = {
-        let conn = state.conn.lock().unwrap();
-        db::form_user_save(&conn, form.id, &name)
+        let conn = state.conn.get().unwrap();
+        db::form_user_save(&conn, form.id, &name, password_hash.as_deref())
     };
     match result {
         Ok(_) => redirect_ok("login", "clients", &format!("已保存「{name}」")),
@@ -1326,6 +1411,42 @@ pub async fn user_save(
                 redirect_err("login", "clients", &format!("保存失败：{e}"))
             }
         }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UserPasswordForm {
+    id: i64,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    password2: String,
+}
+
+pub async fn user_password_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UserPasswordForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) {
+        return redirect_err("login", "clients", "请先登录");
+    }
+    if let Err(msg) = validate_new_password(&form.password, &form.password2) {
+        return redirect_err("login", "clients", msg);
+    }
+    let password = form.password;
+    let hash = match tokio::task::spawn_blocking(move || hash_password(&password)).await {
+        Ok(Ok(hash)) => hash,
+        _ => return redirect_err("login", "clients", "密码重置失败，请重试"),
+    };
+    let result = {
+        let conn = state.conn.get().unwrap();
+        db::form_user_set_password(&conn, form.id, &hash)
+    };
+    match result {
+        Ok(true) => redirect_ok("login", "clients", "密码已重置，旧登录会话已失效"),
+        Ok(false) => redirect_err("login", "clients", "没有这个账号"),
+        Err(e) => redirect_err("login", "clients", &format!("密码重置失败：{e}")),
     }
 }
 
@@ -1346,7 +1467,7 @@ pub async fn user_toggle(
     }
     let enabled = matches!(form.enabled.as_deref(), Some("1") | Some("true"));
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_user_toggle(&conn, form.id, enabled)
     };
     match result {
@@ -1370,7 +1491,7 @@ pub async fn user_delete(
         return redirect_err("login", "clients", "请先登录");
     }
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_user_delete(&conn, form.id)
     };
     match result {
@@ -1400,7 +1521,7 @@ pub async fn admin_template_toggle(
     }
     let is_active = matches!(form.is_active.as_deref(), Some("1") | Some("true"));
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_template_toggle(&conn, form.id, is_active)
     };
     match result {
@@ -1431,7 +1552,7 @@ pub async fn admin_template_delete(
         return redirect_err("register", "templates", "请先登录");
     }
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_template_delete(&conn, form.id)
     };
     match result {
@@ -1458,7 +1579,7 @@ pub async fn admin_template_purge(
         return redirect_err("register", "templates", "请先登录");
     }
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::form_template_purge(&conn, form.id)
     };
     match result {
@@ -1504,6 +1625,7 @@ fn template_editor_html(conn: &rusqlite::Connection, id: i64, add_blank: bool) -
             kind: f.kind.clone(),
             required: f.required,
             options: f.options.clone().unwrap_or_default(),
+            group_by_carrier: f.group_by_carrier,
         })
         .collect();
     if add_blank {
@@ -1514,6 +1636,7 @@ fn template_editor_html(conn: &rusqlite::Connection, id: i64, add_blank: bool) -
             kind: "text".to_string(),
             required: false,
             options: Vec::new(),
+            group_by_carrier: false,
         });
     }
     html::template_editor(t.id, &t.name, t.version, &fields)
@@ -1528,23 +1651,12 @@ pub async fn template_edit(
     if !crate::is_admin(&headers, &state) {
         return (StatusCode::FORBIDDEN, "请先登录").into_response();
     }
-    let conn = state.conn.lock().unwrap();
+    let conn = state.conn.get().unwrap();
     let out = template_editor_html(&conn, id, false);
     if out.is_empty() {
         return (StatusCode::NOT_FOUND, "没有这个模板（或已经删掉了）").into_response();
     }
     (StatusCode::OK, out).into_response()
-}
-
-/// 表格里那一行的操作链接（「上传记录」新窗口里用）。
-fn record_row(time: &str, user: &str, summary: &str, id: i64) -> String {
-    format!(
-        r#"<tr><td>{time}</td><td>{user}</td><td>{summary}</td>
-<td><a class="ghost" href="/admin?tab=register&sub=preview&rec={id}" target="_blank">查看</a></td></tr>"#,
-        time = crate::escape(time),
-        user = crate::escape(user),
-        summary = summary,
-    )
 }
 
 /// 「上传记录」：新窗口打开的独立页面，**只显示最近 200 条**。
@@ -1556,7 +1668,7 @@ pub async fn template_records(
     if !crate::is_admin(&headers, &state) {
         return (StatusCode::FORBIDDEN, "请先登录").into_response();
     }
-    let conn = state.conn.lock().unwrap();
+    let conn = state.conn.get().unwrap();
 
     // 模板名：删掉了就退回登记里冗余存的那份
     let name = db::form_templates_all(&conn)
@@ -1577,36 +1689,28 @@ pub async fn template_records(
     let rows = db::form_submissions(&conn, &filter).unwrap_or_default();
     let total = db::form_submissions_count(&conn, &filter).unwrap_or(0);
 
-    let body: String = rows
-        .iter()
-        .map(|r| {
-            let schema: Option<Schema> = serde_json::from_str(&r.template_snapshot).ok();
-            let data: Map<String, Value> = serde_json::from_str::<Value>(&r.data_json)
-                .ok()
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
-            record_row(
-                &crate::admin::short_time(r.client_time, state.cfg.tz_offset_min),
-                &r.user_name,
-                &crate::escape(&record_summary(schema.as_ref(), &data)),
-                r.id,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let body = if body.is_empty() {
-        r#"<p class="muted">这个模板还没有人填过。</p>"#.to_string()
-    } else {
-        format!(
-            r#"<div class="card"><table>
-<tr><th>填写时间</th><th>提交人</th><th>内容</th><th>操作</th></tr>
-{body}
-</table></div>"#
-        )
+    let parsed: Vec<(Option<Schema>, Map<String, Value>)> = rows.iter().map(|r| (
+        serde_json::from_str(&r.template_snapshot).ok(),
+        serde_json::from_str::<Value>(&r.data_json).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default(),
+    )).collect();
+    let current = db::form_template_by_id(&conn, id).ok().flatten().and_then(|t| serde_json::from_str::<Schema>(&t.schema_json).ok())
+        .or_else(|| parsed.first().and_then(|(s, _)| s.clone()));
+    let cols = grid_columns(current.as_ref(), &parsed);
+    let grid_rows = rows.iter().enumerate().map(|(i, r)| {
+        let data = &parsed[i].1;
+        let cells = cols.iter().map(|c| html::grid_cell(c, &data.get(&c.key).map(value_text).unwrap_or_default(), !c.legacy)).collect::<String>();
+        // 行尾「改」：没开 JS 时格子是纯文本，靠它整页打开登记编辑表单（有 JS 时基本用不到，
+        // 因为格子本身就能改）。表头有这一列，行里也必须有，不然就是「写着改、点不到」。
+        format!(r#"<tr data-sub="{id}"><td class="gnum">{n}</td><td class="ro">{user}</td><td class="ro">{time}</td>{cells}<td class="gst">已存</td><td class="gact"><a class="ghost" href="/admin?tab=register&amp;sub=preview&amp;rec={id}" title="打开这条登记的完整表单">改</a></td></tr>"#,
+            id=r.id, n=i+1, user=crate::escape(&r.user_name), time=crate::escape(&crate::admin::short_time(r.client_time,state.cfg.tz_offset_min)), cells=cells)
+    }).collect::<Vec<_>>().join("");
+    let body = if rows.is_empty() { r#"<div class="card"><p class="muted">这个模板还没有人填过。</p></div>"#.to_string() } else {
+        format!(r#"<div class="card gridcard"><div class="gridwrap"><table class="grid">{}{}</table></div>
+<div class="gridfoot"><span class="gsave" data-role="saved" hidden></span><span class="gerr" data-role="err" hidden></span><span class="muted">编辑单元格后自动保存；旧字段只读</span></div></div>"#, html::grid_head(&cols), grid_rows)
     };
 
     let subtitle = if total > RECORDS_WINDOW {
-        format!("共 {total} 条，这个窗口只显示最近 {RECORDS_WINDOW} 条（要看全部请导出 xlsx）")
+        format!("共 {total} 条，这个窗口只显示最近 {RECORDS_WINDOW} 条（要看全部请导出 xlsx）；编辑单元格后自动保存")
     } else {
         format!("共 {total} 条")
     };
@@ -1615,7 +1719,8 @@ pub async fn template_records(
         .replace("%%CSS%%", html::CSS)
         .replace("%%TITLE%%", &crate::escape(&format!("{name} · 上传记录")))
         .replace("%%SUBTITLE%%", &crate::escape(&subtitle))
-        .replace("%%BODY%%", &body);
+        .replace("%%BODY%%", &body)
+        .replace("%%SCRIPT%%", html::GRID_SCRIPT);
     Html(page).into_response()
 }
 
@@ -1694,6 +1799,7 @@ pub fn parse_template_form(form: &std::collections::HashMap<String, String>) -> 
             decimals: None,
             options: if kind == "select" { Some(options) } else { None },
             placeholder: None,
+            group_by_carrier: attrs.get("group_by_carrier").map(|s| s == "1").unwrap_or(false),
         });
     }
     (name, fields)
@@ -1739,7 +1845,7 @@ pub async fn template_save_web(
     };
 
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         // 已经删掉的模板不让改
         if db::form_template_deleted(&conn, id).unwrap_or(false) {
             return redirect_err("register", "preview", "这个模板已经删除了，不能再改");
@@ -1802,7 +1908,7 @@ pub async fn submission_edit(
     if !crate::is_admin(&headers, &state) {
         return (StatusCode::FORBIDDEN, "请先登录").into_response();
     }
-    let conn = state.conn.lock().unwrap();
+    let conn = state.conn.get().unwrap();
     let Some(sub) = db::form_submission_by_id(&conn, id).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "没有这条登记").into_response();
     };
@@ -1868,7 +1974,7 @@ pub async fn submission_save(
         }
     }
 
-    let conn = state.conn.lock().unwrap();
+    let conn = state.conn.get().unwrap();
     match apply_submission_edit(&conn, form.id, &values) {
         Ok(()) => redirect_ok("register", "preview", "已保存"),
         Err(msg) => redirect_err("register", "preview", &format!("没存上：{msg}")),
@@ -1893,7 +1999,7 @@ pub async fn grid_save(
     if !crate::is_admin(&headers, &state) {
         return (StatusCode::FORBIDDEN, "请先登录").into_response();
     }
-    let conn = state.conn.lock().unwrap();
+    let conn = state.conn.get().unwrap();
     match apply_submission_edit(&conn, req.id, &req.data) {
         Ok(()) => Json(json!({
             "ok": true,
@@ -1935,6 +2041,9 @@ pub(crate) fn apply_submission_edit(
             if v.is_empty() {
                 // 清空 = 删掉这个键，跟客服在客户端填表时的语义一致
                 data.remove(&f.key);
+            } else if f.kind == "express" {
+                let (tracking_number, carrier) = v.split_once(" | ").unwrap_or((v, ""));
+                data.insert(f.key.clone(), json!({"tracking_number":tracking_number.trim(),"carrier":carrier.trim()}));
             } else {
                 data.insert(f.key.clone(), Value::String(v.to_string()));
             }
@@ -2017,7 +2126,7 @@ pub async fn admin_user_save(
 
     let hash = token_hash(token);
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         match form.id {
             Some(id) => db::admin_user_update(&conn, id, &name, Some(&hash)),
             None => db::admin_user_create(&conn, &name, &hash).map(|_| true),
@@ -2053,7 +2162,7 @@ pub async fn admin_user_toggle(
     }
     let enabled = matches!(form.enabled.as_deref(), Some("1") | Some("true"));
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::admin_user_toggle(&conn, form.id, enabled)
     };
     match result {
@@ -2077,7 +2186,7 @@ pub async fn admin_user_delete(
         return redirect_err("login", "admins", "请先登录");
     }
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::admin_user_delete(&conn, form.id)
     };
     match result {
@@ -2109,7 +2218,7 @@ pub async fn admin_user_token(
     }
     let hash = token_hash(token);
     let result = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         // 名字不改，只换口令
         let name = db::admin_users(&conn)
             .unwrap_or_default()
@@ -2153,12 +2262,13 @@ pub async fn export(
         offset: 0,
     };
 
-    let (rows, sheet_name) = {
-        let conn = state.conn.lock().unwrap();
+    let pool = state.conn.clone();
+    let template_id = q.template;
+    let export_data = tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(|e| e.to_string())?;
         let rows = db::form_submissions(&conn, &filter).unwrap_or_default();
         // sheet 名取模板名；模板被「永久删除」了就退回登记里冗余存的那份
-        let name = q
-            .template
+        let name = template_id
             .and_then(|id| db::form_template_by_id(&conn, id).ok().flatten())
             .map(|t| t.name)
             .or_else(|| {
@@ -2167,17 +2277,58 @@ pub async fn export(
                     .filter(|s| !s.is_empty())
             })
             .unwrap_or_else(|| "提交记录".to_string());
-        (rows, name)
+        let carrier_key = template_id.and_then(|id| db::form_template_by_id(&conn, id).ok().flatten())
+            .and_then(|t| serde_json::from_str::<Schema>(&t.schema_json).ok())
+            .and_then(|s| s.fields.into_iter().find(|f| f.kind == "express" && f.group_by_carrier).map(|f| f.key));
+        Ok::<_, String>((rows, name, carrier_key))
+    })
+    .await;
+    let (rows, sheet_name, carrier_key) = match export_data {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
+            eprintln!("xlsx query failed: {e}");
+            return redirect_err("register", "preview", "读取导出数据失败，请稍后重试");
+        }
+        Err(e) => {
+            eprintln!("xlsx query worker failed: {e}");
+            return redirect_err("register", "preview", "读取导出数据失败，请稍后重试");
+        }
     };
 
     if rows.is_empty() {
         return redirect_err("register", "preview", "这个筛选下没有记录可导出");
     }
 
-    let table = crate::xlsx::build_table(&rows, state.cfg.tz_offset_min);
-    let bytes = match crate::xlsx::write_xlsx(&table, &sheet_name) {
-        Ok(b) => b,
-        Err(e) => return redirect_err("register", "preview", &format!("生成表格失败：{e}")),
+    let tz_offset_min = state.cfg.tz_offset_min;
+    let export_sheet_name = sheet_name.clone();
+    let bytes = match tokio::task::spawn_blocking(move || {
+        if let Some(key) = carrier_key {
+            let mut groups: BTreeMap<String, Vec<db::FormSubmission>> = BTreeMap::new();
+            for row in rows {
+                let carrier = serde_json::from_str::<Value>(&row.data_json).ok()
+                    .and_then(|v| v.get(&key).and_then(|x| x.get("carrier")).and_then(Value::as_str).map(str::to_string))
+                    .filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "未识别或未填写".to_string());
+                groups.entry(carrier).or_default().push(row);
+            }
+            let tables: Vec<_> = groups.iter().map(|(_, rows)| crate::xlsx::build_table(rows, tz_offset_min)).collect();
+            let names: Vec<String> = groups.keys().map(|carrier| carrier.clone()).collect();
+            let sheets: Vec<_> = tables.iter().zip(names).map(|(table, carrier)| (table, carrier)).collect();
+            crate::xlsx::write_xlsx_sheets(&sheets)
+        } else {
+            let table = crate::xlsx::build_table(&rows, tz_offset_min);
+            crate::xlsx::write_xlsx(&table, &export_sheet_name)
+        }
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            return redirect_err("register", "preview", &format!("生成表格失败：{e}"));
+        }
+        Err(e) => {
+            eprintln!("xlsx worker failed: {e}");
+            return redirect_err("register", "preview", "生成表格失败，请稍后重试");
+        }
     };
 
     let filename = format!(

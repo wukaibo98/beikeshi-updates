@@ -22,13 +22,15 @@ mod tests;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{body::Body, Json, Router};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::json;
@@ -49,7 +51,7 @@ pub struct Config {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub conn: Arc<Mutex<Connection>>,
+    pub conn: Pool<SqliteConnectionManager>,
     pub auth: Arc<auth::Auth>,
     pub cfg: Arc<Config>,
 }
@@ -108,7 +110,7 @@ async fn latest(
     }
 
     let release = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         db::bump_checks(&conn);
         // 谁在连：每次检查更新都记一笔，概览页据此显示"最近活动"
         db::record_activity(
@@ -181,7 +183,7 @@ async fn package(State(state): State<AppState>, Path(name): Path<String>) -> Res
     };
 
     {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.get().unwrap();
         if let Ok(Some(release)) = find_by_filename(&conn, &name) {
             db::bump_downloads(&conn, release.id);
         }
@@ -246,7 +248,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&pkg_dir)?;
     clean_upload_leftovers(&pkg_dir);
 
-    let conn = db::open(&data_dir.join("updates.db"))?;
+    let db_path = data_dir.join("updates.db");
+    // 启动时串行执行 schema 初始化；服务运行期间由连接池提供并发连接。
+    drop(db::open(&db_path)?);
+    let manager = SqliteConnectionManager::file(&db_path).with_init(|conn| {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
+    });
+    let pool = Pool::builder().max_size(8).build(manager)?;
     let auth = auth::Auth::load_or_create(&data_dir.join("secret.key"))?;
 
     let cfg = Config {
@@ -271,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = env_or("BIND", "0.0.0.0:8080");
     let state = AppState {
-        conn: Arc::new(Mutex::new(conn)),
+        conn: pool,
         auth: Arc::new(auth),
         cfg: Arc::new(cfg),
     };
@@ -289,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/delete/{id}", post(admin::delete))
         .route("/admin/forms", get(redirect_forms))
         .route("/admin/users/delete", post(forms::user_delete))
+        .route("/admin/users/password", post(forms::user_password_reset))
         .route("/admin/forms/template/toggle", post(forms::admin_template_toggle))
         .route("/admin/forms/template/delete", post(forms::admin_template_delete))
         .route("/admin/forms/template/purge", post(forms::admin_template_purge))
@@ -318,6 +329,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/admins/token", post(forms::admin_user_token))
         .route("/admin/admins/delete", post(forms::admin_user_delete))
         .route("/form/login", post(forms::login))
+        .route("/form/heartbeat", post(forms::heartbeat))
+        .route("/form/password/change", post(forms::change_password))
         .route("/form/edit-login", post(forms::edit_login))
         .route("/form/templates", get(forms::templates))
         .route("/form/template/save", post(forms::template_save))

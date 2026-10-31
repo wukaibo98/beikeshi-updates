@@ -68,6 +68,9 @@ fn value_text(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Object(obj) if obj.contains_key("tracking_number") && obj.contains_key("carrier") => {
+            format!("{} | {}", obj.get("tracking_number").and_then(serde_json::Value::as_str).unwrap_or(""), obj.get("carrier").and_then(serde_json::Value::as_str).unwrap_or(""))
+        }
         other => other.to_string(),
     }
 }
@@ -94,9 +97,23 @@ fn short_time(ts: i64, tz_offset_min: i32) -> String {
 
 /// 生成 xlsx 字节。数字列如果整列都是数字，会写成数字单元格（Excel 里能直接求和）。
 pub fn write_xlsx(table: &Table, sheet_name: &str) -> Result<Vec<u8>, String> {
+    write_xlsx_sheets(&[(table, sheet_name.to_string())])
+}
+
+pub fn write_xlsx_sheets(sheets: &[(&Table, String)]) -> Result<Vec<u8>, String> {
     let mut book = Workbook::new();
+    let mut used_names = std::collections::HashSet::new();
+    for (table, sheet_name) in sheets {
     let sheet = book.add_worksheet();
-    sheet.set_name(safe_sheet_name(sheet_name)).map_err(|e| e.to_string())?;
+    let base = safe_sheet_name(sheet_name);
+    let mut unique = base.clone();
+    let mut suffix = 2;
+    while !used_names.insert(unique.clone()) {
+        let tail = format!("-{suffix}");
+        unique = format!("{}{}", base.chars().take(31usize.saturating_sub(tail.len())).collect::<String>(), tail);
+        suffix += 1;
+    }
+    sheet.set_name(unique).map_err(|e| e.to_string())?;
 
     let head = Format::new().set_bold().set_align(FormatAlign::Center).set_text_wrap();
     for (c, h) in table.headers.iter().enumerate() {
@@ -151,6 +168,7 @@ pub fn write_xlsx(table: &Table, sheet_name: &str) -> Result<Vec<u8>, String> {
         sheet.set_column_width(c as u16, widest.clamp(6.0, 40.0)).map_err(|e| e.to_string())?;
     }
     sheet.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
+    }
 
     book.save_to_buffer().map_err(|e| e.to_string())
 }

@@ -121,7 +121,7 @@ CREATE TABLE checks (                     -- 单行表：客户端检查次数�
 ### 3.1 表单的四张表（v0.2 起）
 
 ```sql
-form_users (id, name UNIQUE, enabled, created_at)      -- 姓名白名单，登录只查"在不在"
+form_users (id, name UNIQUE, password_hash, auth_version, enabled, created_at) -- 姓名账号、Argon2 密码哈希、令牌版本
 form_templates (id, name UNIQUE, version, is_active, sort_order, updated_at,
                 deleted_at)                           -- v0.4 加 deleted_at，软删除用
 form_template_versions (template_id, version, schema_json, created_at)  -- 每个版本的字段定义
@@ -163,7 +163,7 @@ admin_users (id, name, token_hash, enabled, created_at, updated_at)
 
 管理端账号与客户端白名单是**两套东西**：
 
-- `form_users` 管的是"哪个客服能填表单"，凭姓名登录，只查在不在名单里。
+- `form_users` 管客服账号：姓名作为账号，密码使用 Argon2 哈希；`auth_version` 让改密、改名、停用/启用都能撤销旧会话。
 - `admin_users` 管的是"谁能进管理页"，凭口令登录，口令**只存 sha256 哈希**。
 
 `admin_users` 与 `form_users` 互不干涉 —— 客服不在管理端名单里照样能填表，
@@ -355,7 +355,7 @@ v0.4 改成了**两级标签**，见 §4.11。
 表单登记 ├ 表单预览   ← 看表、预览编辑、导出 xlsx
         └ 模板管理   ← 建模板、停用、删除
 版本更新
-登录管理 ├ 客户端     ← 就是原来的"名单"，姓名白名单
+登录管理 ├ 客户端     ← 客服账号白名单（姓名账号 / 密码哈希 / 启停）
         └ 管理端     ← 新增：管理员账号 + 口令
 ```
 
@@ -1063,3 +1063,29 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 
 清单字段的消费方在客户端 `Bks.Core/ReleaseManifest.cs` 与 `UpdatePolicy.cs`，
 那边有 43 项单元测试，改清单结构要两边一起动。
+
+## 12. 数据库并发（2026-10-31，ChatGPT 修改）
+
+- 运行期使用 `r2d2_sqlite` 连接池，池上限 8；启动时仍先用单连接执行 schema 初始化，再由池连接服务。
+- 启动初始化时设置数据库 WAL 模式；每条池连接设置 `synchronous=NORMAL` 和 5 秒 `busy_timeout`。WAL 允许读请求与写请求并发；SQLite 写入仍由 SQLite 自身串行化。
+- 请求处理从池中获取连接，不再争抢一把全局 `Mutex<Connection>`。
+- 导出查询、导出数据转换和 xlsx 序列化都移入 Tokio `spawn_blocking`，避免重 CPU/同步磁盘工作堵住异步 worker。
+- 新依赖锁定在 `Cargo.lock`；新增连接池版本选用 Rust 1.75 兼容依赖区间。
+  `cargo test --release` **38 项全过**；镜像 `bks-updates:1.6.6` 已本地构建，**尚未部署**。
+
+## 13. 客服账号密码（2026-10-31，ChatGPT 修改，未发布）
+
+- `form_users.name` 同时作为账号和记录展示名；新增 `password_hash`（Argon2id 编码串）和 `auth_version`。
+- 老库迁移给 `password_hash` 空值；管理员必须给既有账号设初始密码。新客服添加时要求填写并确认至少 10 字符密码。
+- `/form/login` 校验姓名账号与密码，失败按来源 IP 每 15 分钟最多 5 次；登录流程不保存或回传密码。
+- 客服可通过 `/form/password/change` 验证旧密码并改密。管理员可重置密码；改名、改密、停用或启用都会递增 `auth_version`，旧令牌随即失效。
+- 登录令牌包含账号版本。客户端不能再用已存姓名自动续登；令牌过期后需重新输入密码。部署需先发新版客户端，再更新服务端，并给老账号设置初始密码。
+
+
+## 14. 2026-10-31 功能修改记录（ChatGPT 修改，未部署）
+
+- 在线状态：新增 `form_sessions` 表，使用 `(user_id, client_id)` 作为设备会话主键，心跳更新设备 IP 与时间。`POST /form/heartbeat` 要求有效客服令牌；管理员概览逐个展示登录管理名单，180 秒内有心跳为在线，可同时列出多台设备。客户端每 60 秒发心跳，账号令牌被服务端撤销时本地清除会话。老数据库启动时自动建表。
+- 物流字段：schema 新增 `type: express`、`groupByCarrier`。提交值结构为 `{ "tracking_number": "...", "carrier": "..." }`，服务端会复验字段值。客户端根据字母前缀（SF、JD、YT、ZT、YD、JT、EMS 等）和少数较常见数字前缀尝试匹配，并允许直接输入/修改公司名。该规则是本地启发式，不是承运商官方验证。数字编码可能重复；快递鸟的单号识别 API 文档说明识别结果可能是一家或多家公司，并按概率排序；因此未覆盖或容易冲突的数字格式留给人工选择。参考：[快递鸟单号识别 API](https://v2.kdniao.com/api-recognise)、[常见号段说明](https://www.kdniao.com/message/detail/126818)、[开源正则规则示例](https://gist.github.com/shallowlong/7d5501b92666742df0b9c5bda03d0a17)。
+- 分组导出：当前模板中至多一个物流字段勾选 `groupByCarrier` 后，导出生成单个 xlsx，各公司单独一个 sheet；缺公司值归入「未识别或未填写」。sheet 名按 Excel 限制清洗并处理重名。历史模板快照用于生成列，分组字段配置取当前模板。
+- 记录页：预览中只保留模板名称、记录数和操作按钮；「上传记录」独立页显示最近 200 条可编辑网格，提交仍共用 `apply_submission_edit()` 和快照校验。
+- 编译：`cargo build --release` 0 warning；`cargo test --release` **38 项全过**；功能尚未部署。

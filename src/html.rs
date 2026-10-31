@@ -33,6 +33,86 @@ button:hover{background:#335915}
   %%ERROR%%
 </div></body></html>"##;
 
+/// 上传记录页的网格增强：把纯文本单元格换成对应类型的控件，改完失焦自动存。
+///
+/// **控件必须按 `data-kind` 走**，不能一律用文本框 —— 日期要日期选择器、下拉要
+/// `<select>`（否则手打一个不在选项里的值，存进去就是脏数据）、数字要数字框、
+/// 物流要提示「单号 | 快递公司」的格式。没 JS 时格子是纯文本，编辑走行尾「改」链接。
+pub const GRID_SCRIPT: &str = r#"<script>
+(function(){
+  function setState(tr,text,color){var st=tr.querySelector('.gst');if(st){st.textContent=text;st.style.color=color;}}
+  function makeControl(td,card){
+    var kind=td.getAttribute('data-kind')||'text';
+    var opts=(td.getAttribute('data-opts')||'').split('\u0001');
+    var val=td.textContent||'';
+    td.textContent='';
+    var el;
+    if(kind==='select'){
+      el=document.createElement('select');
+      if(!val){var b=document.createElement('option');b.value='';b.textContent='—';b.selected=true;el.appendChild(b);}
+      var has=false;
+      for(var i=0;i<opts.length;i++){
+        if(opts[i]===''){continue;}
+        var o=document.createElement('option');
+        o.value=opts[i];o.textContent=opts[i];
+        if(opts[i]===val){o.selected=true;has=true;}
+        el.appendChild(o);
+      }
+      if(val&&!has){var e=document.createElement('option');e.value=val;e.textContent=val;e.selected=true;el.appendChild(e);}
+    }else{
+      el=document.createElement('input');
+      if(kind==='date'){el.type='date';}
+      else if(kind==='number'){el.type='number';el.step='any';el.setAttribute('inputmode','decimal');}
+      else{el.type='text';}
+      if(kind==='express'){
+        el.title='格式：物流单号 | 物流公司（竖线两边各一个空格）';
+        el.placeholder='单号 | 快递公司';
+      }
+      el.value=val;
+    }
+    el.className='ginput';
+    el.setAttribute('data-key',td.getAttribute('data-key'));
+    el.setAttribute('data-orig',val);
+    td.appendChild(el);
+    el.addEventListener('change',function(){
+      var tr=td.closest('tr');
+      if(this.value===this.getAttribute('data-orig')){setState(tr,'已存','#3E6B1B');return;}
+      setState(tr,'● 未存','#BA7517');
+      save(tr,card);
+    });
+  }
+  function save(tr,card){
+    var id=tr.getAttribute('data-sub');
+    if(!id||!window.fetch){return;}
+    var saved=card.querySelector('[data-role="saved"]');
+    var err=card.querySelector('[data-role="err"]');
+    var data={};
+    tr.querySelectorAll('.ginput').forEach(function(el){data[el.getAttribute('data-key')]=el.value;});
+    if(err){err.hidden=true;}
+    if(saved){saved.hidden=false;saved.textContent='正在保存…';}
+    fetch('/admin/forms/submission/grid-save',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:Number(id),data:data})})
+      .then(function(r){return r.json()})
+      .then(function(j){
+        if(j&&j.ok){
+          tr.querySelectorAll('.ginput').forEach(function(el){el.setAttribute('data-orig',el.value);});
+          setState(tr,'✓ '+(j.at||''),'#3E6B1B');
+          if(saved){saved.textContent='✓ 已保存 '+(j.at||'');setTimeout(function(){saved.hidden=true;},4000);}
+        }else{
+          setState(tr,'● 没存上','#A32D2D');
+          if(err){err.hidden=false;err.textContent=(j&&j.msg)||'保存失败';}
+        }
+      })
+      .catch(function(){
+        setState(tr,'● 没存上','#A32D2D');
+        if(err){err.hidden=false;err.textContent='网络不通，这一行还没存上';}
+      });
+  }
+  document.querySelectorAll('.gridcard td.gc[data-key]').forEach(function(td){
+    makeControl(td,td.closest('.gridcard'));
+  });
+})();
+</script>"#;
+
 pub fn row(
     id: i64,
     version: &str,
@@ -229,9 +309,12 @@ pub fn grid_cell(col: &GridCol, value: &str, editable: bool) -> String {
 }
 
 /// 网格的表头：三列只读元数据 + 模板字段 + 状态 + 「改」。
+///
+/// 提交人 / 填写时间必须给宽度：`table-layout:fixed` 下无宽度的列会平分剩余空间，
+/// 姓名三四个字就会被挤成两行。
 pub fn grid_head(cols: &[GridCol]) -> String {
     let mut s = String::from(
-        r#"<tr><th class="gnum"></th><th>提交人</th><th>填写时间</th>"#,
+        r#"<tr><th class="gnum"></th><th style="width:80px">提交人</th><th style="width:98px">填写时间</th>"#,
     );
     for c in cols {
         let tag = if c.legacy {
@@ -249,15 +332,7 @@ pub fn grid_head(cols: &[GridCol]) -> String {
     s
 }
 
-/// 网格里"这条还没有记录"的那一行。
-pub fn grid_empty_row(cols: usize) -> String {
-    format!(
-        r#"<tr><td colspan="{n}" class="muted" style="padding:16px 10px">这个筛选下还没有记录</td></tr>"#,
-        n = cols + 5
-    )
-}
-
-pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
+pub fn form_user_row(id: i64, name: &str, enabled: bool, has_password: bool) -> String {
     let tag = if enabled {
         r#"<span class="tag">可用</span>"#
     } else {
@@ -265,7 +340,7 @@ pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
     };
     let label = if enabled { "停用" } else { "启用" };
     format!(
-        r#"<tr><td><b>{name}</b></td><td>{tag}</td>
+        r#"<tr><td><b>{name}</b><br><span class="muted">{password_status}</span></td><td>{tag}</td>
 <td><div class="row"><form method="post" action="/admin/users/toggle" style="display:inline">
 <input type="hidden" name="id" value="{id}"><input type="hidden" name="enabled" value="{want}">
 <button class="ghost" type="submit">{label}</button></form>
@@ -273,12 +348,18 @@ pub fn form_user_row(id: i64, name: &str, enabled: bool) -> String {
 <input type="hidden" name="id" value="{id}">
 <input type="text" name="name" value="{name}" style="width:120px">
 <button class="ghost" type="submit">改名</button></form>
+<form method="post" action="/admin/users/password" style="display:inline">
+<input type="hidden" name="id" value="{id}">
+<input type="password" name="password" placeholder="新密码" minlength="10" required>
+<input type="password" name="password2" placeholder="确认密码" minlength="10" required>
+<button class="ghost" type="submit">重置密码</button></form>
 <form method="post" action="/admin/users/delete" style="display:inline"
   onsubmit="return confirm('删除「{name}」？\n\n他填过的登记会保留（记录里已经存了姓名），只是这个人不能再登录了。')">
 <input type="hidden" name="id" value="{id}">
 <button class="danger" type="submit">删除</button></form></div></td></tr>"#,
         name = crate::escape(name),
         want = if enabled { 0 } else { 1 },
+        password_status = if has_password { "密码已设置" } else { "待设置密码" },
     )
 }
 
@@ -332,6 +413,7 @@ pub struct TplField {
     pub kind: String,
     pub required: bool,
     pub options: Vec<String>,
+    pub group_by_carrier: bool,
 }
 
 /// 字段类型的下拉选项。
@@ -369,6 +451,7 @@ pub fn template_editor(id: i64, name: &str, version: i64, fields: &[TplField]) -
 <td><input type="text" name="f{i}_label" value="{label}" placeholder="订单号"></td>
 <td><select name="f{i}_type">{kind_opts}</select></td>
 <td class="mid"><input type="checkbox" name="f{i}_required" value="1"{req}></td>
+<td class="mid"><input type="checkbox" name="f{i}_group_by_carrier" value="1"{group}></td>
 <td><input type="text" name="f{i}_options" value="{opts}" placeholder="逗号隔开" title="下拉选项，用逗号隔开"></td>
 <td class="mid"><label class="tpl-del"><input type="checkbox" class="tpl-delbox" name="f{i}_del" value="1"> 删</label></td>
 </tr>"#,
@@ -377,6 +460,7 @@ pub fn template_editor(id: i64, name: &str, version: i64, fields: &[TplField]) -
                 label = crate::escape(&f.label),
                 kind_opts = kind_options(&f.kind),
                 req = if f.required { " checked" } else { "" },
+                group = if f.group_by_carrier { " checked" } else { "" },
                 opts = crate::escape(&f.options.join("，")),
             )
         })
@@ -391,6 +475,7 @@ pub fn template_editor(id: i64, name: &str, version: i64, fields: &[TplField]) -
 <td><input type="text" name="f0_label" value=""></td>
 <td><select name="f0_type">{kind_opts}</select></td>
 <td class="mid"><input type="checkbox" name="f0_required" value="1"></td>
+<td class="mid"><input type="checkbox" name="f0_group_by_carrier" value="1"></td>
 <td><input type="text" name="f0_options" value="" title="下拉选项，用逗号隔开"></td>
 <td class="mid"><label class="tpl-del"><input type="checkbox" class="tpl-delbox" name="f0_del" value="1"> 删</label></td>
 </tr>"#,
@@ -407,7 +492,7 @@ pub fn template_editor(id: i64, name: &str, version: i64, fields: &[TplField]) -
 <b>已经填过的登记不受影响</b> —— 每条登记的表格列按提交那一刻的字段定义冻结。</p>
 <table class="tpltbl">
 <tr><th style="width:120px">位置</th><th style="width:118px">标识</th><th style="width:138px">显示名称</th>
-<th style="width:100px">类型</th><th style="width:40px">必填</th><th>下拉选项</th><th style="width:52px">操作</th></tr>
+<th style="width:100px">类型</th><th style="width:40px">必填</th><th style="width:105px">按快递分工作表</th><th>下拉选项</th><th style="width:52px">操作</th></tr>
 {rows}
 </table>
 <div class="row" style="margin-top:12px">
@@ -453,7 +538,7 @@ pub const RECORDS_PAGE: &str = r##"<!DOCTYPE html>
     <a class="ghost" href="/admin?tab=register&amp;sub=preview">回到表单预览</a>
   </div>
   %%BODY%%
-</div></body></html>"##;
+</div>%%SCRIPT%%</body></html>"##;
 
 /* ================================================ 标签页外壳（v0.4 起两级标签） */
 
@@ -1034,53 +1119,6 @@ pub fn sub_tabs(top: &str, active_sub: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
-}
-
-/// 概览里"谁在连服务器"的一行。
-///
-/// 没有心跳，所以"在线"只是"最近 15 分钟内有请求"。时间一律如实显示"N 分钟前"，
-/// 不假装在实时在线。
-pub fn activity_row(act: &crate::db::Activity, now: i64, tz_offset_min: i32) -> String {
-    let online = now - act.at < 15 * 60;
-    let dot = if online { "on" } else { "off" };
-    let status = if online { "在线" } else { "离线" };
-    let who = if act.who.is_empty() {
-        r#"<span class="muted">未登录</span>"#.to_string()
-    } else {
-        crate::escape(&act.who)
-    };
-    let machine = if act.client_id.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<br><span class="muted">{}</span>"#, crate::escape(&act.client_id))
-    };
-    let ago = ago_text(now - act.at);
-    format!(
-        r#"<tr><td><span class="dot {dot}"></span>{who}{machine}</td>
-<td><code>{ip}</code></td>
-<td>{kind}{detail}</td>
-<td>{time}<br><span class="muted">{ago} · {status}</span></td></tr>"#,
-        ip = crate::escape(&act.ip),
-        kind = crate::db::activity_kind_label(&act.kind),
-        detail = if act.detail.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", crate::escape(&act.detail))
-        },
-        time = crate::admin::short_time(act.at, tz_offset_min),
-    )
-}
-
-fn ago_text(secs: i64) -> String {
-    if secs < 60 {
-        "刚刚".to_string()
-    } else if secs < 3600 {
-        format!("{} 分钟前", secs / 60)
-    } else if secs < 86400 {
-        format!("{} 小时前", secs / 3600)
-    } else {
-        format!("{} 天前", secs / 86400)
-    }
 }
 
 /// 概览顶部那几个数字。
