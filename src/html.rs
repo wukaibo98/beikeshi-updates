@@ -6,7 +6,7 @@
 pub const LOGIN: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>登录 · 贝可施更新分发</title>
+<title>登录 · 贝可施客服小工具管理系统</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -24,7 +24,7 @@ button:hover{background:#335915}
 .err{margin-top:12px;color:#A32D2D;font-size:12px}
 </style></head>
 <body><div class="wrap">
-  <h1>贝可施更新分发</h1>
+  <h1>贝可施客服小工具管理系统</h1>
   <p class="sub">请输入管理口令</p>
   <form method="post" action="/admin/login">
     <input type="password" name="token" autofocus required placeholder="管理口令">
@@ -188,7 +188,7 @@ pub fn form_template_row(
 <input type="hidden" name="id" value="{id}"><input type="hidden" name="is_active" value="{want}">
 <button class="ghost" type="submit">{label}</button></form>
 <form method="post" action="/admin/forms/template/delete" style="display:inline"
-  onsubmit="return confirm('删除模板「{name}」？\n\n模板不再出现在列表里、客户端也拉不到。\n已经填过的登记和导出的表格都保留不变。')">
+  onsubmit="return confirm('将模板「{name}」移入已删除模板？\n\n可以之后还原；永久删除时会连同所有填写记录一起删除。')">
 <input type="hidden" name="id" value="{id}">
 <button class="danger" type="submit">删除</button></form>
 </div></td></tr>"#,
@@ -350,8 +350,8 @@ pub fn form_user_row(id: i64, name: &str, enabled: bool, has_password: bool) -> 
 <button class="ghost" type="submit">改名</button></form>
 <form method="post" action="/admin/users/password" style="display:inline">
 <input type="hidden" name="id" value="{id}">
-<input type="password" name="password" placeholder="新密码" minlength="10" required>
-<input type="password" name="password2" placeholder="确认密码" minlength="10" required>
+<input type="password" name="password" placeholder="新密码（可留空）" maxlength="32">
+<input type="password" name="password2" placeholder="确认密码" maxlength="32">
 <button class="ghost" type="submit">重置密码</button></form>
 <form method="post" action="/admin/users/delete" style="display:inline"
   onsubmit="return confirm('删除「{name}」？\n\n他填过的登记会保留（记录里已经存了姓名），只是这个人不能再登录了。')">
@@ -359,7 +359,7 @@ pub fn form_user_row(id: i64, name: &str, enabled: bool, has_password: bool) -> 
 <button class="danger" type="submit">删除</button></form></div></td></tr>"#,
         name = crate::escape(name),
         want = if enabled { 0 } else { 1 },
-        password_status = if has_password { "密码已设置" } else { "待设置密码" },
+        password_status = if has_password { "密码已设置" } else { "空密码（可免密登录）" },
     )
 }
 
@@ -509,13 +509,19 @@ pub fn template_editor(id: i64, name: &str, version: i64, fields: &[TplField]) -
     )
 }
 
-/// 「已删除的模板」清单里的一行 —— 比普通模板多一个【永久删除】。
+/// 「已删除的模板」清单：支持还原和连数据永久删除。
 pub fn deleted_template_row(id: i64, name: &str, when: &str, submissions: i64) -> String {
     format!(
-        r#"<tr><td><b>{name}</b></td><td>{when}</td><td>{subs} 条登记还在</td>
-<td><form method="post" action="/admin/forms/template/purge" style="display:inline"
-  onsubmit="return confirm('永久删除模板「{name}」？\n\n这一行会真的从数据库里删掉，不能再恢复。\n已经填过的登记会保留（表名记在登记里），导出的表格也不受影响。')">
+        r#"<tr><td><b>{name}</b></td><td>{when}</td><td>{subs} 条填写记录</td>
+<td><form method="post" action="/admin/forms/template/restore" style="display:inline"
+  onsubmit="return confirm('还原模板「{name}」？')">
 <input type="hidden" name="id" value="{id}">
+<button class="ghost" type="submit">还原</button></form>
+<form method="post" action="/admin/forms/template/purge" style="display:inline">
+<input type="hidden" name="id" value="{id}">
+<input type="text" name="confirm_name" placeholder="输模板名确认" required
+  style="width:112px" autocomplete="off" spellcheck="false"
+  title="要一字不差地输入左边的模板名（{name}），才会真的删掉。这是防手滑的闸门，服务端会核对。">
 <button class="danger" type="submit">永久删除</button></form></td></tr>"#,
         name = crate::escape(name),
         when = when,
@@ -672,12 +678,12 @@ td.ro{background:#F8FAF3;color:#5F5E5A;padding:7px 8px!important}
 pub const PAGE: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>贝可施更新分发</title>
+<title>贝可施客服小工具管理系统</title>
 <style>%%CSS%%</style></head>
 <body><div class="wrap">
   <div class="top">
     <div>
-      <h1>贝可施更新分发</h1>
+      <h1>贝可施客服小工具管理系统</h1>
       <div class="sub">%%SUBTITLE%%</div>
     </div>
     <form method="post" action="/admin/logout"><button class="ghost" type="submit">退出</button></form>

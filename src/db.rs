@@ -248,6 +248,8 @@ pub struct FormTemplate {
     /// 软删除时间（0 = 没删）。删了之后模板不再出现在列表里，
     /// 但这一行还在 —— 历史提交靠它认模板名，删干净了老记录就只剩个 id。
     pub deleted_at: i64,
+    /// 原模板名称，供回收站展示与还原。
+    pub deleted_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +261,7 @@ pub struct FormSubmission {
     pub template_id: i64,
     pub template_version: i64,
     pub template_snapshot: String,
-    /// 冗余存一份模板名。模板被「永久删除」之后，老记录靠这一列还认得出是哪张表。
+    /// 历史兼容列：旧版本永久删除后保留下来的登记可能依靠此列显示表名。
     pub template_name: String,
     /// 同上：筛选用的是 filter.user_id，这里只是把整行读出来
     #[allow(dead_code)]
@@ -294,7 +296,10 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
             version    INTEGER NOT NULL DEFAULT 1,
             is_active  INTEGER NOT NULL DEFAULT 1,
             sort_order INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            deleted_at INTEGER NOT NULL DEFAULT 0,
+            deleted_name TEXT NOT NULL DEFAULT '',
+            deleted_is_active INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS form_template_versions (
             template_id INTEGER NOT NULL,
@@ -340,9 +345,11 @@ pub(crate) fn init_forms(conn: &Connection) -> rusqlite::Result<()> {
 
     // 老库补列：ALTER 失败说明已经有了，忽略即可
     for sql in [
-        // 模板软删除标记。删模板不能真删 —— 历史提交和已经导出的表格还要靠它认名字。
+        // 模板软删除标记。软删除保留原数据并支持还原；永久删除另行清理关联数据。
         "ALTER TABLE form_templates ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
-        // 冗余存一份模板名。模板被「永久删除」之后，提交记录靠这一列还认得出是哪张表。
+        "ALTER TABLE form_templates ADD COLUMN deleted_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE form_templates ADD COLUMN deleted_is_active INTEGER NOT NULL DEFAULT 1",
+        // 历史兼容列：旧版本永久删除后仍保留的提交记录靠此列显示模板名。
         "ALTER TABLE form_submissions ADD COLUMN template_name TEXT NOT NULL DEFAULT ''",
         // Password login for client accounts. Existing allowlist entries need an admin-set password.
         "ALTER TABLE form_users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''",
@@ -462,13 +469,13 @@ pub enum TemplateSave {
 /// 模板列表。**永远不返回已删除的** —— 删掉的模板不该再出现在任何列表里。
 pub fn form_templates(conn: &Connection, include_inactive: bool) -> rusqlite::Result<Vec<FormTemplate>> {
     let sql = if include_inactive {
-        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_name
            FROM form_templates t
            JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
           WHERE t.deleted_at = 0
           ORDER BY t.sort_order, t.id"
     } else {
-        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_name
            FROM form_templates t
            JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
           WHERE t.is_active = 1 AND t.deleted_at = 0
@@ -485,16 +492,16 @@ pub fn form_templates(conn: &Connection, include_inactive: bool) -> rusqlite::Re
             updated_at: r.get(5)?,
             schema_json: r.get(6)?,
             deleted_at: 0,
+            deleted_name: r.get(7)?,
         })
     })?;
     rows.collect()
 }
 
-/// 全部模板，**含已删除的**。只给"历史记录认名字"用：
-/// 模板删了之后，老提交里显示的仍然是它原来的名字，而不是一个光秃秃的 id。
+/// 全部模板，含回收站中的模板。管理页用它展示回收站，历史登记也用它解析模板名。
 pub fn form_templates_all(conn: &Connection) -> rusqlite::Result<Vec<FormTemplate>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_at
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_at, t.deleted_name
            FROM form_templates t
            JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
           ORDER BY t.sort_order, t.id",
@@ -509,6 +516,7 @@ pub fn form_templates_all(conn: &Connection) -> rusqlite::Result<Vec<FormTemplat
             updated_at: r.get(5)?,
             schema_json: r.get(6)?,
             deleted_at: r.get(7)?,
+            deleted_name: r.get(8)?,
         })
     })?;
     rows.collect()
@@ -516,7 +524,7 @@ pub fn form_templates_all(conn: &Connection) -> rusqlite::Result<Vec<FormTemplat
 
 pub fn form_template_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<FormTemplate>> {
     conn.query_row(
-        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_at
+        "SELECT t.id, t.name, t.version, t.is_active, t.sort_order, t.updated_at, v.schema_json, t.deleted_at, t.deleted_name
            FROM form_templates t
            JOIN form_template_versions v ON v.template_id = t.id AND v.version = t.version
           WHERE t.id = ?",
@@ -531,6 +539,7 @@ pub fn form_template_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Optio
                 updated_at: r.get(5)?,
                 schema_json: r.get(6)?,
                 deleted_at: r.get(7)?,
+                deleted_name: r.get(8)?,
             })
         },
     )
@@ -627,26 +636,43 @@ pub fn form_template_toggle(conn: &Connection, id: i64, is_active: bool) -> rusq
     Ok(())
 }
 
-/// 删模板 —— **软删除**：只打一个时间戳并把名字改成"（已删除）"。
-///
-/// 为什么不能真删：`form_submissions` 里存的是 `template_id`，模板一删，
-/// 历史登记在管理页上就只剩一个 `#3`，导出出来的表格也认不出是哪张表。
-/// 软删除之后模板从列表里消失、客户端也拉不到，但老记录还认得它。
-///
-/// 为什么要改名：`form_templates.name` 上有 UNIQUE，名字被占着的话，
-/// 就没法用同一个名字重新建一个模板了（"删了重做"是最常见的用法）。
-/// 改名之后原名就空出来了。
-///
-/// 已有的登记记录**一个字都不动** —— 这就是"删除模板不影响已经生成的表格"。
+/// 移入回收站：保留模板和登记，保存原名及启用状态供还原使用。
 pub fn form_template_delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
     let changed = conn.execute(
         "UPDATE form_templates
-            SET deleted_at = ?, is_active = 0, updated_at = ?,
+            SET deleted_name = name, deleted_is_active = is_active,
+                deleted_at = ?, is_active = 0, updated_at = ?,
                 name = substr(name, 1, 24) || '（已删除）'
           WHERE id = ? AND deleted_at = 0",
         params![now(), now(), id],
     )?;
     Ok(changed == 1)
+}
+
+#[derive(Debug)]
+pub enum RestoreResult { Restored, NotFound, NotDeleted, NameTaken }
+
+/// 从回收站还原模板，不覆盖已经存在的同名模板。
+pub fn form_template_restore(conn: &Connection, id: i64) -> rusqlite::Result<RestoreResult> {
+    let tx = conn.unchecked_transaction()?;
+    let row: Option<(String, String, i64, bool)> = tx.query_row(
+        "SELECT name, deleted_name, deleted_at, deleted_is_active FROM form_templates WHERE id = ?",
+        params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+    ).optional()?;
+    let Some((current_name, saved_name, deleted_at, was_active)) = row else { return Ok(RestoreResult::NotFound) };
+    if deleted_at <= 0 { return Ok(RestoreResult::NotDeleted) }
+    let original_name = if !saved_name.is_empty() { saved_name } else {
+        current_name.strip_suffix("（已删除）").unwrap_or(&current_name).to_string()
+    };
+    let taken: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM form_templates WHERE name = ? AND id <> ?)",
+        params![original_name, id], |r| r.get(0)
+    )?;
+    if taken { return Ok(RestoreResult::NameTaken) }
+    tx.execute("UPDATE form_templates SET name = ?, deleted_name = '', deleted_at = 0, is_active = ?, updated_at = ? WHERE id = ?",
+        params![original_name, if was_active { 1 } else { 0 }, now(), id])?;
+    tx.commit()?;
+    Ok(RestoreResult::Restored)
 }
 
 /// 模板是否已删。提交时用：模板删了就不该再收新登记。
@@ -661,19 +687,14 @@ pub fn form_template_deleted(conn: &Connection, id: i64) -> rusqlite::Result<boo
     Ok(deleted_at.unwrap_or(0) > 0)
 }
 
-/// **永久删除**一个已经软删掉的模板 —— 这次是真的把行删掉。
+/// **永久删除**一个已移入回收站的模板及其填写数据。
 ///
 /// 只允许删 `deleted_at > 0` 的（没软删过的要走软删除那条路）。
 ///
-/// 关键：**先把模板名写进历史登记**。软删除时模板行还在，历史记录靠查表认名字；
-/// 真删了行就没了，登记里的 `template_id` 会指向一个不存在的模板，
-/// 管理页上就只剩「已删除的模板 #3」。所以删之前把名字冗余进
-/// `form_submissions.template_name`，老登记（那一列为空的）一并补上。
-///
-/// 登记本身**一条都不删** —— 表单的列在 `template_snapshot` 里，导出照常能用。
+/// 模板行、所有字段版本和填写记录在一个事务中删除。
 #[derive(Debug)]
 pub enum PurgeResult {
-    /// 删掉了，连带清掉的历史登记条数
+    /// 删掉了，连带删除的填写记录条数
     Purged { submissions: i64 },
     /// 没有这个模板
     NotFound,
@@ -684,32 +705,21 @@ pub enum PurgeResult {
 pub fn form_template_purge(conn: &Connection, id: i64) -> rusqlite::Result<PurgeResult> {
     let tx = conn.unchecked_transaction()?;
 
-    let row: Option<(String, i64)> = tx
+    let row: Option<i64> = tx
         .query_row(
-            "SELECT name, deleted_at FROM form_templates WHERE id = ?",
+            "SELECT deleted_at FROM form_templates WHERE id = ?",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .optional()?;
-    let Some((name, deleted_at)) = row else {
+    let Some(deleted_at) = row else {
         return Ok(PurgeResult::NotFound);
     };
     if deleted_at <= 0 {
         return Ok(PurgeResult::NotDeleted);
     }
 
-    // 把模板名冗余进历史登记（只补那一列为空的，老数据才有这个需要）
-    let touched = tx.execute(
-        "UPDATE form_submissions
-            SET template_name = ?
-          WHERE template_id = ? AND (template_name IS NULL OR template_name = '')",
-        params![name, id],
-    )?;
-    let submissions = tx.query_row(
-        "SELECT COUNT(*) FROM form_submissions WHERE template_id = ?",
-        params![id],
-        |r| r.get::<_, i64>(0),
-    )?;
+    let submissions = tx.execute("DELETE FROM form_submissions WHERE template_id = ?", params![id])? as i64;
 
     // 字段定义的各版本也跟着清掉
     tx.execute(
@@ -719,9 +729,7 @@ pub fn form_template_purge(conn: &Connection, id: i64) -> rusqlite::Result<Purge
     tx.execute("DELETE FROM form_templates WHERE id = ?", params![id])?;
 
     tx.commit()?;
-    Ok(PurgeResult::Purged {
-        submissions: submissions.max(touched as i64),
-    })
+    Ok(PurgeResult::Purged { submissions })
 }
 
 /* ---------------------------------------------------------- 提交 */

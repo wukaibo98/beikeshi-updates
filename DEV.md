@@ -128,7 +128,7 @@ form_template_versions (template_id, version, schema_json, created_at)  -- 每�
 form_submissions (id, submission_id UNIQUE, template_id, template_version,
                   template_snapshot, user_id, user_name, data_json,
                   client_time, created_at, client_id,
-                  template_name)              -- v0.5 加：模板名冗余，永久删除后仍认得出表名
+                  template_name)              -- v0.5 历史兼容列（旧版本永久删除遗留记录）
 ```
 
 关键语义：
@@ -136,15 +136,9 @@ form_submissions (id, submission_id UNIQUE, template_id, template_version,
 - **`template_snapshot` 是提交那一刻的字段定义，冻结不动。**
   模板一改，历史提交的列就变了；导出按每条提交自带的快照取列，永不串行。
   配套：`form_template_versions` 保存**每个版本**的定义，旧的也能取回来。
-- **`template_name` 是模板名的冗余副本（v0.5）**。软删除时模板行还在，名字从
-  `form_templates.name` 取就够；但**永久删除**会把模板行真删掉，历史登记就会变成
-  一个认不出表名的孤儿。所以在永久删除那一刻，**先把模板名写进这一列**再删行 ——
-  顺序不能反（先删行就拿不到名字了）。
-  - 这一列在 `form_submissions` 里是 `NOT NULL DEFAULT ''`，
-    老库靠 `ALTER TABLE ... ADD COLUMN template_name TEXT NOT NULL DEFAULT ''` 补上。
-  - 加列之前提交的老登记，这一列是**空串** —— 这是预期的，
-    它们本来就在模板行还完整的时候提交过，名字随时能从 `form_templates` 取到；
-    只有走永久删除时才会被补上。
+- **`template_name` 是模板名的历史兼容冗余列（v0.5）**。旧版本永久删除模板时会保留登记并填写此列，旧库因此可能存在已脱离模板行的历史记录。当前永久删除策略已改为连同填写记录一起删除；新提交仍填充该列，供旧数据兼容与历史导出使用。
+  - 该列为 `NOT NULL DEFAULT ''`，老库通过 `ALTER TABLE ... ADD COLUMN template_name TEXT NOT NULL DEFAULT ''` 补上。
+  - 当前模板回收站及永久删除行为见 §4.17。
 - **`submission_id UNIQUE` + `ON CONFLICT DO NOTHING`** 是幂等的命根子。
   客户端生成一次，所有重试用同一个；服务端返回 `duplicate` 也算成功
   （客户端只有看到成功才会清队列，网络超时其实已入库时重试不会产生第二条）。
@@ -527,37 +521,21 @@ f1_pos=2   f1_key=reason     ...
 - 页面骨架是 `html::RECORDS_PAGE`，复用 `html::CSS`（v0.5 把样式从 `PAGE` 里抽出来了，
   两个页面共用一套，不复制粘贴）。
 
-### 4.17 模板永久删除（v0.5）
+### 4.17 模板还原与永久删除（ChatGPT 修改，2026-10-31，尚未部署）
 
-「模板管理 → 已删除的模板」里每个软删模板多一个**【永久删除】**按钮，
-点之前有 confirm 二次确认。
+软删除会保存原名称及原启用状态到 `deleted_name`、`deleted_is_active`，将模板移入回收站并暂时保留填写记录。管理员可通过 `POST /admin/forms/template/restore` 还原。若原名称已被占用，返回 `NameTaken`，不修改数据库；旧数据中没有保存原名称时，会尝试从「（已删除）」后缀恢复。
 
-`db::form_template_purge()` 在**一个事务**里做三件事：
+永久删除接口 `POST /admin/forms/template/purge` 只接受已软删除模板（`deleted_at > 0`），并在一个事务中清理全部相关数据：
 
 ```sql
--- 1. 先把模板名冗余进历史登记（顺序不能反：先删行就拿不到名字了）
-UPDATE form_submissions SET template_name = ? WHERE template_id = ? AND (template_name IS NULL OR template_name = '');
--- 2. 删掉这个模板的字段定义历史版本
+DELETE FROM form_submissions WHERE template_id = ?;
 DELETE FROM form_template_versions WHERE template_id = ?;
--- 3. 删掉模板行本身
 DELETE FROM form_templates WHERE id = ?;
 ```
 
-返回三态 `PurgeResult`：
+`PurgeResult::Purged { submissions }` 中的 `submissions` 是实际删除的填写记录数。模板不存在返回 `NotFound`，模板尚未软删除返回 `NotDeleted`。事务失败时整体回滚。永久删除不可恢复，管理页面二次确认明确告知填写记录也会一起删除。
 
-| 返回 | 含义 |
-|---|---|
-| `Purged { submissions }` | 删掉了，`submissions` 是这个模板名下的历史登记条数 |
-| `NotFound` | 没有这个模板（id 不存在） |
-| `NotDeleted` | **还没软删过** —— 必须先走「删除」 |
-
-- **`NotDeleted` 是故意的闸门**：没删过的模板直接调永久删除会抹掉一张还在用的表。
-  要求先软删除，等于强迫操作者先看一眼"这个表有人填过吗"。
-- **历史登记一条都不删**。删模板是"不想要这张表了"，不是"连填过的记录一起抹掉"。
-- 冗余名只补**这一列为空**的那些行（`(template_name IS NULL OR template_name = '')`）——
-  老登记本来就靠 `form_templates.name` 取名字，不用动。
-- `form_template_versions` 要一起删：那是这个模板的字段定义历史，模板都没了，
-  留着只是垃圾，还会让人误以为能回滚到一个已经不存在模板的版本。
+数据库迁移为 `form_templates` 增加 `deleted_name` 与 `deleted_is_active` 两列。此前软删除的模板可能无法精确恢复超过旧截断长度的原名称；新执行的软删除会完整保存名称。
 
 ### 4.18 NAS 上已经有 OnlyOffice 了（2026-10-29 侦察结论，暂未接入）
 
@@ -933,7 +911,7 @@ v0.5 新增 6 项：
 | `网页版编辑器_解析出字段并按位置排序` | `f{i}_{属性}` 能收成字段，顺序按 `pos` 不按下标 |
 | `网页版编辑器_删掉的行和空行都不算` | 勾「删」的行、`key` 为空的行都不进结果 |
 | `提交时把模板名冗余存进登记` | `form_submissions.template_name` 有值 |
-| `永久删除后模板行没了但登记和名字都还在` | 模板行真删，登记一条不少，名字认得出 |
+| `永久删除后模板行没了但登记和名字都还在`（旧版策略） | 仅记录 2026-10-29 旧实现；当前行为会连同登记一起删除 |
 | `没删过的模板不能永久删除` | 返回 `NotDeleted`（闸门有效） |
 | `永久删除会清掉字段定义的历史版本` | `form_template_versions` 里该模板的行被清掉 |
 
@@ -1033,7 +1011,7 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 | 依赖层缓存 | Dockerfile 里 `touch src/main.rs` 不能少，否则编出来的镜像是空壳 |
 | 仓库名 | workflow 用 `github.repository` 当镜像名，仓库必须叫 `beikeshi-updates` |
 | 端口 | 容器内 8080，NAS 映射 50205；公网走 Lucky 反代到 `:54321`。改这里要同时改客户端里的两个地址常量 |
-| 模板永久删除前不先冗余名字 | 模板行一删，历史登记就变成认不出表名的孤儿。先 `UPDATE ... SET template_name` 再 `DELETE`，**顺序不能反** |
+| 新永久删除后仍有填写记录 | 当前流程应在同一事务删除该模板的所有 `form_submissions`；检查 `form_template_purge` 的 DELETE 与事务回滚 |
 | `form_submissions.template_name` 加列 | 老库要 `ALTER TABLE ... ADD COLUMN template_name TEXT NOT NULL DEFAULT ''`；**别删**，NAS 上那份库是 v0.4 建的 |
 | 浏览器表单收不了数组 | `serde_urlencoded` 遇到同名参数只保留最后一个，`key[]=a&key[]=b` 会丢。字段属性必须用独立名字 `f{i}_{属性}` |
 | `f{i}` 下标 ≠ 最终位置 | 下标只是收集时的临时下标（删一行后下标会跳）。排序的权威是 `f{i}_pos`，按 `pos` 排 |
@@ -1076,10 +1054,10 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 ## 13. 客服账号密码（2026-10-31，ChatGPT 修改，未发布）
 
 - `form_users.name` 同时作为账号和记录展示名；新增 `password_hash`（Argon2id 编码串）和 `auth_version`。
-- 老库迁移给 `password_hash` 空值；管理员必须给既有账号设初始密码。新客服添加时要求填写并确认至少 10 字符密码。
+- 老库 `password_hash` 为空表示免密登录；管理员也可设置非空密码。现行规则（2026-10-31 后续调整）：密码可空，非空最多 32 个字符，只允许英文字母、数字、`@`、`.`；不再做最小长度或复杂性校验。
 - `/form/login` 校验姓名账号与密码，失败按来源 IP 每 15 分钟最多 5 次；登录流程不保存或回传密码。
 - 客服可通过 `/form/password/change` 验证旧密码并改密。管理员可重置密码；改名、改密、停用或启用都会递增 `auth_version`，旧令牌随即失效。
-- 登录令牌包含账号版本。客户端不能再用已存姓名自动续登；令牌过期后需重新输入密码。部署需先发新版客户端，再更新服务端，并给老账号设置初始密码。
+- 登录令牌包含账号版本。客户端不能再用已存姓名自动续登；令牌过期后需按当前密码规则重新登录。原密码包含其他符号或超过 32 个字符的账号，需管理员重置后再登录。
 
 
 ## 14. 2026-10-31 功能修改记录（ChatGPT 修改，未部署）
@@ -1089,3 +1067,16 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 - 分组导出：当前模板中至多一个物流字段勾选 `groupByCarrier` 后，导出生成单个 xlsx，各公司单独一个 sheet；缺公司值归入「未识别或未填写」。sheet 名按 Excel 限制清洗并处理重名。历史模板快照用于生成列，分组字段配置取当前模板。
 - 记录页：预览中只保留模板名称、记录数和操作按钮；「上传记录」独立页显示最近 200 条可编辑网格，提交仍共用 `apply_submission_edit()` 和快照校验。
 - 编译：`cargo build --release` 0 warning；`cargo test --release` **38 项全过**；功能尚未部署。
+
+
+## 15. 密码规则调整（2026-10-31，ChatGPT 修改，未部署）
+
+- 取消最小长度和复杂性校验。密码可为空；非空密码最多 32 个字符，仅允许 ASCII 英文字母、数字、`@`、`.`。客户端、服务端登录、管理员新增/重置和客服修改密码使用同一规则。
+- 空字符串在库中用空 `password_hash` 表示；`password_matches` 仅在提交密码也为空时通过。旧库原本未设密码的客服账号因此可免密登录；管理员仍可设置密码或通过空密码重置。
+- 客户端登录框以 placeholder 提示「默认密码：123456」，不自动填充；管理员需要把该账号密码设置为 `123456` 才能用它登录。
+- 以前设置的密码若含其他符号或超过 32 个字符，将无法通过新客户端校验；管理员需重置。
+- 新增代码已完成；构建检查状态与部署记录见本轮交接文档。
+
+### 管理页面标题与模板回收站（2026-10-31，ChatGPT 修改，尚未部署）
+
+管理页面标题为「贝可施客服小工具管理系统」。模板删除进入回收站，可还原；永久删除在事务中清除模板、字段版本和全部填写记录。恢复时检查模板名称唯一性。

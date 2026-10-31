@@ -275,8 +275,7 @@ fn current_user(state: &AppState, headers: &HeaderMap) -> Option<db::FormUser> {
     if user.enabled && user.auth_version == auth_version { Some(user) } else { None }
 }
 
-const PASSWORD_MIN_CHARS: usize = 10;
-const PASSWORD_MAX_BYTES: usize = 512;
+const PASSWORD_MAX_CHARS: usize = 32;
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_MAX_FAILURES: u32 = 5;
 static LOGIN_FAILURES: OnceLock<Mutex<BTreeMap<String, (u32, Instant)>>> = OnceLock::new();
@@ -307,20 +306,27 @@ fn clear_login_failures(ip: &str) {
     }
 }
 
-fn hash_password(password: &str) -> Result<String, String> {
+pub(crate) fn hash_password(password: &str) -> Result<String, String> {
+    if password.is_empty() { return Ok(String::new()); }
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default().hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string()).map_err(|e| e.to_string())
 }
 
-fn password_matches(password: &str, encoded_hash: &str) -> bool {
+pub(crate) fn password_matches(password: &str, encoded_hash: &str) -> bool {
+    if encoded_hash.is_empty() { return password.is_empty(); }
     let Ok(hash) = PasswordHash::new(encoded_hash) else { return false };
     Argon2::default().verify_password(password.as_bytes(), &hash).is_ok()
 }
 
+fn validate_password(password: &str) -> Result<(), &'static str> {
+    if password.chars().count() > PASSWORD_MAX_CHARS { return Err("密码最多 32 个字符") }
+    if !password.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'@' || b == b'.') { return Err("密码只允许英文字母、数字、@ 和 .") }
+    Ok(())
+}
+
 fn validate_new_password(password: &str, confirmation: &str) -> Result<(), &'static str> {
-    if password.chars().count() < PASSWORD_MIN_CHARS { return Err("密码至少 10 个字符") }
-    if password.len() > PASSWORD_MAX_BYTES { return Err("密码过长") }
+    validate_password(password)?;
     if password != confirmation { return Err("两次输入的密码不一致") }
     Ok(())
 }
@@ -377,6 +383,12 @@ pub async fn login(
     if name.chars().count() > 20 {
         return bad(StatusCode::BAD_REQUEST, "姓名太长");
     }
+    // 登录只比对哈希，**不校验字符集**：老账号可能设过中文密码或超过 32 位，
+    // 按新规则去卡它，会让人明明密码对却登不进去（还提示"只允许字母数字"）。
+    // 这里只挡一下超长的，免得白烧 argon2 的 CPU。
+    if req.password.len() > 512 {
+        return bad(StatusCode::BAD_REQUEST, "密码过长");
+    }
     let ip = crate::peer_ip(&headers, Some(addr));
     if login_is_limited(&ip) {
         return bad(StatusCode::TOO_MANY_REQUESTS, "登录尝试过多，请 15 分钟后再试");
@@ -390,9 +402,6 @@ pub async fn login(
         note_login_failure(&ip);
         return bad(StatusCode::UNAUTHORIZED, "账号或密码错误");
     };
-    if user.password_hash.is_empty() {
-        return bad(StatusCode::FORBIDDEN, "账号尚未设置密码，请联系管理员");
-    }
     let password = req.password.clone();
     let encoded_hash = user.password_hash.clone();
     let valid = match tokio::task::spawn_blocking(move || password_matches(&password, &encoded_hash)).await {
@@ -1084,7 +1093,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
                     .unwrap_or(0);
                 html::deleted_template_row(
                     t.id,
-                    &t.name,
+                    if t.deleted_name.is_empty() { &t.name } else { &t.deleted_name },
                     &crate::admin::short_time(t.deleted_at, state.cfg.tz_offset_min),
                     subs,
                 )
@@ -1100,7 +1109,7 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
             .collect::<Vec<_>>()
             .join("");
         let user_rows = if user_rows.is_empty() {
-            r#"<tr><td colspan="3" class="muted">还没有人，添加账号并设置初始密码后才能登录</td></tr>"#.to_string()
+            r#"<tr><td colspan="3" class="muted">还没有客户端账号。</td></tr>"#.to_string()
         } else {
             user_rows
         };
@@ -1236,16 +1245,18 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
       {tpl_rows}
     </table>
     <p class="muted" style="margin-top:12px">
-      「停用」只是不让客户端再显示；「删除」是把模板从列表里去掉 ——
-      <b>已经填过的登记和已经导出的表格都保留不变</b>，历史记录里还是原来那张表。
+      「停用」只是不让客户端再显示；「删除」是把模板移进下面的「已删除的模板」——
+      这一步<b>不动填写记录，还能还原</b>。
+      只有那里点「永久删除」才会连模板、字段版本和填写记录一起从库里删掉。
     </p>
   </div>
   <div class="card">
-    <h2>已删除的模板<span class="muted">从列表里删掉了，但填过的登记和导出的表格都还在</span></h2>
+    <h2>已删除的模板<span class="muted">可还原；永久删除会同时删除模板、字段版本和全部填写记录</span></h2>
     {deleted}
     <p class="muted" style="margin-top:10px">
-      「永久删除」会把这一行真的从数据库里删掉，不能恢复 ——
-      但<b>已经填过的登记会保留</b>（表名记在登记里，导出的表格也不受影响）。
+      「还原」会恢复模板名称和原启用状态；名称已被占用时需要先处理重名。
+      「永久删除」不可恢复，会同时删除模板、字段版本和该模板的全部填写记录 ——
+      所以要先在框里<b>一字不差地打出模板名</b>，服务端核对一致才会真的删。
     </p>
   </div>"##,
         deleted = if deleted_rows.is_empty() {
@@ -1264,10 +1275,10 @@ pub fn panes(state: &AppState, q: &AdminQuery) -> AdminPanes {
     <h2>客户端（谁能填表）</h2>
     <form method="post" action="/admin/users/save" class="row" style="margin-bottom:12px">
       <input type="text" name="name" placeholder="中文姓名" required>
-      <input type="password" name="password" placeholder="初始密码（至少 10 位）" minlength="10" required>
-      <input type="password" name="password2" placeholder="确认初始密码" minlength="10" required>
+      <input type="password" name="password" placeholder="初始密码（留空=免密登录）" maxlength="32">
+      <input type="password" name="password2" placeholder="确认初始密码" maxlength="32">
       <button type="submit">添加</button>
-      <span class="muted">姓名是登录账号；管理员设置初始密码，客服可登录后修改</span>
+      <span class="muted">姓名是登录账号；密码最多 32 位，仅字母、数字、@、.；留空表示免密登录</span>
     </form>
     <table>
       <tr><th>姓名</th><th>状态</th><th>操作</th></tr>
@@ -1541,8 +1552,7 @@ pub struct TemplateDeleteForm {
     id: i64,
 }
 
-/// 删模板。**软删除**：模板从列表里消失、客户端也拉不到，
-/// 但模板这一行还在库里 —— 历史登记还认得它的名字，已经导出的表格也不受影响。
+/// 将模板移入回收站；填写记录暂时保留，直到永久删除。
 pub async fn admin_template_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1556,37 +1566,70 @@ pub async fn admin_template_delete(
         db::form_template_delete(&conn, form.id)
     };
     match result {
-        Ok(true) => redirect_ok(
-            "register",
-            "templates",
-            "已删除；已经填过的登记和导出的表格都保留不变",
-        ),
+        Ok(true) => redirect_ok("register", "templates", "模板已移入已删除列表；可还原或永久删除"),
         Ok(false) => redirect_err("register", "templates", "没有这个模板（或已经删过了）"),
         Err(e) => redirect_err("register", "templates", &format!("删除失败：{e}")),
     }
 }
 
-/// **永久删除**一个已经软删掉的模板 —— 这次是真的把行从数据库里删掉。
+/// 永久删除的表单：多一个 `confirm_name` —— 必须一字不差打出模板原名。
 ///
-/// 只允许删已经「删除」过的。删之前会把模板名冗余进历史登记，
-/// 所以登记和导出的表格都还在，只是这个模板本身不再占地方了。
+/// 这一道是**服务端**的闸门，不是靠前端 confirm 糊弄：
+/// 永久删除会连填写记录一起删，手滑点错就没了，值得让人多打几个字。
+#[derive(Deserialize)]
+pub struct TemplatePurgeForm {
+    id: i64,
+    #[serde(default)]
+    confirm_name: String,
+}
+
+/// 模板的原名：优先 `deleted_name`，老数据没有就从「（已删除）」后缀还原。
+pub fn template_original_name(t: &db::FormTemplate) -> String {
+    let saved = t.deleted_name.trim();
+    if !saved.is_empty() {
+        return saved.to_string();
+    }
+    t.name
+        .strip_suffix("（已删除）")
+        .unwrap_or(&t.name)
+        .to_string()
+}
+
+/// 永久删除回收站中的模板、字段版本和全部填写记录。
+///
+/// **必须带上正确的模板名**（`confirm_name`）才会执行 —— 服务端核对，
+/// 光在浏览器里绕开 confirm 没用。
 pub async fn admin_template_purge(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<TemplateDeleteForm>,
+    Form(form): Form<TemplatePurgeForm>,
 ) -> Response {
     if !crate::is_admin(&headers, &state) {
         return redirect_err("register", "templates", "请先登录");
     }
+    let typed = form.confirm_name.trim().to_string();
     let result = {
         let conn = state.conn.get().unwrap();
-        db::form_template_purge(&conn, form.id)
+        match db::form_template_by_id(&conn, form.id).ok().flatten() {
+            None => Err("没有这个模板".to_string()),
+            Some(t) => {
+                let original = template_original_name(&t);
+                if typed != original {
+                    Err(format!(
+                        "永久删除要手打模板名「{original}」确认，输入框里填的不一样，已取消（什么都没删）"
+                    ))
+                } else {
+                    db::form_template_purge(&conn, form.id)
+                        .map_err(|e| format!("永久删除失败：{e}"))
+                }
+            }
+        }
     };
     match result {
         Ok(db::PurgeResult::Purged { submissions }) => redirect_ok(
             "register",
             "templates",
-            &format!("已永久删除；{submissions} 条登记保留不变（表名记在登记里）"),
+            &format!("已永久删除模板及 {submissions} 条填写记录"),
         ),
         Ok(db::PurgeResult::NotFound) => {
             redirect_err("register", "templates", "没有这个模板")
@@ -1594,9 +1637,25 @@ pub async fn admin_template_purge(
         Ok(db::PurgeResult::NotDeleted) => redirect_err(
             "register",
             "templates",
-            "这个模板还没删过，先点「删除」再永久删除",
+            "模板不在已删除列表中，不能永久删除",
         ),
-        Err(e) => redirect_err("register", "templates", &format!("永久删除失败：{e}")),
+        Err(msg) => redirect_err("register", "templates", &msg),
+    }
+}
+
+pub async fn admin_template_restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TemplateDeleteForm>,
+) -> Response {
+    if !crate::is_admin(&headers, &state) { return redirect_err("register", "templates", "请先登录"); }
+    let result = { let conn = state.conn.get().unwrap(); db::form_template_restore(&conn, form.id) };
+    match result {
+        Ok(db::RestoreResult::Restored) => redirect_ok("register", "templates", "模板已还原"),
+        Ok(db::RestoreResult::NotFound) => redirect_err("register", "templates", "没有这个模板"),
+        Ok(db::RestoreResult::NotDeleted) => redirect_err("register", "templates", "这个模板不在已删除列表中"),
+        Ok(db::RestoreResult::NameTaken) => redirect_err("register", "templates", "还原失败：原模板名称已被占用，请先处理同名模板"),
+        Err(e) => redirect_err("register", "templates", &format!("还原失败：{e}")),
     }
 }
 

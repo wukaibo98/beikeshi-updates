@@ -302,6 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/users/password", post(forms::user_password_reset))
         .route("/admin/forms/template/toggle", post(forms::admin_template_toggle))
         .route("/admin/forms/template/delete", post(forms::admin_template_delete))
+        .route("/admin/forms/template/restore", post(forms::admin_template_restore))
         .route("/admin/forms/template/purge", post(forms::admin_template_purge))
         .route(
             "/admin/forms/template/{id}/edit",

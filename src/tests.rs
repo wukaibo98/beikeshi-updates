@@ -557,7 +557,7 @@ fn 提交时把模板名冗余存进登记() {
 }
 
 #[test]
-fn 永久删除后模板行没了但登记和名字都还在() {
+fn 永久删除后模板和填写记录都真删除() {
     let conn = fresh();
     let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
     db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
@@ -594,16 +594,11 @@ fn 永久删除后模板行没了但登记和名字都还在() {
         "再查也查不到这个模板"
     );
 
-    // 登记一条不少，而且名字被补上了
+    // 填写记录也必须一并删除
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM form_submissions", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(n, 1, "永久删除模板不能动已经填过的登记");
-
-    let name: String = conn
-        .query_row("SELECT template_name FROM form_submissions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(name, "客户需求表（已删除）", "名字要补进登记里，历史才认得出来");
+    assert_eq!(n, 0, "永久删除模板必须同时删除其填写记录");
 }
 
 #[test]
@@ -894,4 +889,109 @@ fn 多工作表导出_重名的表自动加后缀() {
     let long = "很长的快递公司名称".repeat(3); // 超过 31 字
     let sheets = [(&t, long.clone()), (&t, long.clone())];
     assert!(crate::xlsx::write_xlsx_sheets(&sheets).is_ok(), "长名字撞名不能报错");
+}
+
+/* ---------------------------- 2026-10-31 后续：回收站还原 + 空密码免密 */
+
+#[test]
+fn 回收站还原_名字和原来的启用状态都恢复() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    // 先停用，再删除 —— 还原后应该还是停用状态
+    db::form_template_toggle(&conn, 1, false).unwrap();
+    assert!(db::form_template_delete(&conn, 1).unwrap());
+
+    let t = db::form_templates_all(&conn).unwrap().remove(0);
+    assert_eq!(t.name, "客户需求表（已删除）", "软删除要改名腾出 UNIQUE");
+    assert_eq!(t.deleted_name, "客户需求表", "原名要存进 deleted_name");
+
+    match db::form_template_restore(&conn, 1).unwrap() {
+        db::RestoreResult::Restored => {}
+        other => panic!("应该能还原，实际 {other:?}"),
+    }
+    let t = db::form_templates_all(&conn).unwrap().remove(0);
+    assert_eq!(t.name, "客户需求表", "还原要把原名还回去");
+    assert_eq!(t.deleted_at, 0);
+    assert!(!t.is_active, "删除前是停用的，还原后还得是停用");
+    assert_eq!(t.deleted_name, "");
+}
+
+#[test]
+fn 回收站还原_原名字被占了就不还原而且库不动() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    db::form_template_delete(&conn, 1).unwrap();
+    // 用原名再建一个（软删除已经腾出了 UNIQUE）
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+
+    match db::form_template_restore(&conn, 1).unwrap() {
+        db::RestoreResult::NameTaken => {}
+        other => panic!("重名应该拒绝，实际 {other:?}"),
+    }
+    let t = db::form_template_by_id(&conn, 1).unwrap().unwrap();
+    assert_eq!(t.name, "客户需求表（已删除）", "被拒时不能改库");
+    assert!(t.deleted_at > 0);
+}
+
+#[test]
+fn 回收站还原_没删过的模板不能被还原() {
+    let conn = fresh();
+    let v1 = schema(r#"[{"key":"a","label":"A","type":"text"}]"#);
+    db::form_template_save(&conn, None, "客户需求表", &v1, None, 0).unwrap();
+    match db::form_template_restore(&conn, 1).unwrap() {
+        db::RestoreResult::NotDeleted => {}
+        other => panic!("没删过的应该返回 NotDeleted，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn 空密码账号_只有空密码能登进来() {
+    // 空哈希 = 免密登录；但只要传了非空密码，就不能过
+    assert!(crate::forms::password_matches("", ""), "空哈希 + 空密码 = 免密");
+    assert!(!crate::forms::password_matches("123456", ""), "空哈希不接受任何非空密码");
+
+    // 有哈希时必须比对
+    let conn = fresh();
+    db::form_user_save(&conn, None, "张三", None).unwrap();
+    let empty: String = conn
+        .query_row("SELECT password_hash FROM form_users WHERE name='张三'", [], |r| r.get(0))
+        .unwrap();
+    assert!(empty.is_empty(), "不传密码创建出来的是空哈希");
+}
+
+#[test]
+fn 空密码存空串_一位密码也能正常哈希比对() {
+    // 空密码不存哈希，存空串 —— 这是"免密登录"的开关
+    assert_eq!(crate::forms::hash_password("").unwrap(), "");
+    // 没有最小长度限制，一位也能设
+    let h = crate::forms::hash_password("a").unwrap();
+    assert!(h.starts_with("$argon2"), "应该是 argon2 编码串");
+    assert!(crate::forms::password_matches("a", &h));
+    assert!(!crate::forms::password_matches("b", &h));
+}
+
+#[test]
+fn 模板原名_优先用删除时存下的那份() {
+    let mut t = db::FormTemplate {
+        id: 1,
+        name: "客户需求表（已删除）".into(),
+        version: 1,
+        is_active: false,
+        sort_order: 0,
+        updated_at: 0,
+        schema_json: "{}".into(),
+        deleted_at: 123,
+        deleted_name: "客户需求表".into(),
+    };
+    assert_eq!(crate::forms::template_original_name(&t), "客户需求表");
+
+    // 老数据没存 deleted_name：从「（已删除）」后缀还原
+    t.deleted_name = String::new();
+    assert_eq!(crate::forms::template_original_name(&t), "客户需求表");
+
+    // 连后缀都没有（理论上不该出现）：原样返回，宁可不删也不猜
+    t.name = "客户需求表".into();
+    assert_eq!(crate::forms::template_original_name(&t), "客户需求表");
 }
