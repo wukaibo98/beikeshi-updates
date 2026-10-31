@@ -150,6 +150,26 @@ fn valid_key(key: &str) -> bool {
         && !key.starts_with(|c: char| c.is_ascii_digit())
 }
 
+/// 一个物流快递字段最多几条单号（防误操作/滥用）。客户端也是 20。
+pub const MAX_EXPRESS_ITEMS: usize = 20;
+
+/// 把 express 字段的值规整成「(单号, 公司)」列表。
+/// 新格式是数组 `[{tracking_number, carrier}, ...]`；老数据是单个对象 —— 都认。
+pub(crate) fn express_items(value: Option<&Value>) -> Vec<(String, String)> {
+    fn one(v: &Value) -> (String, String) {
+        (
+            v.get("tracking_number").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            v.get("carrier").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+        )
+    }
+    match value {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items.iter().map(one).collect(),
+        Some(v @ Value::Object(_)) => vec![one(v)],
+        Some(_) => Vec::new(),
+    }
+}
+
 /// 按 schema 校验一份提交数据。返回「字段 key → 错误人话」，空表示全部通过。
 pub fn validate_data(schema: &Schema, data: &Map<String, Value>) -> BTreeMap<String, String> {
     let mut errs = BTreeMap::new();
@@ -157,15 +177,37 @@ pub fn validate_data(schema: &Schema, data: &Map<String, Value>) -> BTreeMap<Str
     for f in &schema.fields {
         let raw = data.get(&f.key);
         if f.kind == "express" {
-            let (number, carrier) = raw.and_then(Value::as_object).map(|v| (
-                v.get("tracking_number").and_then(Value::as_str).unwrap_or("").trim(),
-                v.get("carrier").and_then(Value::as_str).unwrap_or("").trim(),
-            )).unwrap_or(("", ""));
-            if f.required && (number.is_empty() || carrier.is_empty()) {
-                errs.insert(f.key.clone(), "请填写物流单号并选择物流公司".into());
+            // 空行（加了行又没填）先丢掉
+            let items: Vec<(String, String)> = express_items(raw)
+                .into_iter()
+                .filter(|(n, c)| !n.is_empty() || !c.is_empty())
+                .collect();
+            if items.len() > MAX_EXPRESS_ITEMS {
+                errs.insert(f.key.clone(), format!("物流单号最多 {MAX_EXPRESS_ITEMS} 条"));
+                continue;
             }
-            if number.chars().count() > 60 { errs.insert(f.key.clone(), "物流单号最多 60 字".into()); }
-            if carrier.chars().count() > 30 { errs.insert(f.key.clone(), "物流公司最多 30 字".into()); }
+            if f.required && items.is_empty() {
+                errs.insert(f.key.clone(), "请填写物流单号并选择物流公司".into());
+                continue;
+            }
+            for (number, carrier) in &items {
+                if number.is_empty() {
+                    errs.insert(f.key.clone(), "请填写物流单号".into());
+                    break;
+                }
+                if carrier.is_empty() {
+                    errs.insert(f.key.clone(), "请选择物流公司".into());
+                    break;
+                }
+                if number.chars().count() > 60 {
+                    errs.insert(f.key.clone(), "物流单号最多 60 字".into());
+                    break;
+                }
+                if carrier.chars().count() > 30 {
+                    errs.insert(f.key.clone(), "物流公司最多 30 字".into());
+                    break;
+                }
+            }
             continue;
         }
         let text = match raw {
@@ -1355,12 +1397,23 @@ fn select_options(items: &[(String, String)], selected: Option<&str>, all_label:
 }
 
 fn value_text(v: &Value) -> String {
+    fn one(obj: &Value) -> String {
+        format!(
+            "{} | {}",
+            obj.get("tracking_number").and_then(Value::as_str).unwrap_or(""),
+            obj.get("carrier").and_then(Value::as_str).unwrap_or("")
+        )
+    }
     match v {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),
-        Value::Object(obj) if obj.contains_key("tracking_number") && obj.contains_key("carrier") => {
-            format!("{} | {}", obj.get("tracking_number").and_then(Value::as_str).unwrap_or(""), obj.get("carrier").and_then(Value::as_str).unwrap_or(""))
-        }
+        Value::Array(items) => items
+            .iter()
+            .map(one)
+            .filter(|s| s != " | ")
+            .collect::<Vec<_>>()
+            .join(" / "),
+        Value::Object(_obj) if v.get("tracking_number").is_some() && v.get("carrier").is_some() => one(v),
         other => other.to_string(),
     }
 }
@@ -1757,7 +1810,11 @@ pub async fn template_records(
     let cols = grid_columns(current.as_ref(), &parsed);
     let grid_rows = rows.iter().enumerate().map(|(i, r)| {
         let data = &parsed[i].1;
-        let cells = cols.iter().map(|c| html::grid_cell(c, &data.get(&c.key).map(value_text).unwrap_or_default(), !c.legacy)).collect::<String>();
+        let cells = cols.iter().map(|c| {
+            // 快递字段多单号，网格里只读（引导去客户端改）
+            let editable = !c.legacy && c.kind != "express";
+            html::grid_cell(c, &data.get(&c.key).map(value_text).unwrap_or_default(), editable)
+        }).collect::<String>();
         // 行尾「改」：没开 JS 时格子是纯文本，靠它整页打开登记编辑表单（有 JS 时基本用不到，
         // 因为格子本身就能改）。表头有这一列，行里也必须有，不然就是「写着改、点不到」。
         format!(r#"<tr data-sub="{id}"><td class="gnum">{n}</td><td class="ro">{user}</td><td class="ro">{time}</td>{cells}<td class="gst">已存</td><td class="gact"><a class="ghost" href="/admin?tab=register&amp;sub=preview&amp;rec={id}" title="打开这条登记的完整表单">改</a></td></tr>"#,
@@ -2095,14 +2152,15 @@ pub(crate) fn apply_submission_edit(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
     for f in &schema.fields {
+        // 物流快递字段在网格里只读（多单号 + 自动识别），不走这条编辑路径 —— 引导去客户端改
+        if f.kind == "express" {
+            continue;
+        }
         if let Some(v) = values.get(&f.key) {
             let v = v.trim();
             if v.is_empty() {
                 // 清空 = 删掉这个键，跟客服在客户端填表时的语义一致
                 data.remove(&f.key);
-            } else if f.kind == "express" {
-                let (tracking_number, carrier) = v.split_once(" | ").unwrap_or((v, ""));
-                data.insert(f.key.clone(), json!({"tracking_number":tracking_number.trim(),"carrier":carrier.trim()}));
             } else {
                 data.insert(f.key.clone(), Value::String(v.to_string()));
             }
@@ -2364,9 +2422,13 @@ pub async fn export(
         if let Some(key) = carrier_key {
             let mut groups: BTreeMap<String, Vec<db::FormSubmission>> = BTreeMap::new();
             for row in rows {
+                // 按「主承运商」分表 = 取该订单**第一个单号**的承运商（一单跨多家时整单进这张表）
                 let carrier = serde_json::from_str::<Value>(&row.data_json).ok()
-                    .and_then(|v| v.get(&key).and_then(|x| x.get("carrier")).and_then(Value::as_str).map(str::to_string))
-                    .filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "未识别或未填写".to_string());
+                    .and_then(|v| v.get(&key).cloned())
+                    .and_then(|x| express_items(Some(&x)).into_iter().next())
+                    .map(|(_, carrier)| carrier)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "未识别或未填写".to_string());
                 groups.entry(carrier).or_default().push(row);
             }
             let tables: Vec<_> = groups.iter().map(|(_, rows)| crate::xlsx::build_table(rows, tz_offset_min)).collect();

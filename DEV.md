@@ -1080,3 +1080,12 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 ### 管理页面标题与模板回收站（2026-10-31，ChatGPT 修改，尚未部署）
 
 管理页面标题为「贝可施客服小工具管理系统」。模板删除进入回收站，可还原；永久删除在事务中清除模板、字段版本和全部填写记录。恢复时检查模板名称唯一性。
+
+### 物流快递多单号导出（2026-10-31，源码完成，未部署）
+
+- `Field.kind == "express"` 的值改为数组 `[{tracking_number, carrier}, ...]`；`forms::express_items` 兼容旧对象并过滤全空行。
+- `validate_data`：必填至少 1 条、每条有单号必须有公司、单号 ≤60 / 公司 ≤30、最多 20 条。
+- `xlsx::build_table`：订单按快递字段条目数展开成 N 行；快递字段拆「单号」「快递公司」两列；订单级列（普通字段 + 系统列）记录垂直 `Merge`。
+- `xlsx::write_xlsx_sheets`：用 `merge_range` 先建合并区、再把左上角写回数字/文本 —— 金额合并后**仍是数字**（可 SUM）；单号/公司列 `force_text` 强制文本（纯数字单号不丢前导零）。
+- 分表 `group_by_carrier`：按订单**第一个单号**的承运商整单进一张表，sheet 内合并保留。
+- 网格：express 单元格只读，`apply_submission_edit` 跳过 express。

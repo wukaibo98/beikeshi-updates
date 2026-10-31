@@ -842,35 +842,20 @@ fn 按快递分表_只能勾在物流字段上且最多一个() {
 }
 
 #[test]
-fn 网格改物流字段_把单号加竖线拆回对象() {
+fn 网格改物流字段_只读_不会被改动() {
     let conn = fresh();
     let snap = express_schema("");
-    let id = insert_sub(&conn, &snap, r#"{"exp":{"tracking_number":"旧单号","carrier":"圆通"}}"#);
+    let id = insert_sub(&conn, &snap, r#"{"exp":[{"tracking_number":"旧单号","carrier":"圆通速递"}]}"#);
 
     let mut v = std::collections::BTreeMap::new();
-    v.insert("exp".to_string(), "SF999 | 顺丰".to_string());
+    v.insert("exp".to_string(), "SF999 | 顺丰快递".to_string());
     crate::forms::apply_submission_edit(&conn, id, &v).unwrap();
 
     let row = db::form_submission_by_id(&conn, id).unwrap().unwrap();
     let data: Value = serde_json::from_str(&row.data_json).unwrap();
-    assert_eq!(data["exp"]["tracking_number"], "SF999");
-    assert_eq!(data["exp"]["carrier"], "顺丰", "必须还是对象，不能变成字符串");
-}
-
-#[test]
-fn 网格改物流字段_只填了单号也能存下来() {
-    let conn = fresh();
-    let snap = express_schema(""); // 非必填
-    let id = insert_sub(&conn, &snap, r#"{"exp":{"tracking_number":"旧","carrier":"圆通"}}"#);
-
-    let mut v = std::collections::BTreeMap::new();
-    v.insert("exp".to_string(), "YT123".to_string());
-    crate::forms::apply_submission_edit(&conn, id, &v).unwrap();
-
-    let row = db::form_submission_by_id(&conn, id).unwrap().unwrap();
-    let data: Value = serde_json::from_str(&row.data_json).unwrap();
-    assert_eq!(data["exp"]["tracking_number"], "YT123");
-    assert_eq!(data["exp"]["carrier"], "", "没写竖线就只认单号，不能把整串塞进单号");
+    // 网格里快递字段只读：即使传了值也不改，原来的数组原样保留
+    assert_eq!(data["exp"][0]["tracking_number"], "旧单号");
+    assert_eq!(data["exp"][0]["carrier"], "圆通速递");
 }
 
 #[test]
@@ -879,6 +864,8 @@ fn 多工作表导出_重名的表自动加后缀() {
         headers: vec!["A".into()],
         keys: vec!["a".into()],
         rows: vec![vec!["1".into()]],
+        merges: vec![],
+        force_text: vec![],
     };
     // 同一个名字给三次：第一张叫「顺丰」，后面两张要变成「顺丰-2」「顺丰-3」
     let sheets = [(&t, "顺丰".to_string()), (&t, "顺丰".to_string()), (&t, "顺丰".to_string())];
