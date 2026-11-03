@@ -260,11 +260,18 @@ fn back(sub: &str, ok: Option<&str>, err: Option<&str>) -> Response {
     Redirect::to(&url).into_response()
 }
 
-/// 存完停在某个商品的编辑页（接着加规格）
-fn back_edit(id: i64, ok: Option<&str>) -> Response {
-    let mut url = format!("/admin?tab=products&sub=list&edit={id}");
+/// 存完/存错都停在编辑页：id=0（还没建出来）就回到「新增」那张空表单
+fn back_edit(id: i64, ok: Option<&str>, err: Option<&str>) -> Response {
+    let mut url = if id > 0 {
+        format!("/admin?tab=products&sub=list&edit={id}")
+    } else {
+        "/admin?tab=products&sub=list&new=1".to_string()
+    };
     if let Some(m) = ok {
         url.push_str(&format!("&ok={}", crate::admin::encode(m)));
+    }
+    if let Some(m) = err {
+        url.push_str(&format!("&err={}", crate::admin::encode(m)));
     }
     Redirect::to(&url).into_response()
 }
@@ -290,6 +297,116 @@ fn picked(map: &HashMap<String, String>, kind: &str) -> Vec<String> {
     out
 }
 
+/// 表单里的一条规格（还没落库）。`price` 留着原始文本，转换失败要报给人看。
+#[derive(Default, Clone)]
+pub struct SkuInput {
+    pub id: Option<i64>,
+    pub value: f64,
+    pub unit: String,
+    pub pack: String,
+    pub barcode: String,
+    pub price: String,
+    pub promo: String,
+    /// 勾了「删」：保存时把这条删掉（新增行勾了也没意义，直接忽略）
+    pub remove: bool,
+}
+
+impl SkuInput {
+    fn is_blank(&self) -> bool {
+        self.barcode.is_empty()
+            && self.price.trim().is_empty()
+            && self.promo.trim().is_empty()
+            && self.value == 0.0
+    }
+}
+
+/// 从表单里把 `sku_<序号>_<字段>` 抽出来，按序号排好。
+pub fn parse_sku_rows(form: &HashMap<String, String>) -> Vec<SkuInput> {
+    let mut rows: std::collections::BTreeMap<usize, SkuInput> = Default::default();
+    for (key, raw) in form {
+        let Some(rest) = key.strip_prefix("sku_") else { continue };
+        let Some((idx, field)) = rest.split_once('_') else { continue };
+        let Ok(idx) = idx.parse::<usize>() else { continue };
+        let row = rows.entry(idx).or_default();
+        let v = raw.trim();
+        match field {
+            "id" => row.id = v.parse::<i64>().ok().filter(|x| *x > 0),
+            "value" => row.value = v.parse::<f64>().unwrap_or(0.0),
+            "unit" => row.unit = v.to_string(),
+            "pack" => row.pack = v.to_string(),
+            "barcode" => row.barcode = v.to_string(),
+            "price" => row.price = v.to_string(),
+            "promo" => row.promo = v.to_string(),
+            "del" => row.remove = v == "1" || v == "on",
+            _ => {}
+        }
+    }
+    rows.into_values().collect()
+}
+
+/// 商品 + 规格一次性保存。任何一条不合格就整体不动（先校验、后事务）。
+pub fn save_product_with_skus(
+    conn: &rusqlite::Connection,
+    id: Option<i64>,
+    p: &db::NewProduct<'_>,
+    rows: &[SkuInput],
+) -> Result<i64, String> {
+    use std::collections::HashSet;
+
+    // 1) 先校验：空行跳过，其余必须有 69 码、价格能转、69 码不重复
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut clean: Vec<&SkuInput> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if row.remove || row.is_blank() {
+            continue;
+        }
+        if row.barcode.is_empty() {
+            return Err(format!("第 {} 条规格没填 69 码", i + 1));
+        }
+        if !seen.insert(row.barcode.as_str()) {
+            return Err(format!("69 码 {} 在这个商品里填了两次", row.barcode));
+        }
+        if price_to_cents(&row.price).is_none() {
+            return Err(format!("69 码 {} 的售价格式不对（最多两位小数）", row.barcode));
+        }
+        if db::sku_barcode_taken(conn, &row.barcode, row.id.unwrap_or(0))
+            .map_err(|e| format!("校验失败：{e}"))?
+        {
+            return Err(format!("69 码 {} 已被别的规格占用", row.barcode));
+        }
+        clean.push(row);
+    }
+
+    // 2) 再落库：商品 + 规格在同一个事务里，中途失败不会留下半个商品
+    let tx = conn.unchecked_transaction().map_err(|e| format!("开事务失败：{e}"))?;
+    let pid = db::product_save(&tx, id, p).map_err(|e| format!("保存商品失败：{e}"))?;
+
+    for (sort, row) in clean.iter().enumerate() {
+        let price_cents = price_to_cents(&row.price).unwrap_or(0);
+        let new = db::NewSku {
+            product_id: pid,
+            spec_value: row.value,
+            spec_unit: &row.unit,
+            spec_pack: &row.pack,
+            barcode69: &row.barcode,
+            price_cents,
+            promo: &row.promo,
+            sort_order: sort as i64,
+        };
+        db::sku_save(&tx, row.id, &new).map_err(|e| format!("保存规格失败：{e}"))?;
+    }
+
+    // 3) 勾了删的，删掉（必须是这个商品自己的规格）
+    for row in rows.iter().filter(|r| r.remove) {
+        if let Some(sku_id) = row.id {
+            db::sku_delete(&tx, sku_id, pid).map_err(|e| format!("删除规格失败：{e}"))?;
+        }
+    }
+
+    tx.commit().map_err(|e| format!("提交失败：{e}"))?;
+    Ok(pid)
+}
+
 pub async fn save(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -298,7 +415,7 @@ pub async fn save(
     if let Some(r) = require_admin(&state, &headers) {
         return r;
     }
-    let name = form.get("name").map(|s| s.trim()).unwrap_or("");
+    let name = form.get("name").map(|s| s.trim()).unwrap_or("").to_string();
     if name.is_empty() {
         return back("list", None, Some("商品名称不能为空"));
     }
@@ -317,7 +434,7 @@ pub async fn save(
     let funcs_json = serde_json::to_string(&funcs).unwrap_or_else(|_| "[]".into());
 
     let new = db::NewProduct {
-        name,
+        name: &name,
         category: &category,
         class_name: &class_name,
         forms_json: &forms_json,
@@ -325,11 +442,16 @@ pub async fn save(
         usage_text: &usage,
         image: &image,
     };
+    let rows = parse_sku_rows(&form);
+
     let conn = state.conn.get().unwrap();
-    match db::product_save(&conn, id, &new) {
-        // 存完停在编辑页：接着加规格是最常见的下一步
-        Ok(pid) => back_edit(pid, Some(&format!("已保存「{name}」"))),
-        Err(e) => back("list", None, Some(&format!("保存失败：{e}"))),
+    match save_product_with_skus(&conn, id, &new, &rows) {
+        // 存完停在编辑页：还能接着改规格
+        Ok(pid) => {
+            let kept = rows.iter().filter(|r| !r.remove && !r.is_blank()).count();
+            back_edit(pid, Some(&format!("已保存「{name}」，{kept} 条规格")), None)
+        }
+        Err(msg) => back_edit(id.unwrap_or(0), None, Some(&msg)),
     }
 }
 
@@ -395,71 +517,6 @@ pub fn price_to_cents(raw: &str) -> Option<i64> {
         _ => frac_part.parse().ok()?,
     };
     Some(yuan * 100 + cents)
-}
-
-pub async fn sku_save(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
-) -> Response {
-    if let Some(r) = require_admin(&state, &headers) {
-        return r;
-    }
-    let get = |k: &str| form.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
-    let Some(product_id) = get("product_id").parse::<i64>().ok() else {
-        return back("list", None, Some("缺少商品 id"));
-    };
-    let id = get("id").parse::<i64>().ok();
-    let barcode = get("barcode");
-    if barcode.is_empty() {
-        return back("list", None, Some("69 码不能为空"));
-    }
-    let spec_value = get("spec_value").parse::<f64>().unwrap_or(0.0);
-    let Some(price_cents) = price_to_cents(&get("price")) else {
-        return back("list", None, Some("售价格式不对（最多两位小数）"));
-    };
-    let conn = state.conn.get().unwrap();
-    match db::sku_barcode_taken(&conn, &barcode, id.unwrap_or(0)) {
-        Ok(true) => return back("list", None, Some(&format!("69 码 {barcode} 已被别的规格占用"))),
-        Err(e) => return back("list", None, Some(&format!("校验失败：{e}"))),
-        _ => {}
-    }
-    let new = db::NewSku {
-        product_id,
-        spec_value,
-        spec_unit: &get("spec_unit"),
-        spec_pack: &get("spec_pack"),
-        barcode69: &barcode,
-        price_cents,
-        promo: &get("promo"),
-        sort_order: get("sort").parse::<i64>().unwrap_or(0),
-    };
-    match db::sku_save(&conn, id, &new) {
-        Ok(_) => back("list", Some("规格已保存"), None),
-        Err(e) => back("list", None, Some(&format!("保存失败：{e}"))),
-    }
-}
-
-pub async fn sku_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
-) -> Response {
-    if let Some(r) = require_admin(&state, &headers) {
-        return r;
-    }
-    let get = |k: &str| form.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
-    let (Some(id), Some(pid)) = (
-        get("id").parse::<i64>().ok(),
-        get("product_id").parse::<i64>().ok(),
-    ) else {
-        return back("list", None, Some("缺少规格 id"));
-    };
-    let conn = state.conn.get().unwrap();
-    match db::sku_delete(&conn, id, pid) {
-        Ok(_) => back("list", Some("规格已删除"), None),
-        Err(e) => back("list", None, Some(&format!("删除失败：{e}"))),
-    }
 }
 
 /// 传图：multipart（product_id + file）。存完只改 `image` 一列。
@@ -697,52 +754,56 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
         )
     };
 
-    let sku_rows = if pid == 0 {
-        r#"<div class="muted">先保存商品，再添加规格</div>"#.to_string()
-    } else {
-        let conn = state.conn.get().unwrap();
-        let skus = db::skus_of(&conn, pid).unwrap_or_default();
-        if skus.is_empty() {
-            r#"<div class="muted">还没有规格，下面加一条</div>"#.to_string()
-        } else {
-            skus.iter()
-                .map(|s| {
-                    format!(
-                        r##"<form class="row" method="post" action="/admin/products/sku" style="margin-bottom:8px">
-  <input type="hidden" name="id" value="{id}">
-  <input type="hidden" name="product_id" value="{pid}">
-  <input name="spec_value" value="{value}" style="width:64px" placeholder="数值">
-  <select name="spec_unit" style="width:76px">{units}</select>
-  <select name="spec_pack" style="width:76px">{packs}</select>
-  <input name="barcode" value="{barcode}" style="width:132px">
-  <input name="price" value="{price}" style="width:68px">
-  <input name="promo" value="{promo}" placeholder="促销（可空）" style="width:120px">
-  <button class="ghost" type="submit">保存</button>
-  <button class="ghost" type="submit" formaction="/admin/products/sku/delete">删</button>
-</form>"##,
-                        id = s.id,
-                        pid = pid,
-                        value = if s.spec_value > 0.0 {
-                            format!("{}", s.spec_value)
-                        } else {
-                            String::new()
-                        },
-                        units = options(&dict_values(dict, "unit"), &s.spec_unit),
-                        packs = options(&dict_values(dict, "pack"), &s.spec_pack),
-                        barcode = crate::escape(&s.barcode69),
-                        price = yuan(s.price_cents),
-                        promo = crate::escape(&s.promo),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        }
+    // 规格行：已有的 + 一条空白（不点任何按钮，直接填完最下面的「保存」就一起存）；
+    // 行多的时候点「＋ 加一行」在浏览器里克隆，不需要往返一次服务器。
+    let conn = state.conn.get().unwrap();
+    let existing = if pid > 0 { db::skus_of(&conn, pid).unwrap_or_default() } else { Vec::new() };
+    let blank_index = existing.len();
+    let units_all = dict_values(dict, "unit");
+    let packs_all = dict_values(dict, "pack");
+
+    let sku_row_html = |i: usize, s: Option<&db::SkuRow>| -> String {
+        format!(
+            r##"<div class="row" style="margin-bottom:8px;align-items:center">
+  <input type="hidden" name="sku_{i}_id" value="{id}">
+  <input name="sku_{i}_value" value="{value}" style="width:64px" placeholder="数值">
+  <select name="sku_{i}_unit" style="width:76px">{units}</select>
+  <select name="sku_{i}_pack" style="width:76px">{packs}</select>
+  <input name="sku_{i}_barcode" value="{barcode}" style="width:132px" placeholder="69 码">
+  <input name="sku_{i}_price" value="{price}" style="width:68px" placeholder="售价">
+  <input name="sku_{i}_promo" value="{promo}" style="width:120px" placeholder="促销（可空）">
+  <label class="muted" style="display:flex;align-items:center;gap:4px;white-space:nowrap">
+    <input type="checkbox" name="sku_{i}_del" value="1" style="width:auto"> 删
+  </label>
+</div>"##,
+            i = i,
+            id = s.map(|x| x.id.to_string()).unwrap_or_default(),
+            value = s
+                .map(|x| if x.spec_value > 0.0 { format!("{}", x.spec_value) } else { String::new() })
+                .unwrap_or_default(),
+            units = options(&units_all, s.map(|x| x.spec_unit.as_str()).unwrap_or("")),
+            packs = options(&packs_all, s.map(|x| x.spec_pack.as_str()).unwrap_or("")),
+            barcode = crate::escape(s.map(|x| x.barcode69.as_str()).unwrap_or("")),
+            price = s.map(|x| yuan(x.price_cents)).unwrap_or_default(),
+            promo = crate::escape(s.map(|x| x.promo.as_str()).unwrap_or("")),
+        )
     };
+
+    let mut sku_rows = existing
+        .iter()
+        .enumerate()
+        .map(|(i, s)| sku_row_html(i, Some(s)))
+        .collect::<String>();
+    // 末尾永远留一条空白行：多填一条，存完再来一条
+    let blank_html = sku_row_html(blank_index, None);
+    sku_rows.push_str(&format!(r#"<div id="sku-blank">{blank_html}</div>"#));
+    // 「＋ 加一行」用的模板：把 __i__ 换成新序号
+    let tpl = sku_row_html(999_999, None).replace("_999999_", "___i___");
 
     format!(
         r##"<div class="card">
   <h2>{title}<span class="muted">{sub}</span></h2>
-  <form method="post" action="/admin/products/save">
+  <form method="post" action="/admin/products/save" id="product-form">
     <input type="hidden" name="id" value="{pid}">
     <input type="hidden" name="image" value="{image}">
     <table>
@@ -754,36 +815,52 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
       <tr><th>剂型（多选）</th><td>{form_checks}</td></tr>
       <tr><th>功能（多选）</th><td>{func_checks}</td></tr>
       <tr><th>使用方法</th><td><textarea name="usage" rows="6" placeholder="客服话术，可长文">{usage}</textarea></td></tr>
-      <tr><th>主图</th><td class="row">{image_block}<span class="muted">上传后自动裁成 800×800（白底补边）</span></td></tr>
+      <tr><th>主图</th><td class="row">{image_block}<span class="muted">上传后自动补成 800×800（白底）</span></td></tr>
+
+      <tr><th style="vertical-align:top;padding-top:12px">规格</th><td style="padding-top:8px">
+        <div class="muted" style="margin-bottom:6px">
+          一个 69 码一条规格；<b>填完直接点最下面的「保存商品」就一起存</b>，不用单独保存
+        </div>
+        <div class="muted" style="margin-bottom:6px">数值 · 单位 · 包装 · 69 码 · 售价(元) · 促销</div>
+        <div id="sku-rows">{sku_rows}</div>
+        <button class="ghost" type="button" id="sku-add">＋ 加一行</button>
+      </td></tr>
     </table>
-    <div class="row" style="margin-top:12px">
+
+    <div style="border-top:1px solid #EFF3E7;margin:14px 0"></div>
+
+    <div class="row">
       <button type="submit">保存商品</button>
       <a class="ghost" href="/admin?tab=products&amp;sub=list">关闭</a>
     </div>
   </form>
+
   <form class="row" method="post" action="/admin/products/image" enctype="multipart/form-data" style="margin-top:12px">
     <input type="hidden" name="product_id" value="{pid}">
     <input type="file" name="file" accept="image/*" required style="max-width:280px">
     <button class="ghost" type="submit">上传 / 替换图片</button>
+    <span class="muted">传完会立刻生效，不用再点保存</span>
   </form>
 
-  <div style="border-top:1px solid #EFF3E7;margin:16px 0 14px"></div>
-
-  <h2 style="margin-bottom:4px">规格<span class="muted">一个 69 码一条规格；不同规格不同价</span></h2>
-  <div class="muted" style="margin-bottom:8px">数值 · 单位 · 包装 · 69 码 · 售价(元) · 促销</div>
-  {sku_rows}
-  <form class="row" method="post" action="/admin/products/sku"
-        style="margin-top:12px;padding-top:10px;border-top:1px dashed #EFF3E7">
-    <input type="hidden" name="product_id" value="{pid}">
-    <input name="spec_value" placeholder="500" style="width:64px">
-    <select name="spec_unit" style="width:76px">{units_new}</select>
-    <select name="spec_pack" style="width:76px">{packs_new}</select>
-    <input name="barcode" placeholder="69 码" style="width:132px">
-    <input name="price" placeholder="39.9" style="width:68px">
-    <input name="promo" placeholder="促销（可空）" style="width:120px">
-    <button class="ghost" type="submit">加一条规格</button>
-  </form>
-</div>"##,
+  <template id="sku-tpl">{tpl}</template>
+</div>
+<script>
+(function () {{
+  var add = document.getElementById('sku-add');
+  var wrap = document.getElementById('sku-rows');
+  var tpl = document.getElementById('sku-tpl');
+  var box = document.getElementById('sku-blank');
+  var next = Number({blank_index}) + 1;
+  if (!add || !wrap || !tpl) return;
+  add.addEventListener('click', function () {{
+    var holder = document.createElement('div');
+    holder.innerHTML = tpl.innerHTML.replace(/__i__/g, String(next++));
+    var row = holder.firstElementChild;
+    if (box && box.parentNode === wrap) wrap.insertBefore(row, box);
+    else wrap.appendChild(row);
+  }});
+}})();
+</script>"##,
         title = if pid == 0 { "新增商品" } else { "编辑商品" },
         sub = if pid == 0 {
             "先填商品信息并保存，再回来加规格".to_string()
@@ -800,8 +877,8 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
         func_checks = checks("function", &funcs, "mk-function:"),
         image_block = image_block,
         sku_rows = sku_rows,
-        units_new = options(&dict_values(dict, "unit"), ""),
-        packs_new = options(&dict_values(dict, "pack"), ""),
+        tpl = tpl,
+        blank_index = blank_index,
     )
 }
 
@@ -904,7 +981,10 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
         r##"{editing}
 <div class="card">
   <h2>商品<span class="muted">共 {n} 个商品 · 一个 69 码一条规格</span>
-    <span class="row" style="float:right"><a class="ghost" href="/admin?tab=products&amp;sub=list&amp;new=1">新增商品</a></span>
+    <span class="row" style="float:right">
+      <a class="ghost" href="/admin/products/export.xlsx" title="导出成 Excel（和导入模板同一套列）">导出</a>
+      <a class="ghost" href="/admin?tab=products&amp;sub=list&amp;new=1">新增商品</a>
+    </span>
   </h2>
   <table>
     <tr><th style="width:60px">图</th><th>商品</th><th>规格 · 69 码 · 售价</th><th style="width:180px">操作</th></tr>
@@ -920,12 +1000,13 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
     let import = r##"<div class="card">
   <h2>批量导入<span class="muted">Excel 填字 + 图片打包，一次灌几百个</span></h2>
   <p class="muted" style="line-height:1.8">
-    ① 下载模板，填「商品」和「规格」两个 sheet（用商品名把两者对上）；<br>
+    <b>模板就是导出格式</b>（「商品」「规格」两个 sheet，列完全一致），所以「导出 → 改 → 导入」是闭环。<br>
+    ① 下载空模板填，或者直接导出当前商品库来改（用商品名把两个 sheet 对上）；<br>
     ② 图片打包成 zip，文件名用 <code>商品名.jpg</code> 或 <code>69码.jpg</code>（支持 jpg/png/webp）；<br>
     ③ 两个文件一起传，服务端按 69 码增量写入（已存在就更新，不会重复建）。
   </p>
   <div class="row" style="margin-bottom:14px">
-    <a class="ghost" href="/admin/products/template.xlsx">下载导入模板</a>
+    <a class="ghost" href="/admin/products/template.xlsx">下载空模板</a>
     <a class="ghost" href="/admin/products/export.xlsx">导出当前商品库</a>
   </div>
   <form method="post" action="/admin/products/import" enctype="multipart/form-data">

@@ -1291,3 +1291,149 @@ fn 不是本系统备份的_zip_会被拒() {
     assert!(err.contains("updates.db"), "错误要说清楚缺什么：{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/* ------------------------------------------------------------ 一次保存商品 + 规格 */
+
+fn form_of(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn new_product(name: &str) -> db::NewProduct<'_> {
+    db::NewProduct {
+        name,
+        category: "园艺",
+        class_name: "园艺肥料",
+        forms_json: r#"["液体"]"#,
+        funcs_json: r#"["绿叶肥"]"#,
+        usage_text: "稀释 1000 倍",
+        image: "",
+    }
+}
+
+#[test]
+fn 表单里按序号解析规格行() {
+    let form = form_of(&[
+        ("sku_0_id", ""),
+        ("sku_0_value", "500"),
+        ("sku_0_unit", "ml"),
+        ("sku_0_pack", "瓶"),
+        ("sku_0_barcode", "6930000000001"),
+        ("sku_0_price", "39.9"),
+        ("sku_1_id", "7"),
+        ("sku_1_barcode", "6930000000002"),
+        ("sku_1_del", "1"),
+        ("name", "不该被当成规格"),
+    ]);
+    let rows = crate::products::parse_sku_rows(&form);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].barcode, "6930000000001");
+    assert_eq!(rows[0].value, 500.0);
+    assert_eq!(rows[0].unit, "ml");
+    assert!(rows[0].id.is_none());
+    assert_eq!(rows[1].id, Some(7));
+    assert!(rows[1].remove);
+}
+
+#[test]
+fn 保存商品时规格一起落库_空行忽略() {
+    let conn = fresh_products();
+    let form = form_of(&[
+        ("sku_0_value", "500"),
+        ("sku_0_unit", "ml"),
+        ("sku_0_pack", "瓶"),
+        ("sku_0_barcode", "6930000000001"),
+        ("sku_0_price", "39.9"),
+        ("sku_0_promo", "买2送1"),
+        ("sku_1_value", "1"),
+        ("sku_1_unit", "L"),
+        ("sku_1_pack", "瓶"),
+        ("sku_1_barcode", "6930000000002"),
+        ("sku_1_price", "69.9"),
+        // 第三条是完全空的行（界面上永远留一条）
+        ("sku_2_value", ""),
+        ("sku_2_barcode", ""),
+        ("sku_2_price", ""),
+    ]);
+    let rows = crate::products::parse_sku_rows(&form);
+    let pid = crate::products::save_product_with_skus(&conn, None, &new_product("营养液"), &rows).unwrap();
+
+    let skus = db::skus_of(&conn, pid).unwrap();
+    assert_eq!(skus.len(), 2, "空行不该被当成规格");
+    assert_eq!(skus[0].barcode69, "6930000000001");
+    assert_eq!(skus[0].price_cents, 3990);
+    assert_eq!(skus[0].promo, "买2送1");
+    assert_eq!(skus[1].spec_value, 1.0);
+    assert_eq!(skus[1].spec_unit, "L");
+}
+
+#[test]
+fn 同一次提交里_69码重复要整体拒掉并且不留商品() {
+    let conn = fresh_products();
+    let form = form_of(&[
+        ("sku_0_barcode", "6930000000001"),
+        ("sku_0_price", "10"),
+        ("sku_1_barcode", "6930000000001"),
+        ("sku_1_price", "20"),
+    ]);
+    let rows = crate::products::parse_sku_rows(&form);
+    let err = crate::products::save_product_with_skus(&conn, None, &new_product("重复码"), &rows)
+        .unwrap_err();
+    assert!(err.contains("填了两次"), "错误要说清楚：{err}");
+    assert!(db::products(&conn, false).unwrap().is_empty(), "失败不能留下半个商品");
+}
+
+#[test]
+fn 没填69码的规格行要报第几条() {
+    let conn = fresh_products();
+    let form = form_of(&[("sku_0_value", "500"), ("sku_0_price", "39.9")]);
+    let rows = crate::products::parse_sku_rows(&form);
+    let err = crate::products::save_product_with_skus(&conn, None, &new_product("缺码"), &rows)
+        .unwrap_err();
+    assert!(err.contains("第 1 条规格没填 69 码"), "{err}");
+}
+
+#[test]
+fn 六九码被别的商品占了要拒() {
+    let conn = fresh_products();
+    let other = add_product(&conn, "别的商品");
+    add_sku(&conn, other, "6930000000009", 1990);
+
+    let form = form_of(&[("sku_0_barcode", "6930000000009"), ("sku_0_price", "19.9")]);
+    let rows = crate::products::parse_sku_rows(&form);
+    let err = crate::products::save_product_with_skus(&conn, None, &new_product("抢码"), &rows)
+        .unwrap_err();
+    assert!(err.contains("已被别的规格占用"), "{err}");
+}
+
+#[test]
+fn 改商品时勾了删的规格会被删掉_其余原样更新() {
+    let conn = fresh_products();
+    let pid = add_product(&conn, "缓释肥");
+    let keep = add_sku(&conn, pid, "6930000000001", 2500);
+    let gone = add_sku(&conn, pid, "6930000000002", 4500);
+
+    let form = form_of(&[
+        ("sku_0_id", &keep.to_string()),
+        ("sku_0_value", "500"),
+        ("sku_0_unit", "g"),
+        ("sku_0_pack", "袋"),
+        ("sku_0_barcode", "6930000000001"),
+        ("sku_0_price", "26"),
+        ("sku_1_id", &gone.to_string()),
+        ("sku_1_barcode", "6930000000002"),
+        ("sku_1_del", "1"),
+        ("sku_2_barcode", "6930000000003"),
+        ("sku_2_price", "60"),
+    ]);
+    let rows = crate::products::parse_sku_rows(&form);
+    crate::products::save_product_with_skus(&conn, Some(pid), &new_product("缓释肥"), &rows).unwrap();
+
+    let skus = db::skus_of(&conn, pid).unwrap();
+    let codes: Vec<&str> = skus.iter().map(|s| s.barcode69.as_str()).collect();
+    assert_eq!(codes, vec!["6930000000001", "6930000000003"]);
+    assert_eq!(skus[0].price_cents, 2600, "改价要生效");
+    assert!(!codes.contains(&"6930000000002"), "勾了删的要没了");
+}

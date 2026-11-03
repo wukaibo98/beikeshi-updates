@@ -39,47 +39,16 @@ fn back(ok: Option<&str>, err: Option<&str>) -> Response {
     Redirect::to(&url).into_response()
 }
 
-/// 模板：只有表头 + 两行示例，避免空表被 Excel 当成没有内容
+/// 导入模板：**和导出完全同一套列**，只是没有数据行。
+/// 这样「导出 → 改 → 导入」是一条闭环，不会出现模板和导出的列对不上的情况。
 pub async fn template(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !crate::is_admin(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match build_template() {
+    match build_export(&[], &[]) {
         Ok(bytes) => xlsx_response(bytes, "商品导入模板.xlsx"),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-}
-
-fn build_template() -> Result<Vec<u8>, String> {
-    use rust_xlsxwriter::{Format, Workbook};
-    let mut wb = Workbook::new();
-    let bold = Format::new().set_bold();
-
-    let sheet = wb.add_worksheet();
-    sheet.set_name(SHEET_PRODUCTS).map_err(|e| e.to_string())?;
-    for (i, h) in PRODUCT_HEADERS.iter().enumerate() {
-        sheet.write_with_format(0, i as u16, *h, &bold).map_err(|e| e.to_string())?;
-    }
-    let example = ["贝可施花卉营养液", "园艺", "园艺肥料", "液体", "绿叶肥、生长肥", "稀释 1000 倍灌根…", ""];
-    for (i, v) in example.iter().enumerate() {
-        sheet.write(1, i as u16, *v).map_err(|e| e.to_string())?;
-    }
-    sheet.set_column_width(0, 24).ok();
-    sheet.set_column_width(5, 40).ok();
-
-    let sheet = wb.add_worksheet();
-    sheet.set_name(SHEET_SKUS).map_err(|e| e.to_string())?;
-    for (i, h) in SKU_HEADERS.iter().enumerate() {
-        sheet.write_with_format(0, i as u16, *h, &bold).map_err(|e| e.to_string())?;
-    }
-    let example = ["贝可施花卉营养液", "500", "ml", "瓶", "6931234567890", "39.9", "买2送1"];
-    for (i, v) in example.iter().enumerate() {
-        sheet.write(1, i as u16, *v).map_err(|e| e.to_string())?;
-    }
-    sheet.set_column_width(0, 24).ok();
-    sheet.set_column_width(4, 18).ok();
-
-    wb.save_to_buffer().map_err(|e| e.to_string())
 }
 
 /// 导出：把库里现有的商品和规格原样导成同样的两张表（备份 + 手工改价都靠它）
