@@ -766,13 +766,14 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
     <input type="file" name="file" accept="image/*" required style="max-width:280px">
     <button class="ghost" type="submit">上传 / 替换图片</button>
   </form>
-</div>
 
-<div class="card">
-  <h2>规格<span class="muted">一个 69 码一条规格；不同规格不同价</span></h2>
-  <div class="muted" style="margin-bottom:6px">数值 · 单位 · 包装 · 69 码 · 售价(元) · 促销</div>
+  <div style="border-top:1px solid #EFF3E7;margin:16px 0 14px"></div>
+
+  <h2 style="margin-bottom:4px">规格<span class="muted">一个 69 码一条规格；不同规格不同价</span></h2>
+  <div class="muted" style="margin-bottom:8px">数值 · 单位 · 包装 · 69 码 · 售价(元) · 促销</div>
   {sku_rows}
-  <form class="row" method="post" action="/admin/products/sku" style="margin-top:12px">
+  <form class="row" method="post" action="/admin/products/sku"
+        style="margin-top:12px;padding-top:10px;border-top:1px dashed #EFF3E7">
     <input type="hidden" name="product_id" value="{pid}">
     <input name="spec_value" placeholder="500" style="width:64px">
     <select name="spec_unit" style="width:76px">{units_new}</select>
