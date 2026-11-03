@@ -982,3 +982,312 @@ fn 模板原名_优先用删除时存下的那份() {
     t.name = "客户需求表".into();
     assert_eq!(crate::forms::template_original_name(&t), "客户需求表");
 }
+
+/* ============================================================ 商品库 */
+
+fn fresh_products() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_forms(&conn).unwrap();
+    db::init_products(&conn).unwrap();
+    conn
+}
+
+fn tmpdir(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("bks-test-{tag}-{}", db::now()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn add_product(conn: &Connection, name: &str) -> i64 {
+    db::product_save(
+        conn,
+        None,
+        &db::NewProduct {
+            name,
+            category: "园艺",
+            class_name: "园艺肥料",
+            forms_json: r#"["液体"]"#,
+            funcs_json: r#"["绿叶肥"]"#,
+            usage_text: "稀释 1000 倍灌根",
+            image: "",
+        },
+    )
+    .unwrap()
+}
+
+fn add_sku(conn: &Connection, pid: i64, barcode: &str, cents: i64) -> i64 {
+    db::sku_save(
+        conn,
+        None,
+        &db::NewSku {
+            product_id: pid,
+            spec_value: 500.0,
+            spec_unit: "ml",
+            spec_pack: "瓶",
+            barcode69: barcode,
+            price_cents: cents,
+            promo: "买2送1",
+            sort_order: 0,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn 码表出厂就带着脑图里的剂型和功能() {
+    let conn = fresh_products();
+    let dict = db::product_dict(&conn).unwrap();
+    let forms: Vec<&str> = dict.iter().filter(|d| d.kind == "form").map(|d| d.value.as_str()).collect();
+    let funcs: Vec<&str> = dict.iter().filter(|d| d.kind == "function").map(|d| d.value.as_str()).collect();
+    // 悬浮剂和悬乳剂是两个东西，别合并
+    assert!(forms.contains(&"悬浮剂") && forms.contains(&"悬乳剂"));
+    assert!(forms.contains(&"可湿性粉剂") && forms.contains(&"水分散粒剂"));
+    assert!(funcs.contains(&"杀虫剂") && funcs.contains(&"植物生长调节剂"));
+    assert_eq!(dict.iter().filter(|d| d.kind == "category").count(), 2);
+    assert_eq!(dict.iter().filter(|d| d.kind == "class").count(), 4);
+}
+
+#[test]
+fn 码表可以加可以删也可以重排() {
+    let conn = fresh_products();
+    db::dict_add(&conn, "form", "微乳剂").unwrap();
+    let dict = db::product_dict(&conn).unwrap();
+    let item = dict.iter().find(|d| d.kind == "form" && d.value == "微乳剂").unwrap();
+
+    // 加到末尾
+    let last = dict.iter().filter(|d| d.kind == "form").next_back().unwrap();
+    assert_eq!(item.sort_order, last.sort_order);
+
+    // 把「微乳剂」拖到第一个
+    let mut ids: Vec<i64> = dict.iter().filter(|d| d.kind == "form").map(|d| d.id).collect();
+    ids.retain(|id| *id != item.id);
+    ids.insert(0, item.id);
+    db::dict_reorder(&conn, "form", &ids).unwrap();
+
+    let dict = db::product_dict(&conn).unwrap();
+    let first = dict.iter().find(|d| d.kind == "form").unwrap();
+    assert_eq!(first.value, "微乳剂");
+
+    db::dict_delete(&conn, item.id).unwrap();
+    let dict = db::product_dict(&conn).unwrap();
+    assert!(!dict.iter().any(|d| d.value == "微乳剂"));
+}
+
+#[test]
+fn 商品和规格存得住_69码不能重复() {
+    let conn = fresh_products();
+    let pid = add_product(&conn, "花卉营养液");
+    let sku_id = add_sku(&conn, pid, "6931234567890", 3990);
+
+    let p = db::product_by_id(&conn, pid).unwrap().unwrap();
+    assert_eq!(p.name, "花卉营养液");
+    assert_eq!(p.forms_json, r#"["液体"]"#);
+
+    let skus = db::skus_of(&conn, pid).unwrap();
+    assert_eq!(skus.len(), 1);
+    assert_eq!(skus[0].price_cents, 3990);
+    assert_eq!(skus[0].spec_pack, "瓶");
+
+    // 同一个 69 码换到别的规格上要被挡
+    assert!(db::sku_barcode_taken(&conn, "6931234567890", 0).unwrap());
+    // 自己重存不算冲突
+    assert!(!db::sku_barcode_taken(&conn, "6931234567890", sku_id).unwrap());
+}
+
+#[test]
+fn 增量同步只回新改动_删除也有流水() {
+    let conn = fresh_products();
+    let pid = add_product(&conn, "颗粒缓释肥");
+    let rev0 = db::product_rev(&conn).unwrap();
+    assert!(rev0 > 0);
+
+    // 新商品在 since=rev0 之后
+    let pid2 = add_product(&conn, "杀虫剂");
+    let sync = db::product_sync(&conn, rev0).unwrap();
+    assert_eq!(sync.products.len(), 1, "只该回刚加的那个");
+    assert_eq!(sync.products[0].id, pid2);
+    assert!(sync.skus.is_empty());
+
+    // 加规格：商品本身也会跟着刷新（客户端按商品聚合）
+    let sku_id = add_sku(&conn, pid2, "6930000000001", 1990);
+    let sync = db::product_sync(&conn, rev0).unwrap();
+    assert_eq!(sync.skus.len(), 1);
+    assert!(sync.products.iter().any(|p| p.id == pid2));
+
+    // 删除：商品和规格都留流水
+    let rev1 = db::product_rev(&conn).unwrap();
+    db::product_delete(&conn, pid2).unwrap();
+    let sync = db::product_sync(&conn, rev1).unwrap();
+    assert!(sync.products.is_empty());
+    assert!(sync.deleted.iter().any(|(k, id)| k == "product" && *id == pid2));
+    assert!(sync.deleted.iter().any(|(k, id)| k == "sku" && *id == sku_id));
+
+    // 全量（since=0）能拿到还活着的商品
+    let all = db::product_sync(&conn, 0).unwrap();
+    assert_eq!(all.products.len(), 1);
+    assert_eq!(all.products[0].id, pid);
+}
+
+#[test]
+fn 售价从元转成分_格式不对要挡住() {
+    use crate::products::price_to_cents;
+    assert_eq!(price_to_cents("39"), Some(3900));
+    assert_eq!(price_to_cents("39.9"), Some(3990));
+    assert_eq!(price_to_cents("39.99"), Some(3999));
+    assert_eq!(price_to_cents("0.05"), Some(5));
+    assert_eq!(price_to_cents(""), Some(0));
+    assert_eq!(price_to_cents("1,299"), Some(129900));
+    assert_eq!(price_to_cents("39.999"), None);
+    assert_eq!(price_to_cents("abc"), None);
+    assert_eq!(price_to_cents("-5"), None);
+}
+
+/* ------------------------------------------------------------ 图片 */
+
+fn png_of(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    use image::ImageEncoder;
+    let mut img = image::RgbImage::new(w, h);
+    for p in img.pixels_mut() {
+        *p = image::Rgb(rgb);
+    }
+    let mut buf = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    buf
+}
+
+#[test]
+fn 竖长图会被补成800正方形_不是裁切() {
+    let src = png_of(400, 900, [200, 30, 30]);
+    let out = crate::products::normalize_image(&src).unwrap();
+    let img = image::load_from_memory(&out).unwrap().to_rgb8();
+    assert_eq!(img.dimensions(), (800, 800));
+
+    // 左上角是补的白边
+    assert_eq!(img.get_pixel(0, 0).0, [255, 255, 255]);
+    // 中间还是原图（没被裁掉）
+    let mid = img.get_pixel(400, 400).0;
+    assert!(mid[0] > 180 && mid[1] < 60, "中间应该是红色原图，实际 {mid:?}");
+    // 400×900 等比缩到长边 800 → 355×800，左右各留 ~222 白边
+    let left = img.get_pixel(60, 400).0;
+    assert_eq!(left, [255, 255, 255]);
+}
+
+#[test]
+fn 缩略图是160正方形() {
+    let src = png_of(1000, 600, [10, 120, 60]);
+    let big = crate::products::normalize_image(&src).unwrap();
+    let thumb = crate::products::make_thumb(&big).unwrap();
+    let img = image::load_from_memory(&thumb).unwrap().to_rgb8();
+    assert_eq!(img.dimensions(), (160, 160));
+    assert!(thumb.len() < big.len(), "缩略图必须比原图小");
+}
+
+#[test]
+fn 同一张图重复存只占一份_哈希相同() {
+    let dir = tmpdir("img");
+    let src = png_of(300, 300, [30, 30, 200]);
+    let a = crate::products::store_image_in(&dir, &src).unwrap();
+    let b = crate::products::store_image_in(&dir, &src).unwrap();
+    assert_eq!(a, b);
+    let files = std::fs::read_dir(&dir).unwrap().count();
+    assert_eq!(files, 2, "只有大图 + 缩略图各一份");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/* ------------------------------------------------------------ 备份 / 恢复 */
+
+#[test]
+fn 备份包含数据库_密钥_图片和清单() {
+    let dir = tmpdir("backup");
+    let db_path = dir.join("updates.db");
+    let conn = db::open(&db_path).unwrap();
+    let pid = add_product(&conn, "备份测试商品");
+    let img_dir = dir.join("products").join("img");
+    std::fs::create_dir_all(&img_dir).unwrap();
+    let hash = crate::products::store_image_in(&img_dir, &png_of(500, 500, [1, 2, 3])).unwrap();
+    db::product_set_image(&conn, pid, &hash).unwrap();
+    std::fs::write(dir.join("secret.key"), b"fake-secret").unwrap();
+
+    let (zip_path, size) = crate::backup::build_backup_at(&conn, &dir, "unit-test").unwrap();
+    assert!(size > 0);
+
+    let file = std::fs::File::open(&zip_path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(names.iter().any(|n| n == "updates.db"));
+    assert!(names.iter().any(|n| n == "secret.key"));
+    assert!(names.iter().any(|n| n == "manifest.json"));
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("img/")).count(),
+        2,
+        "大图 + 缩略图"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn 恢复能把数据整套装回去_并且先留一份现在的() {
+    let src_dir = tmpdir("restore-src");
+    let conn = db::open(&src_dir.join("updates.db")).unwrap();
+    add_product(&conn, "恢复前的商品");
+    let (zip_path, _) = crate::backup::build_backup_at(&conn, &src_dir, "unit-test").unwrap();
+    let bytes = std::fs::read(&zip_path).unwrap();
+    drop(conn);
+
+    // 目标：一个全新的数据目录（模拟服务器重装）
+    let dst_dir = tmpdir("restore-dst");
+    let staged = crate::backup::stage_restore(&dst_dir, &bytes).unwrap();
+    assert!(staged >= 2, "至少是 db + manifest");
+    assert!(dst_dir.join("restore.pending").exists());
+
+    crate::backup::apply_pending(&dst_dir).unwrap();
+    assert!(!dst_dir.join("restore.pending").exists(), "标记要清掉");
+
+    let conn = db::open(&dst_dir.join("updates.db")).unwrap();
+    let all = db::products(&conn, false).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].name, "恢复前的商品");
+    drop(conn);
+
+    // 再恢复一次：这次目标目录里已有数据，应该先另存一份 pre-restore
+    let conn = db::open(&dst_dir.join("updates.db")).unwrap();
+    add_product(&conn, "后来加的");
+    let (zip2, _) = crate::backup::build_backup_at(&conn, &dst_dir, "second").unwrap();
+    let bytes2 = std::fs::read(&zip2).unwrap();
+    drop(conn);
+    crate::backup::stage_restore(&dst_dir, &bytes2).unwrap();
+    crate::backup::apply_pending(&dst_dir).unwrap();
+    let backups: Vec<_> = std::fs::read_dir(dst_dir.join("backups"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        backups.iter().any(|n| n.starts_with("pre-restore-")),
+        "恢复前要把现状留一份，实际：{backups:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dst_dir);
+}
+
+#[test]
+fn 不是本系统备份的_zip_会被拒() {
+    let dir = tmpdir("restore-bad");
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        w.start_file("hello.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut w, b"not a backup").unwrap();
+        w.finish().unwrap();
+    }
+    let err = crate::backup::stage_restore(&dir, &buf).unwrap_err();
+    assert!(err.contains("updates.db"), "错误要说清楚缺什么：{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

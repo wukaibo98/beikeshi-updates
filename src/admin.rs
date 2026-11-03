@@ -59,6 +59,12 @@ pub struct PageQuery {
     /// 「加一个字段」（没 JS 时点链接过来）
     #[serde(default)]
     pub add: Option<String>,
+    /// 正在编辑的商品 id（商品库）
+    #[serde(default, deserialize_with = "crate::opt_i64")]
+    pub edit: Option<i64>,
+    /// 「新增商品」过来的空表单
+    #[serde(default)]
+    pub new: Option<String>,
 }
 
 impl PageQuery {
@@ -228,11 +234,14 @@ pub async fn page(
   </div>"##
         );
 
-        let counts: [(&str, i64); 4] = [
+        let product_count = db::products(&conn, false).map(|v| v.len()).unwrap_or(0) as i64;
+        let counts: [(&str, i64); 6] = [
             ("overview", 0),
             ("register", stats.submissions),
             ("versions", releases.len() as i64),
+            ("products", product_count),
             ("login", stats.users + admin_count),
+            ("backup", 0),
         ];
 
         let subtitle = format!(
@@ -260,6 +269,12 @@ pub async fn page(
         add: q.add.clone(),
     };
     let panes = crate::forms::panes(&state, &fq);
+    let pq = crate::products::ProductQuery {
+        edit: q.edit,
+        new: matches!(q.new.as_deref(), Some("1") | Some("true")),
+    };
+    let prod = crate::products::panes(&state, &pq);
+    let backup_pane = crate::backup::pane(&state);
 
     let hide = |pane: &str| if pane == active { "" } else { "hidden" };
     // 二级标签：只有"顶层标签正开着 + 这一项正是当前子标签"时才显示
@@ -291,7 +306,17 @@ pub async fn page(
         .replace("%%PANE_REG_PREVIEW%%", &panes.preview)
         .replace("%%PANE_REG_TEMPLATES%%", &panes.templates)
         .replace("%%PANE_LOGIN_CLIENTS%%", &panes.clients)
-        .replace("%%PANE_LOGIN_ADMINS%%", &panes.admins);
+        .replace("%%PANE_LOGIN_ADMINS%%", &panes.admins)
+        .replace("%%HIDE_PRODUCTS%%", hide("products"))
+        .replace("%%HIDE_BACKUP%%", hide("backup"))
+        .replace("%%SUB_PRODUCTS%%", &crate::html::sub_tabs("products", &active_sub))
+        .replace("%%HIDE_PROD_LIST%%", hide_sub("products", "list"))
+        .replace("%%HIDE_PROD_IMPORT%%", hide_sub("products", "import"))
+        .replace("%%HIDE_PROD_DICT%%", hide_sub("products", "dict"))
+        .replace("%%PANE_PROD_LIST%%", &prod.list)
+        .replace("%%PANE_PROD_IMPORT%%", &prod.import)
+        .replace("%%PANE_PROD_DICT%%", &prod.dict)
+        .replace("%%PANE_BACKUP%%", &backup_pane);
 
     Html(body).into_response()
 }
@@ -577,7 +602,7 @@ fn redirect_err(msg: &str) -> Response {
     response
 }
 
-fn encode(text: &str) -> String {
+pub(crate) fn encode(text: &str) -> String {
     let mut out = String::new();
     for b in text.as_bytes() {
         match b {

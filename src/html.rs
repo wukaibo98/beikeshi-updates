@@ -697,11 +697,18 @@ pub const PAGE: &str = r##"<!DOCTYPE html>
     <div class="subpane" data-spane="templates" %%HIDE_REG_TEMPLATES%%>%%PANE_REG_TEMPLATES%%</div>
   </section>
   <section class="pane" data-pane="versions" %%HIDE_VERSIONS%%>%%PANE_VERSIONS%%</section>
+  <section class="pane" data-pane="products" %%HIDE_PRODUCTS%%>
+    <nav class="subtabs">%%SUB_PRODUCTS%%</nav>
+    <div class="subpane" data-spane="list" %%HIDE_PROD_LIST%%>%%PANE_PROD_LIST%%</div>
+    <div class="subpane" data-spane="import" %%HIDE_PROD_IMPORT%%>%%PANE_PROD_IMPORT%%</div>
+    <div class="subpane" data-spane="dict" %%HIDE_PROD_DICT%%>%%PANE_PROD_DICT%%</div>
+  </section>
   <section class="pane" data-pane="login" %%HIDE_LOGIN%%>
     <nav class="subtabs">%%SUB_LOGIN%%</nav>
     <div class="subpane" data-spane="clients" %%HIDE_LOGIN_CLIENTS%%>%%PANE_LOGIN_CLIENTS%%</div>
     <div class="subpane" data-spane="admins" %%HIDE_LOGIN_ADMINS%%>%%PANE_LOGIN_ADMINS%%</div>
   </section>
+  <section class="pane" data-pane="backup" %%HIDE_BACKUP%%>%%PANE_BACKUP%%</section>
 </div>
 
 <!-- 预览/编辑某条登记用的弹出层 -->
@@ -1069,16 +1076,19 @@ pub const PAGE: &str = r##"<!DOCTYPE html>
 </script>
 </body></html>"##;
 
-pub const TABS: [(&str, &str); 4] = [
+pub const TABS: [(&str, &str); 6] = [
     ("overview", "概览"),
     ("register", "表单登记"),
     ("versions", "版本更新"),
+    ("products", "商品库"),
     ("login", "登录管理"),
+    ("backup", "备份维护"),
 ];
 
 /// 顶层标签下面的二级标签。没有二级标签的标签（概览、版本更新）不在表里。
 pub const SUBTABS: &[(&str, &[(&str, &str)])] = &[
     ("register", &[("preview", "表单预览"), ("templates", "模板管理")]),
+    ("products", &[("list", "商品表格"), ("import", "批量导入"), ("dict", "分类码表")]),
     ("login", &[("clients", "客户端"), ("admins", "管理端")]),
 ];
 
@@ -1093,7 +1103,7 @@ pub fn default_sub(tab: &str) -> &'static str {
 }
 
 /// 标签栏。用 `<a href="?tab=">` 而不是按钮 —— 没有 JS 时点它也能整页跳转。
-pub fn tabs(active: &str, counts: &[(&str, i64); 4]) -> String {
+pub fn tabs(active: &str, counts: &[(&str, i64); 6]) -> String {
     TABS.iter()
         .zip(counts.iter())
         .map(|((key, label), (_, count))| {

@@ -309,7 +309,7 @@ fn header_token<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// 表单用户：校验 token → 再查库确认这个人还存在且没被停用。
 /// （只在 token 里认 user_id 不够：停用一个客服后他的 token 不能还能提交。）
-fn current_user(state: &AppState, headers: &HeaderMap) -> Option<db::FormUser> {
+pub(crate) fn current_user(state: &AppState, headers: &HeaderMap) -> Option<db::FormUser> {
     let token = header_token(headers, HEADER_FORM)?;
     let (user_id, auth_version) = state.auth.verify_form_token(token)?;
     let conn = state.conn.get().unwrap();

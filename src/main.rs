@@ -12,9 +12,12 @@
 
 mod admin;
 mod auth;
+mod backup;
 mod db;
 mod forms;
 mod html;
+mod import;
+mod products;
 mod xlsx;
 
 #[cfg(test)]
@@ -39,6 +42,7 @@ use time::OffsetDateTime;
 use tokio_util::io::ReaderStream;
 
 pub struct Config {
+    pub data_dir: PathBuf,
     pub pkg_dir: PathBuf,
     pub admin_token: String,
     pub lan_base: String,
@@ -248,6 +252,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&pkg_dir)?;
     clean_upload_leftovers(&pkg_dir);
 
+    // 有待恢复的备份就先应用它 —— 必须赶在打开数据库**之前**，
+    // 否则连接池会攥着旧文件的句柄，换过去读到的是半截数据。
+    if let Err(e) = backup::apply_pending(&data_dir) {
+        eprintln!("应用待恢复备份失败：{e}");
+    }
+
     let db_path = data_dir.join("updates.db");
     // 启动时串行执行 schema 初始化；服务运行期间由连接池提供并发连接。
     drop(db::open(&db_path)?);
@@ -260,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth = auth::Auth::load_or_create(&data_dir.join("secret.key"))?;
 
     let cfg = Config {
+        data_dir: data_dir.clone(),
         pkg_dir,
         admin_token: std::env::var("ADMIN_TOKEN").unwrap_or_default(),
         lan_base: std::env::var("LAN_BASE")
@@ -286,6 +297,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg: Arc::new(cfg),
     };
 
+    // 自动备份要在 state 被 Router 拿走之前克隆一份
+    let auto_state = state.clone();
     let app = Router::new()
         .route("/", get(|| async { axum::response::Redirect::to("/admin") }))
         .route("/health", get(health))
@@ -323,6 +336,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(forms::submission_edit),
         )
         .route("/admin/forms/export.xlsx", get(forms::export))
+        .route("/admin/products/save", post(products::save))
+        .route("/admin/products/toggle", post(products::toggle))
+        .route("/admin/products/delete", post(products::delete))
+        .route("/admin/products/sku", post(products::sku_save))
+        .route("/admin/products/sku/delete", post(products::sku_delete))
+        .route("/admin/products/image", post(products::image_upload))
+        .route("/admin/products/dict/add", post(products::dict_add))
+        .route("/admin/products/dict/delete", post(products::dict_delete))
+        .route("/admin/products/dict/move", post(products::dict_move))
+        .route("/admin/products/import", post(import::import))
+        .route("/admin/products/template.xlsx", get(import::template))
+        .route("/admin/products/export.xlsx", get(import::export))
+        .route("/admin/backup/download", get(backup::download))
+        .route("/admin/backup/file/{name}", get(backup::download_file))
+        .route("/admin/backup/delete", post(backup::delete_file))
+        .route("/admin/backup/restore", post(backup::restore))
+        .route("/admin/backup/restart", post(backup::restart))
+        .route("/product-image/{name}", get(products::image_file))
+        .route("/products", get(products::api_list))
+        .route("/products/hit", post(products::api_hit))
         .route("/admin/users/save", post(forms::user_save))
         .route("/admin/users/toggle", post(forms::user_toggle))
         .route("/admin/admins/save", post(forms::admin_user_save))
@@ -340,10 +373,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/form/mine", get(forms::mine))
         // 默认是 2MB：64MB 的安装包传到一半就被截断，浏览器看到的是"连接被重置"。
         // 放宽到略大于单包上限，超限的请求会被干净地拒掉（413）而不是悄悄截断。
+        // 备份 zip 可能有上百 MB（图片占大头），所以这里按 300MB 放行；
+        // 单张图片、安装包各自还有更严的上限，这道门只是兜底。
         .layer(DefaultBodyLimit::max(
-            (admin::MAX_UPLOAD_BYTES + 20 * 1024 * 1024) as usize,
+            (admin::MAX_UPLOAD_BYTES + 20 * 1024 * 1024).max(300 * 1024 * 1024) as usize,
         ))
         .with_state(state);
+
+    // 每天 03:00 自动备份（保留 7 份）
+    backup::spawn_auto_backup(auto_state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("监听 {bind}");

@@ -1069,7 +1069,7 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 - 编译：`cargo build --release` 0 warning；`cargo test --release` **38 项全过**；功能尚未部署。
 
 
-## 15. 密码规则调整（2026-10-31，ChatGPT 修改，未部署）
+## 15. 密码规则调整（2026-10-31，ChatGPT 修改，已部署）
 
 - 取消最小长度和复杂性校验。密码可为空；非空密码最多 32 个字符，仅允许 ASCII 英文字母、数字、`@`、`.`。客户端、服务端登录、管理员新增/重置和客服修改密码使用同一规则。
 - 空字符串在库中用空 `password_hash` 表示；`password_matches` 仅在提交密码也为空时通过。旧库原本未设密码的客服账号因此可免密登录；管理员仍可设置密码或通过空密码重置。
@@ -1089,3 +1089,86 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 - `xlsx::write_xlsx_sheets`：用 `merge_range` 先建合并区、再把左上角写回数字/文本 —— 金额合并后**仍是数字**（可 SUM）；单号/公司列 `force_text` 强制文本（纯数字单号不丢前导零）。
 - 分表 `group_by_carrier`：按订单**第一个单号**的承运商整单进一张表，sheet 内合并保留。
 - 网格：express 单元格只读，`apply_submission_edit` 跳过 express。
+
+## 16. 商品库（1.7.0）
+
+### 数据模型：两层，不是一个表
+
+```
+products      商品：名称 / 类目 / 类别 / 剂型(JSON 数组) / 功能(JSON 数组) / 使用方法 / 图片 / 热度 / rev
+product_skus  规格：所属商品 / 数值 + 单位 + 包装 / 69 码(UNIQUE) / 售价(分) / 促销 / rev
+product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_order
+```
+
+为什么要拆两层：同一个商品有 500ml 和 1L 两个规格，**69 码不同、价格不同**，
+但图片和话术只有一份。硬塞进一张表就会重复维护图片和话术。
+
+- **69 码全局唯一**：它是出库/对账认货的锚点，允许重复会让「这个码是谁的」变得无解。
+  写入前用 `sku_barcode_taken(barcode, except_sku)` 查，自己重存不算冲突。
+- **价格存「分」**（`price_cents` INTEGER）：`39.9` 存成 `3990`，避免浮点误差；
+  界面输入的「元」由 `products::price_to_cents` 转换，超过两位小数直接拒。
+- **码表出厂种子**只在 `product_dict` 为空时灌一次（`SEED_DICT`），之后完全由管理页维护；
+  类目/类别固定不可改（就 4 个组合），剂型/功能/单位/包装可增删、可拖拽排序。
+
+### 增量同步：rev 计数器
+
+- `app_meta.product_rev` 一个整数，每次写操作 `+1` 并写进受影响行的 `rev`
+  （`INSERT ... ON CONFLICT DO UPDATE` 在 SQLite 里是原子的）
+- 客户端带 `since` 来问，服务端只回 `rev > since` 的行
+- **删除不能靠「查不到」表达**，所以另记 `product_graveyard(kind, ref_id, rev)`，
+  客户端据此把商品/规格从本地缓存里摘掉
+- 改规格时**同时 bump 商品的 rev**：客户端按商品聚合，商品不刷新的话新规格挂不上去
+
+### 图片：上传即定型
+
+```
+校验 ≤10MB / jpg|png|webp → 解码 → 等比缩到长边 800（不裁）
+  → 贴到 800×800 纯白画布居中 → JPEG q82 → 再生成 160×160 缩略图
+  → 文件名 = 处理后内容的 sha256 前 16 位 → /data/products/img/<hash>.jpg + <hash>_t.jpg
+```
+
+- **白底补边而不是裁切**：瓶装产品是竖长条，居中裁成正方形会切掉瓶盖和瓶底。
+- **按内容哈希命名**：同一张图重复上传只存一份，商品行里只存 16 位哈希。
+- 列表只拉 `?s=thumb`（~8KB），点开才拉 800px（~100KB）——外网模式下这条很关键。
+- 路由 `/product-image/{hash}` 只接受 16 位十六进制，挡掉 `../`。
+
+### 接口
+
+| 接口 | 鉴权 | 说明 |
+|---|---|---|
+| `GET /products?since=<rev>` | 客户端 token（`x-bks-form`） | 增量拉取；未登录 401（商品库有售价，不给看） |
+| `POST /products/hit` | 同上 | 热度上报，一次最多 50 个 id |
+| `GET /product-image/{hash}?s=thumb` | 无 | 内容寻址，`Cache-Control: immutable` |
+| `POST /admin/products/{save,sku,sku/delete,image,dict/*}` | 管理 Cookie | 表单提交，303 回列表 |
+| `POST /admin/products/import` | 管理 Cookie | xlsx + 可选图片 zip |
+| `GET /admin/products/{template,export}.xlsx` | 管理 Cookie | 导入模板 / 导出当前库 |
+
+### 热度排序
+
+客户端点开商品详情时上报，服务端只累加 `hit_count` 和 `last_hit_at`，随商品下发；
+排序在**客户端**算：`hit_count / (1 + 距今天数/30)` 降序，热度为 0 的按类目 → 类别 → 名称。
+好处是服务端不需要定时任务；代价是冷启动时所有人都是 0，用一两周才自然浮上来。
+
+### 批量导入的两条规矩
+
+1. 两个 sheet（`商品` / `规格`）用**商品名**关联 —— 用 69 码关联的话，一个码填错就整行挂到别的商品上。
+2. 规格按 **69 码 upsert**：已存在就更新，不存在就新建；69 码已挂在**别的**商品上时跳过并在回执里说明。
+
+> calamine 0.26 和 zip 2.6 不兼容（`ZipFile` 在 2.6 多了个泛型参数导致编不过），
+> `Cargo.lock` 里把 calamine 用的 zip 钉在 **2.2.2**。升级 calamine 前先确认这一点。
+
+## 17. 备份 / 恢复（1.7.0）
+
+- **必须用 `VACUUM INTO` 做快照**，不能直接拷 `updates.db`：数据库开的是 WAL，
+  最新数据可能还在 `-wal` 里，只拷主库会丢一大截（手工备份时踩过）。
+- 备份内容：`updates.db`（快照）+ `secret.key`（带上它，恢复后所有人的登录态还能用）
+  + `products/img/*` + `manifest.json`（含 db 的 sha256，恢复时校验）。
+- **恢复不能在运行中热替换**：连接池握着句柄，NAS 上容易锁死或读到半截。
+  流程是：上传 → 解到 `/data/restore/` → 写 `restore.pending` → 进程退出 →
+  Docker 拉起 → **启动时在打开数据库之前**完成替换（`backup::apply_pending`）。
+  - 替换前会删掉旧的 `-wal`/`-shm`，否则会盖在刚恢复的主库上把数据弄乱
+  - 替换前会把现状另存一份到 `backups/pre-restore-<时间>/`
+  - 所以 compose 必须有 `restart: unless-stopped`，否则进程退出后起不来
+- **自动备份**：每 10 分钟醒一次看「本地时间是不是 3 点、今天这档做过没有」，
+  这样机器休眠、时钟跳变都不会漏；保留最近 7 份（`prune_auto`）。
+- 请求体上限放到 **300MB**（恢复要传 ~100MB 的 zip）；axum 默认只有 2MB。

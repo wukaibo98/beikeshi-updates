@@ -1,6 +1,6 @@
 [package]
 name = "bks-updates"
-version = "1.6.8"
+version = "1.7.0"
 edition = "2021"
 rust-version = "1.75"
 description = "贝可施客服小工具 · 更新分发服务"
@@ -21,6 +21,12 @@ hex = "0.4"
 rand = "0.8"
 time = { version = "0.3", features = ["formatting"] }
 rust_xlsxwriter = "0.92.0"
+# 商品库：图片统一成 800×800（白底补边）+ 160 缩略图；只开需要的编解码器
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# 全量备份打包/还原。特性与 rust_xlsxwriter 对齐，避免重复编译一份 zip
+zip = { version = "7", default-features = false, features = ["deflate"] }
+# 批量导入读 xlsx（xlsxwriter 只能写不能读）
+calamine = "0.26"
 
 [profile.release]
 opt-level = "z"

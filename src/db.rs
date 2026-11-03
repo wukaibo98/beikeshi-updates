@@ -91,6 +91,7 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     init_forms(conn)?;
+    init_products(conn)?;
     Ok(())
 }
 
@@ -1064,4 +1065,503 @@ pub fn form_stats(conn: &Connection) -> FormStats {
 pub fn form_user_delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
     let changed = conn.execute("DELETE FROM form_users WHERE id = ?", params![id])?;
     Ok(changed == 1)
+}
+
+/* ============================================================ 商品库 */
+//
+// 两层结构：products（商品，挂图片/话术/分类）+ product_skus（规格，挂 69 码/价格/促销）。
+// 一个 69 码只属于一条规格，全局唯一 —— 出库和对账都靠它认货。
+//
+// 增量同步靠一个全局 rev 计数器（app_meta.product_rev）：任何写操作把计数器 +1 并写进
+// 对应行的 rev，客户端带上本地 rev 来问「比我新的」，服务端只回这些行。
+// 删除不能靠「查不到」表达，所以另记一张 product_graveyard（kind + ref_id + rev）。
+
+/// 商品与规格的全局版本号存在这张表里（只有一行）
+const PRODUCT_REV_KEY: &str = "product_rev";
+
+#[derive(Debug, Clone)]
+pub struct ProductRow {
+    pub id: i64,
+    pub name: String,
+    pub category: String,
+    pub class_name: String,
+    pub forms_json: String,
+    pub funcs_json: String,
+    pub usage_text: String,
+    pub image: String,
+    pub hit_count: i64,
+    pub last_hit_at: i64,
+    pub enabled: bool,
+    /// 版本号只用来做增量查询（SQL 里比较），Rust 侧不需要读
+    #[allow(dead_code)]
+    pub rev: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkuRow {
+    pub id: i64,
+    pub product_id: i64,
+    pub spec_value: f64,
+    pub spec_unit: String,
+    pub spec_pack: String,
+    pub barcode69: String,
+    pub price_cents: i64,
+    pub promo: String,
+    pub sort_order: i64,
+    pub enabled: bool,
+    #[allow(dead_code)]
+    pub rev: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DictRow {
+    pub id: i64,
+    pub kind: String,
+    pub value: String,
+    /// 排序在 SQL 里生效，结构体里留一份便于排查
+    #[allow(dead_code)]
+    pub sort_order: i64,
+    pub enabled: bool,
+}
+
+/// 出厂码表。只在 product_dict 为空时灌一次，之后完全由管理页维护。
+const SEED_DICT: &[(&str, &[&str])] = &[
+    ("category", &["园艺", "农业"]),
+    ("class", &["园艺肥料", "园艺农药", "农业肥料", "农业农药"]),
+    (
+        "form",
+        &[
+            "液体", "颗粒", "晶体", "粉末", "乳油", "水剂", "悬浮剂", "水乳剂", "悬乳剂",
+            "可湿性粉剂", "水分散粒剂", "颗粒剂", "粉剂",
+        ],
+    ),
+    (
+        "function",
+        &[
+            "开花肥", "绿叶肥", "生长肥", "生根肥", "调土肥", "功能肥", "复合肥", "单质肥",
+            "杀虫剂", "杀菌剂", "除草剂", "杀螨剂", "杀线虫剂", "杀鼠剂", "杀软体动物剂",
+            "植物生长调节剂",
+        ],
+    ),
+    ("unit", &["ml", "L", "g", "kg"]),
+    ("pack", &["瓶", "袋", "桶", "包", "支"]),
+];
+
+pub(crate) fn init_products(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS products (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            category    TEXT NOT NULL DEFAULT '',
+            class_name  TEXT NOT NULL DEFAULT '',
+            forms_json  TEXT NOT NULL DEFAULT '[]',
+            funcs_json  TEXT NOT NULL DEFAULT '[]',
+            usage_text  TEXT NOT NULL DEFAULT '',
+            image       TEXT NOT NULL DEFAULT '',
+            hit_count   INTEGER NOT NULL DEFAULT 0,
+            last_hit_at INTEGER NOT NULL DEFAULT 0,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            rev         INTEGER NOT NULL DEFAULT 0,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_products_rev ON products(rev);
+        CREATE TABLE IF NOT EXISTS product_skus (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id  INTEGER NOT NULL,
+            spec_value  REAL NOT NULL DEFAULT 0,
+            spec_unit   TEXT NOT NULL DEFAULT '',
+            spec_pack   TEXT NOT NULL DEFAULT '',
+            barcode69   TEXT NOT NULL UNIQUE,
+            price_cents INTEGER NOT NULL DEFAULT 0,
+            promo       TEXT NOT NULL DEFAULT '',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            rev         INTEGER NOT NULL DEFAULT 0,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_skus_pid ON product_skus(product_id);
+        CREATE INDEX IF NOT EXISTS idx_skus_rev ON product_skus(rev);
+        CREATE TABLE IF NOT EXISTS product_dict (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind       TEXT NOT NULL,
+            value      TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(kind, value)
+        );
+        CREATE TABLE IF NOT EXISTS product_graveyard (
+            kind   TEXT NOT NULL,
+            ref_id INTEGER NOT NULL,
+            rev    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_grave_rev ON product_graveyard(rev);
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )?;
+
+    let seeded: i64 = conn.query_row("SELECT COUNT(*) FROM product_dict", [], |r| r.get(0))?;
+    if seeded == 0 {
+        for (kind, values) in SEED_DICT {
+            for (i, value) in values.iter().enumerate() {
+                conn.execute(
+                    "INSERT OR IGNORE INTO product_dict(kind, value, sort_order) VALUES(?1, ?2, ?3)",
+                    params![kind, value, i as i64],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 当前商品库版本（客户端拿它判断要不要更新）
+pub fn product_rev(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM app_meta WHERE key = ?1",
+        params![PRODUCT_REV_KEY],
+        |r| r.get(0),
+    )
+    .optional()
+    .map(|v| v.unwrap_or(0))
+}
+
+/// 取下一个版本号。`ON CONFLICT DO UPDATE` 在 SQLite 里是原子的，
+/// 并发写不会拿到同一个号。
+fn product_next_rev(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO app_meta(key, value) VALUES(?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        params![PRODUCT_REV_KEY],
+    )?;
+    product_rev(conn)
+}
+
+fn product_from_row(row: &Row<'_>) -> rusqlite::Result<ProductRow> {
+    Ok(ProductRow {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        category: row.get("category")?,
+        class_name: row.get("class_name")?,
+        forms_json: row.get("forms_json")?,
+        funcs_json: row.get("funcs_json")?,
+        usage_text: row.get("usage_text")?,
+        image: row.get("image")?,
+        hit_count: row.get("hit_count")?,
+        last_hit_at: row.get("last_hit_at")?,
+        enabled: row.get::<_, i64>("enabled")? == 1,
+        rev: row.get("rev")?,
+    })
+}
+
+fn sku_from_row(row: &Row<'_>) -> rusqlite::Result<SkuRow> {
+    Ok(SkuRow {
+        id: row.get("id")?,
+        product_id: row.get("product_id")?,
+        spec_value: row.get("spec_value")?,
+        spec_unit: row.get("spec_unit")?,
+        spec_pack: row.get("spec_pack")?,
+        barcode69: row.get("barcode69")?,
+        price_cents: row.get("price_cents")?,
+        promo: row.get("promo")?,
+        sort_order: row.get("sort_order")?,
+        enabled: row.get::<_, i64>("enabled")? == 1,
+        rev: row.get("rev")?,
+    })
+}
+
+const PRODUCT_COLS: &str = "id, name, category, class_name, forms_json, funcs_json, \
+     usage_text, image, hit_count, last_hit_at, enabled, rev";
+const SKU_COLS: &str = "id, product_id, spec_value, spec_unit, spec_pack, barcode69, \
+     price_cents, promo, sort_order, enabled, rev";
+
+pub fn products(conn: &Connection, only_enabled: bool) -> rusqlite::Result<Vec<ProductRow>> {
+    let sql = format!(
+        "SELECT {PRODUCT_COLS} FROM products {} ORDER BY id",
+        if only_enabled { "WHERE enabled = 1" } else { "" }
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], product_from_row)?;
+    rows.collect()
+}
+
+pub fn product_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<ProductRow>> {
+    conn.query_row(
+        &format!("SELECT {PRODUCT_COLS} FROM products WHERE id = ?1"),
+        params![id],
+        product_from_row,
+    )
+    .optional()
+}
+
+pub fn skus_of(conn: &Connection, product_id: i64) -> rusqlite::Result<Vec<SkuRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SKU_COLS} FROM product_skus WHERE product_id = ?1 ORDER BY sort_order, id"
+    ))?;
+    let rows = stmt.query_map(params![product_id], sku_from_row)?;
+    rows.collect()
+}
+
+pub struct NewProduct<'a> {
+    pub name: &'a str,
+    pub category: &'a str,
+    pub class_name: &'a str,
+    pub forms_json: &'a str,
+    pub funcs_json: &'a str,
+    pub usage_text: &'a str,
+    pub image: &'a str,
+}
+
+pub fn product_save(conn: &Connection, id: Option<i64>, p: &NewProduct<'_>) -> rusqlite::Result<i64> {
+    let now = now();
+    let rev = product_next_rev(conn)?;
+    match id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE products SET name=?2, category=?3, class_name=?4, forms_json=?5,
+                     funcs_json=?6, usage_text=?7, image=?8, rev=?9, updated_at=?10 WHERE id=?1",
+                params![id, p.name, p.category, p.class_name, p.forms_json, p.funcs_json,
+                        p.usage_text, p.image, rev, now],
+            )?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO products(name, category, class_name, forms_json, funcs_json,
+                     usage_text, image, rev, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                params![p.name, p.category, p.class_name, p.forms_json, p.funcs_json,
+                        p.usage_text, p.image, rev, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+/// 只改图片（上传/替换/清空都走这里），不动其它字段
+pub fn product_set_image(conn: &Connection, id: i64, image: &str) -> rusqlite::Result<()> {
+    let rev = product_next_rev(conn)?;
+    conn.execute(
+        "UPDATE products SET image = ?2, rev = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, image, rev, now()],
+    )?;
+    Ok(())
+}
+
+pub fn product_toggle(conn: &Connection, id: i64, enabled: bool) -> rusqlite::Result<()> {
+    let rev = product_next_rev(conn)?;
+    conn.execute(
+        "UPDATE products SET enabled = ?2, rev = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, if enabled { 1 } else { 0 }, rev, now()],
+    )?;
+    Ok(())
+}
+
+/// 删商品：连规格一起删，并在流水里记两条删除（客户端据此从本地缓存里摘掉）
+pub fn product_delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    let rev = product_next_rev(conn)?;
+    let sku_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM product_skus WHERE product_id = ?1")?;
+        let rows = stmt.query_map(params![id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for sku_id in sku_ids {
+        conn.execute(
+            "INSERT INTO product_graveyard(kind, ref_id, rev) VALUES('sku', ?1, ?2)",
+            params![sku_id, rev],
+        )?;
+    }
+    conn.execute("DELETE FROM product_skus WHERE product_id = ?1", params![id])?;
+    conn.execute("DELETE FROM products WHERE id = ?1", params![id])?;
+    conn.execute(
+        "INSERT INTO product_graveyard(kind, ref_id, rev) VALUES('product', ?1, ?2)",
+        params![id, rev],
+    )?;
+    Ok(())
+}
+
+pub struct NewSku<'a> {
+    pub product_id: i64,
+    pub spec_value: f64,
+    pub spec_unit: &'a str,
+    pub spec_pack: &'a str,
+    pub barcode69: &'a str,
+    pub price_cents: i64,
+    pub promo: &'a str,
+    pub sort_order: i64,
+}
+
+/// 69 码是否被**别的**规格占用（同一条自己重存不算冲突）
+pub fn sku_barcode_taken(conn: &Connection, barcode: &str, except_sku: i64) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM product_skus WHERE barcode69 = ?1 AND id <> ?2",
+        params![barcode, except_sku],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+pub fn sku_save(conn: &Connection, id: Option<i64>, s: &NewSku<'_>) -> rusqlite::Result<i64> {
+    let now = now();
+    let rev = product_next_rev(conn)?;
+    // 商品自己的 rev 也要动：客户端按商品聚合，规格变了商品就得重新下发
+    conn.execute(
+        "UPDATE products SET rev = ?2, updated_at = ?3 WHERE id = ?1",
+        params![s.product_id, rev, now],
+    )?;
+    match id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE product_skus SET product_id=?2, spec_value=?3, spec_unit=?4,
+                     spec_pack=?5, barcode69=?6, price_cents=?7, promo=?8, sort_order=?9,
+                     rev=?10, updated_at=?11 WHERE id=?1",
+                params![id, s.product_id, s.spec_value, s.spec_unit, s.spec_pack,
+                        s.barcode69, s.price_cents, s.promo, s.sort_order, rev, now],
+            )?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO product_skus(product_id, spec_value, spec_unit, spec_pack,
+                     barcode69, price_cents, promo, sort_order, rev, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params![s.product_id, s.spec_value, s.spec_unit, s.spec_pack, s.barcode69,
+                        s.price_cents, s.promo, s.sort_order, rev, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+pub fn sku_delete(conn: &Connection, id: i64, product_id: i64) -> rusqlite::Result<()> {
+    let rev = product_next_rev(conn)?;
+    conn.execute("DELETE FROM product_skus WHERE id = ?1", params![id])?;
+    conn.execute(
+        "INSERT INTO product_graveyard(kind, ref_id, rev) VALUES('sku', ?1, ?2)",
+        params![id, rev],
+    )?;
+    conn.execute(
+        "UPDATE products SET rev = ?2, updated_at = ?3 WHERE id = ?1",
+        params![product_id, rev, now()],
+    )?;
+    Ok(())
+}
+
+/// 客户端点开商品时上报一次热度。同一商品重复上报只累计次数，
+/// 时间戳取最新 —— 客户端用它做「30 天半衰」排序。
+pub fn product_hit(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
+    let now = now();
+    for id in ids {
+        conn.execute(
+            "UPDATE products SET hit_count = hit_count + 1, last_hit_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn product_dict(conn: &Connection) -> rusqlite::Result<Vec<DictRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, value, sort_order, enabled FROM product_dict ORDER BY kind, sort_order, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(DictRow {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            value: row.get(2)?,
+            sort_order: row.get(3)?,
+            enabled: row.get::<_, i64>(4)? == 1,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn dict_add(conn: &Connection, kind: &str, value: &str) -> rusqlite::Result<()> {
+    let next: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM product_dict WHERE kind = ?1",
+        params![kind],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO product_dict(kind, value, sort_order) VALUES(?1, ?2, ?3)",
+        params![kind, value, next],
+    )?;
+    Ok(())
+}
+
+pub fn dict_delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM product_dict WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// 拖拽排序：整组按前端给的新顺序重排（下标即顺序）
+pub fn dict_reorder(conn: &Connection, kind: &str, ids: &[i64]) -> rusqlite::Result<()> {
+    for (i, id) in ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE product_dict SET sort_order = ?3 WHERE id = ?1 AND kind = ?2",
+            params![id, kind, i as i64],
+        )?;
+    }
+    Ok(())
+}
+
+pub struct ProductSync {
+    pub rev: i64,
+    pub products: Vec<ProductRow>,
+    pub skus: Vec<SkuRow>,
+    /// (kind, id)：kind 是 "product" 或 "sku"
+    pub deleted: Vec<(String, i64)>,
+}
+
+pub fn product_sync(conn: &Connection, since: i64) -> rusqlite::Result<ProductSync> {
+    let rev = product_rev(conn)?;
+    let mut pstmt = conn.prepare(&format!(
+        "SELECT {PRODUCT_COLS} FROM products WHERE rev > ?1 ORDER BY id"
+    ))?;
+    let products = pstmt
+        .query_map(params![since], product_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut sstmt = conn.prepare(&format!(
+        "SELECT {SKU_COLS} FROM product_skus WHERE rev > ?1 ORDER BY product_id, sort_order, id"
+    ))?;
+    let skus = sstmt
+        .query_map(params![since], sku_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut gstmt =
+        conn.prepare("SELECT kind, ref_id FROM product_graveyard WHERE rev > ?1 ORDER BY rev")?;
+    let deleted = gstmt
+        .query_map(params![since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(ProductSync { rev, products, skus, deleted })
+}
+
+/// 商品库里引用了哪些图片（留给之后的「清理孤立图片」，现在还没接页面）
+#[allow(dead_code)]
+pub fn product_images_used(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT image FROM products WHERE image <> ''")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    rows.collect()
+}
+
+pub fn product_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<ProductRow>> {
+    conn.query_row(
+        &format!("SELECT {PRODUCT_COLS} FROM products WHERE name = ?1"),
+        params![name],
+        product_from_row,
+    )
+    .optional()
+}
+
+pub fn sku_by_barcode(conn: &Connection, barcode: &str) -> rusqlite::Result<Option<SkuRow>> {
+    conn.query_row(
+        &format!("SELECT {SKU_COLS} FROM product_skus WHERE barcode69 = ?1"),
+        params![barcode],
+        sku_from_row,
+    )
+    .optional()
 }
