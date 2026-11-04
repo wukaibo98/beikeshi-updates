@@ -10,6 +10,15 @@
 ARG RUST_IMAGE=rust:1-alpine
 FROM ${RUST_IMAGE} AS build
 
+# 可选的 crates 镜像：国内构建时 crates.io 会卡住（实测 16 分钟零编译），
+# 传这个参数换源即可；GitHub Actions 上留空，照旧走 crates.io。
+#   docker build --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ ...
+ARG CARGO_MIRROR=
+RUN if [ -n "$CARGO_MIRROR" ]; then \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+        "$CARGO_MIRROR" > /usr/local/cargo/config.toml; \
+    fi
+
 # rusqlite 用 bundled 特性自带 SQLite 源码，需要 C 编译器
 RUN apk add --no-cache musl-dev
 
@@ -17,17 +26,25 @@ WORKDIR /src
 
 # 先只拷清单，让依赖层能被缓存：改代码不用重新编译依赖
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    mkdir src && echo "fn main() {}" > src/main.rs && \
     cargo build --release && \
     rm -rf src
 
 COPY src ./src
-# 需要 touch 一下，否则 cargo 认为源码没变，会复用上面那个空壳
-RUN touch src/main.rs && cargo build --release
+# 需要 touch 一下，否则 cargo 认为源码没变，会复用上面那个空壳。
+# target 是 cache mount（构建间复用、但不进镜像层），所以要把产物复制到普通目录。
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    touch src/main.rs && cargo build --release && \
+    cp target/release/bks-updates /usr/local/bin/bks-updates
 
 FROM scratch
 
-COPY --from=build /src/target/release/bks-updates /bks-updates
+COPY --from=build /usr/local/bin/bks-updates /bks-updates
 
 ENV DATA_DIR=/data \
     BIND=0.0.0.0:8080
