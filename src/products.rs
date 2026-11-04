@@ -1000,10 +1000,10 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
     let import = r##"<div class="card">
   <h2>批量导入<span class="muted">Excel 填字 + 图片打包，一次灌几百个</span></h2>
   <p class="muted" style="line-height:1.8">
-    <b>模板就是导出格式</b>（「商品」「规格」两个 sheet，列完全一致），所以「导出 → 改 → 导入」是闭环。<br>
-    ① 下载空模板填，或者直接导出当前商品库来改（用商品名把两个 sheet 对上）；<br>
-    ② 图片打包成 zip，文件名用 <code>商品名.jpg</code> 或 <code>69码.jpg</code>（支持 jpg/png/webp）；<br>
-    ③ 两个文件一起传，服务端按 69 码增量写入（已存在就更新，不会重复建）。
+    <b>模板就是导出格式</b>（一张表，13 列，完全一致），所以「导出 → 改 → 导入」是闭环。<br>
+    ① <b>一行一条规格</b>：同一个商品的几行用<strong>同一个商品名</strong>，类目/剂型/话术这些只写第一行就行，导入时按商品名合并；<br>
+    ② 没写 69 码的行只当商品（不建规格）；69 码已存在就更新，不会重复建；<br>
+    ③ 图片打包成 zip，文件名用 <code>商品名.jpg</code> 或 <code>69码.jpg</code>（支持 jpg/png/webp），和 Excel 一起传。
   </p>
   <div class="row" style="margin-bottom:14px">
     <a class="ghost" href="/admin/products/template.xlsx">下载空模板</a>

@@ -1,11 +1,11 @@
 //! 商品库的批量导入 / 导出 / 模板下载。
 //!
 //! 为什么用 xlsx 而不是 CSV：Excel 另存 CSV 在中文 Windows 上是 GBK，
-//! 传到服务端必然乱码；xlsx 是 UTF-8 且能带多 sheet。
+//! 传到服务端必然乱码；xlsx 是 UTF-8。
 //!
-//! 两个 sheet 靠**商品名**关联（69 码只属于规格，用它关联商品容易一码错全错）：
-//!   「商品」：商品名 | 类目 | 类别 | 剂型 | 功能 | 使用方法 | 图片文件名
-//!   「规格」：商品名 | 数值 | 单位 | 包装 | 69码 | 售价(元) | 促销
+//! **一张表，一行一条规格**（不是两个 sheet）：商品名相同的几行属于同一个商品，
+//! 商品级字段（类目/类别/剂型/功能/使用方法/图片）只在第一行写就行，导入时按商品名合并。
+//! 这样「导出 → 改 → 导入」在 Excel 里就是一张连续的表格，不用来回切标签页，也能直接排序筛选。
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -18,14 +18,12 @@ use calamine::DataType;
 
 use crate::{db, products, AppState};
 
-const SHEET_PRODUCTS: &str = "商品";
-const SHEET_SKUS: &str = "规格";
+const SHEET: &str = "商品";
 
-const PRODUCT_HEADERS: [&str; 7] = [
+/// 列顺序即导入模板顺序；改这里导入导出一起变
+const HEADERS: [&str; 13] = [
     "商品名", "类目", "类别", "剂型", "功能", "使用方法", "图片文件名",
-];
-const SKU_HEADERS: [&str; 7] = [
-    "商品名", "数值", "单位", "包装", "69码", "售价(元)", "促销",
+    "规格数值", "单位", "包装", "69码", "售价(元)", "促销",
 ];
 
 fn back(ok: Option<&str>, err: Option<&str>) -> Response {
@@ -40,7 +38,6 @@ fn back(ok: Option<&str>, err: Option<&str>) -> Response {
 }
 
 /// 导入模板：**和导出完全同一套列**，只是没有数据行。
-/// 这样「导出 → 改 → 导入」是一条闭环，不会出现模板和导出的列对不上的情况。
 pub async fn template(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !crate::is_admin(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -51,20 +48,18 @@ pub async fn template(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
-/// 导出：把库里现有的商品和规格原样导成同样的两张表（备份 + 手工改价都靠它）
 pub async fn export(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !crate::is_admin(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let (products, skus) = {
         let conn = state.conn.get().unwrap();
-        (db::products(&conn, false).unwrap_or_default(), {
-            let mut all = Vec::new();
-            for p in db::products(&conn, false).unwrap_or_default() {
-                all.extend(db::skus_of(&conn, p.id).unwrap_or_default());
-            }
-            all
-        })
+        let products = db::products(&conn, false).unwrap_or_default();
+        let mut skus = Vec::new();
+        for p in &products {
+            skus.extend(db::skus_of(&conn, p.id).unwrap_or_default());
+        }
+        (products, skus)
     };
     match build_export(&products, &skus) {
         Ok(bytes) => xlsx_response(bytes, "商品库导出.xlsx"),
@@ -72,18 +67,22 @@ pub async fn export(State(state): State<AppState>, headers: HeaderMap) -> Respon
     }
 }
 
+/// 一行一条规格；没有规格的商品也占一行（后半段留空），不然导出会把它丢掉。
 fn build_export(products: &[db::ProductRow], skus: &[db::SkuRow]) -> Result<Vec<u8>, String> {
     use rust_xlsxwriter::{Format, Workbook};
-    let mut wb = Workbook::new();
-    let bold = Format::new().set_bold();
 
+    let mut wb = Workbook::new();
     let sheet = wb.add_worksheet();
-    sheet.set_name(SHEET_PRODUCTS).map_err(|e| e.to_string())?;
-    for (i, h) in PRODUCT_HEADERS.iter().enumerate() {
-        sheet.write_with_format(0, i as u16, *h, &bold).map_err(|e| e.to_string())?;
+    sheet.set_name(SHEET).map_err(|e| e.to_string())?;
+    let bold = Format::new().set_bold();
+    for (i, h) in HEADERS.iter().enumerate() {
+        sheet
+            .write_with_format(0, i as u16, *h, &bold)
+            .map_err(|e| e.to_string())?;
     }
-    for (r, p) in products.iter().enumerate() {
-        let row = r as u32 + 1;
+
+    let mut row = 1u32;
+    for p in products {
         let forms: Vec<String> = serde_json::from_str(&p.forms_json).unwrap_or_default();
         let funcs: Vec<String> = serde_json::from_str(&p.funcs_json).unwrap_or_default();
         let image_name = if p.image.is_empty() {
@@ -91,47 +90,57 @@ fn build_export(products: &[db::ProductRow], skus: &[db::SkuRow]) -> Result<Vec<
         } else {
             format!("{}.jpg", p.image)
         };
-        let cells = [
-            p.name.clone(),
-            p.category.clone(),
-            p.class_name.clone(),
-            forms.join("、"),
-            funcs.join("、"),
-            p.usage_text.clone(),
-            image_name,
-        ];
-        for (i, v) in cells.iter().enumerate() {
-            sheet.write(row, i as u16, v.as_str()).map_err(|e| e.to_string())?;
+        let own: Vec<&db::SkuRow> = skus.iter().filter(|s| s.product_id == p.id).collect();
+
+        let mut write_row = |spec: Option<&db::SkuRow>| -> Result<(), String> {
+            let cells: [String; 13] = [
+                p.name.clone(),
+                p.category.clone(),
+                p.class_name.clone(),
+                forms.join("、"),
+                funcs.join("、"),
+                p.usage_text.clone(),
+                image_name.clone(),
+                spec.map(|s| if s.spec_value > 0.0 { fmt_num(s.spec_value) } else { String::new() })
+                    .unwrap_or_default(),
+                spec.map(|s| s.spec_unit.clone()).unwrap_or_default(),
+                spec.map(|s| s.spec_pack.clone()).unwrap_or_default(),
+                spec.map(|s| s.barcode69.clone()).unwrap_or_default(),
+                spec.map(|s| format!("{}.{:02}", s.price_cents / 100, s.price_cents % 100))
+                    .unwrap_or_default(),
+                spec.map(|s| s.promo.clone()).unwrap_or_default(),
+            ];
+            for (i, v) in cells.iter().enumerate() {
+                sheet
+                    .write(row, i as u16, v.as_str())
+                    .map_err(|e| e.to_string())?;
+            }
+            row += 1;
+            Ok(())
+        };
+
+        if own.is_empty() {
+            write_row(None)?;
+        } else {
+            for s in own {
+                write_row(Some(s))?;
+            }
         }
     }
+
     sheet.set_column_width(0, 24).ok();
     sheet.set_column_width(5, 40).ok();
-
-    let sheet = wb.add_worksheet();
-    sheet.set_name(SHEET_SKUS).map_err(|e| e.to_string())?;
-    for (i, h) in SKU_HEADERS.iter().enumerate() {
-        sheet.write_with_format(0, i as u16, *h, &bold).map_err(|e| e.to_string())?;
-    }
-    let names: HashMap<i64, &str> = products.iter().map(|p| (p.id, p.name.as_str())).collect();
-    for (r, s) in skus.iter().enumerate() {
-        let row = r as u32 + 1;
-        let cells = [
-            names.get(&s.product_id).copied().unwrap_or("").to_string(),
-            if s.spec_value > 0.0 { format!("{}", s.spec_value) } else { String::new() },
-            s.spec_unit.clone(),
-            s.spec_pack.clone(),
-            s.barcode69.clone(),
-            format!("{}.{:02}", s.price_cents / 100, s.price_cents % 100),
-            s.promo.clone(),
-        ];
-        for (i, v) in cells.iter().enumerate() {
-            sheet.write(row, i as u16, v.as_str()).map_err(|e| e.to_string())?;
-        }
-    }
-    sheet.set_column_width(0, 24).ok();
-    sheet.set_column_width(4, 18).ok();
+    sheet.set_column_width(10, 18).ok();
 
     wb.save_to_buffer().map_err(|e| e.to_string())
+}
+
+fn fmt_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v}")
+    }
 }
 
 fn xlsx_response(bytes: Vec<u8>, filename: &str) -> Response {
@@ -152,20 +161,16 @@ fn xlsx_response(bytes: Vec<u8>, filename: &str) -> Response {
         .into_response()
 }
 
-/// 一行里的单元格按列序取出（缺列按空串，数字转成文本）
+/* ============================================================ 导入 */
+
+/// 一行按列序取出（缺列按空串，数字转文本）
 fn row_cells(row: &[calamine::Data], n: usize) -> Vec<String> {
     (0..n)
         .map(|i| {
             row.get(i)
                 .map(|c| match c {
                     calamine::Data::Int(v) => v.to_string(),
-                    calamine::Data::Float(v) => {
-                        if (v - v.round()).abs() < 1e-9 {
-                            format!("{}", v.round() as i64)
-                        } else {
-                            v.to_string()
-                        }
-                    }
+                    calamine::Data::Float(v) => fmt_num(*v),
                     other => other.as_string().unwrap_or_default().trim().to_string(),
                 })
                 .unwrap_or_default()
@@ -208,7 +213,7 @@ pub async fn import(
         return back(None, Some("没有收到 Excel 文件"));
     };
 
-    // 解析 + 写库都在阻塞线程里做：几百行 xlsx 解析不该占着异步线程
+    // 几百行解析 + 写库都在阻塞线程里做，别占异步线程
     let result = {
         let state = state.clone();
         tokio::task::spawn_blocking(move || parse_and_import(&state, &sheet_bytes, zip_bytes)).await
@@ -230,126 +235,122 @@ fn parse_and_import(
     let mut wb: Xlsx<_> = calamine::open_workbook_from_rs(Cursor::new(sheet_bytes.to_vec()))
         .map_err(|e| format!("读不了这个 Excel：{e:?}"))?;
 
+    // 只有一张表；万一被改名了，退而用第一张
+    let range = match wb.worksheet_range(SHEET) {
+        Ok(r) => r,
+        Err(_) => {
+            let first = wb
+                .sheet_names()
+                .first()
+                .cloned()
+                .ok_or_else(|| "这个 Excel 里没有工作表".to_string())?;
+            wb.worksheet_range(&first)
+                .map_err(|e| format!("读不到工作表「{first}」：{e:?}"))?
+        }
+    };
+
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut sku_created = 0usize;
     let mut sku_updated = 0usize;
     let mut warnings: Vec<String> = Vec::new();
+    // 商品名 -> id：同一个商品在表里出现多行，商品只写一次
+    let mut seen: HashMap<String, i64> = HashMap::new();
 
-    // 商品名 -> id（导入过程里新建的商品也能马上被规格引用）
-    let mut known: HashMap<String, i64> = HashMap::new();
-    if let Ok(range) = wb.worksheet_range(SHEET_PRODUCTS) {
-        for row in range.rows().skip(1) {
-            let cells = row_cells(row, PRODUCT_HEADERS.len());
-            let name = cells[0].clone();
-            if name.is_empty() {
-                continue;
-            }
-            let forms = split_multi(&cells[3]);
-            let funcs = split_multi(&cells[4]);
-            let conn = state.conn.get().unwrap();
-            let existing = db::product_by_name(&conn, &name).ok().flatten();
-            let id = existing.as_ref().map(|p| p.id);
-            let forms_json = serde_json::to_string(&forms).unwrap_or_else(|_| "[]".into());
-            let funcs_json = serde_json::to_string(&funcs).unwrap_or_else(|_| "[]".into());
-            // 图片这一列在导入时先保留原值（稍后按 zip 覆盖），避免二次导入把图冲掉
-            let image = existing
-                .as_ref()
-                .map(|p| p.image.clone())
-                .unwrap_or_default();
-            let new = db::NewProduct {
-                name: &name,
-                category: &cells[1],
-                class_name: &cells[2],
-                forms_json: &forms_json,
-                funcs_json: &funcs_json,
-                usage_text: &cells[5],
-                image: &image,
-            };
-            match db::product_save(&conn, id, &new) {
-                Ok(pid) => {
-                    known.insert(name.clone(), pid);
-                    if id.is_some() {
-                        updated += 1;
-                    } else {
-                        created += 1;
+    for (i, row) in range.rows().skip(1).enumerate() {
+        let line = i + 2; // Excel 行号（表头是第 1 行）
+        let cells = row_cells(row, HEADERS.len());
+        let name = cells[0].clone();
+        if name.is_empty() {
+            continue;
+        }
+        let conn = state.conn.get().unwrap();
+
+        // ---- 商品：同名只处理第一行 ----
+        let pid = match seen.get(&name) {
+            Some(id) => *id,
+            None => {
+                let existing = db::product_by_name(&conn, &name).ok().flatten();
+                let id = existing.as_ref().map(|p| p.id);
+                // 图片沿用原值（zip 传图时再覆盖），二次导入不会把图冲掉
+                let image = existing.as_ref().map(|p| p.image.clone()).unwrap_or_default();
+                let forms_json =
+                    serde_json::to_string(&split_multi(&cells[3])).unwrap_or_else(|_| "[]".into());
+                let funcs_json =
+                    serde_json::to_string(&split_multi(&cells[4])).unwrap_or_else(|_| "[]".into());
+                let new = db::NewProduct {
+                    name: &name,
+                    category: &cells[1],
+                    class_name: &cells[2],
+                    forms_json: &forms_json,
+                    funcs_json: &funcs_json,
+                    usage_text: &cells[5],
+                    image: &image,
+                };
+                match db::product_save(&conn, id, &new) {
+                    Ok(v) => {
+                        if id.is_some() {
+                            updated += 1;
+                        } else {
+                            created += 1;
+                        }
+                        seen.insert(name.clone(), v);
+                        v
+                    }
+                    Err(e) => {
+                        warnings.push(format!("第 {line} 行：商品「{name}」写入失败：{e}"));
+                        continue;
                     }
                 }
-                Err(e) => warnings.push(format!("商品「{name}」写入失败：{e}")),
+            }
+        };
+
+        // ---- 规格：69 码是主键，有则更新无则新建 ----
+        let barcode = cells[10].clone();
+        if barcode.is_empty() {
+            // 这一行只写了商品没写规格：允许（商品可以先没有规格）
+            continue;
+        }
+        let Some(price_cents) = products::price_to_cents(&cells[11]) else {
+            warnings.push(format!("第 {line} 行：售价格式不对（{}）", cells[11]));
+            continue;
+        };
+        let existing = db::sku_by_barcode(&conn, &barcode).ok().flatten();
+        let sku_id = existing.as_ref().map(|s| s.id);
+        if let Some(s) = &existing {
+            if s.product_id != pid {
+                warnings.push(format!("第 {line} 行：69 码 {barcode} 已经挂在别的商品上，跳过"));
+                continue;
             }
         }
-    } else {
-        warnings.push(format!("没找到「{SHEET_PRODUCTS}」这个 sheet"));
-    }
-
-    // 规格：69 码是主键，已存在就更新（找到它属于哪个商品）
-    if let Ok(range) = wb.worksheet_range(SHEET_SKUS) {
-        for (i, row) in range.rows().skip(1).enumerate() {
-            let cells = row_cells(row, SKU_HEADERS.len());
-            let name = cells[0].clone();
-            let barcode = cells[4].clone();
-            if name.is_empty() && barcode.is_empty() {
-                continue;
-            }
-            let conn = state.conn.get().unwrap();
-            let Some(pid) = known
-                .get(&name)
-                .copied()
-                .or_else(|| db::product_by_name(&conn, &name).ok().flatten().map(|p| p.id))
-            else {
-                warnings.push(format!("第 {} 行：商品名「{name}」不存在，跳过", i + 2));
-                continue;
-            };
-            if barcode.is_empty() {
-                warnings.push(format!("第 {} 行：没有 69 码，跳过", i + 2));
-                continue;
-            }
-            let Some(price_cents) = products::price_to_cents(&cells[5]) else {
-                warnings.push(format!("第 {} 行：售价格式不对（{}）", i + 2, cells[5]));
-                continue;
-            };
-            let existing = db::sku_by_barcode(&conn, &barcode).ok().flatten();
-            let sku_id = existing.as_ref().map(|s| s.id);
-            if let Some(s) = &existing {
-                if s.product_id != pid {
-                    warnings.push(format!(
-                        "69 码 {barcode} 已经挂在别的商品上（id {}），跳过",
-                        s.product_id
-                    ));
-                    continue;
+        let new = db::NewSku {
+            product_id: pid,
+            spec_value: cells[7].parse::<f64>().unwrap_or(0.0),
+            spec_unit: &cells[8],
+            spec_pack: &cells[9],
+            barcode69: &barcode,
+            price_cents,
+            promo: &cells[12],
+            sort_order: i as i64,
+        };
+        match db::sku_save(&conn, sku_id, &new) {
+            Ok(_) => {
+                if sku_id.is_some() {
+                    sku_updated += 1;
+                } else {
+                    sku_created += 1;
                 }
             }
-            let new = db::NewSku {
-                product_id: pid,
-                spec_value: cells[1].parse::<f64>().unwrap_or(0.0),
-                spec_unit: &cells[2],
-                spec_pack: &cells[3],
-                barcode69: &barcode,
-                price_cents,
-                promo: &cells[6],
-                sort_order: i as i64,
-            };
-            match db::sku_save(&conn, sku_id, &new) {
-                Ok(_) => {
-                    if sku_id.is_some() {
-                        sku_updated += 1;
-                    } else {
-                        sku_created += 1;
-                    }
-                }
-                Err(e) => warnings.push(format!("69 码 {barcode} 写入失败：{e}")),
-            }
+            Err(e) => warnings.push(format!("第 {line} 行：69 码 {barcode} 写入失败：{e}")),
         }
-    } else {
-        warnings.push(format!("没找到「{SHEET_SKUS}」这个 sheet"));
     }
 
-    // 图片：zip 里每个文件按「文件名去扩展名」找商品（先按商品名，再按 69 码）
+    // ---- 图片 zip：文件名按商品名或 69 码匹配 ----
     let mut img_ok = 0usize;
     let mut img_miss: Vec<String> = Vec::new();
     if let Some(zb) = zip_bytes {
-        let mut archive = zip::ZipArchive::new(Cursor::new(zb))
-            .map_err(|e| format!("图片 zip 打不开：{e}"))?;
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(zb)).map_err(|e| format!("图片 zip 打不开：{e}"))?;
         for i in 0..archive.len() {
             let Ok(mut file) = archive.by_index(i) else { continue };
             if file.is_dir() {
@@ -368,7 +369,7 @@ fn parse_and_import(
                 continue;
             }
             let conn = state.conn.get().unwrap();
-            let pid = known.get(&stem).copied().or_else(|| {
+            let pid = seen.get(&stem).copied().or_else(|| {
                 db::product_by_name(&conn, &stem).ok().flatten().map(|p| p.id)
             });
             let pid = match pid {
@@ -400,9 +401,16 @@ fn parse_and_import(
     if !warnings.is_empty() || !img_miss.is_empty() {
         let mut tail: Vec<String> = warnings;
         if !img_miss.is_empty() {
-            tail.push(format!("{} 张图没匹配上商品：{}", img_miss.len(), img_miss.iter().take(3).cloned().collect::<Vec<_>>().join("、")));
+            tail.push(format!(
+                "{} 张图没匹配上商品：{}",
+                img_miss.len(),
+                img_miss.iter().take(3).cloned().collect::<Vec<_>>().join("、")
+            ));
         }
-        msg.push_str(&format!("。要注意：{}", tail.iter().take(4).cloned().collect::<Vec<_>>().join("；")));
+        msg.push_str(&format!(
+            "。要注意：{}",
+            tail.iter().take(4).cloned().collect::<Vec<_>>().join("；")
+        ));
     }
     Ok(msg)
 }
