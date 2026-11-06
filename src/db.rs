@@ -1070,7 +1070,8 @@ pub fn form_user_delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 /* ============================================================ 商品库 */
 //
 // 两层结构：products（商品，挂图片/话术/分类）+ product_skus（规格，挂 69 码/价格/促销）。
-// 一个 69 码只属于一条规格，全局唯一 —— 出库和对账都靠它认货。
+// **非空** 69 码一条规格、全局唯一（出库和对账靠它认货）；69 码允许留空，
+// 留空的规格可以有很多条，靠 id / 规格三元组认自己。
 //
 // 增量同步靠一个全局 rev 计数器（app_meta.product_rev）：任何写操作把计数器 +1 并写进
 // 对应行的 rev，客户端带上本地 rev 来问「比我新的」，服务端只回这些行。
@@ -1179,7 +1180,7 @@ pub(crate) fn init_products(conn: &Connection) -> rusqlite::Result<()> {
             spec_value  REAL NOT NULL DEFAULT 0,
             spec_unit   TEXT NOT NULL DEFAULT '',
             spec_pack   TEXT NOT NULL DEFAULT '',
-            barcode69   TEXT NOT NULL UNIQUE,
+            barcode69   TEXT NOT NULL,
             price_cents INTEGER NOT NULL DEFAULT 0,
             promo       TEXT NOT NULL DEFAULT '',
             sort_order  INTEGER NOT NULL DEFAULT 0,
@@ -1190,6 +1191,9 @@ pub(crate) fn init_products(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_skus_pid ON product_skus(product_id);
         CREATE INDEX IF NOT EXISTS idx_skus_rev ON product_skus(rev);
+        -- 1.7.8 起 69 码选填：只对非空码做全局唯一，空串可以有很多条
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_skus_barcode
+            ON product_skus(barcode69) WHERE barcode69 <> '';
         CREATE TABLE IF NOT EXISTS product_dict (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             kind       TEXT NOT NULL,
@@ -1209,6 +1213,23 @@ pub(crate) fn init_products(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );",
     )?;
+
+    // 1.7.8：69 码从必填改成选填。老库的 product_skus.barcode69 是列级 UNIQUE，
+    // 两条空串会直接撞约束；SQLite 又不能 DROP CONSTRAINT，只能重建表。
+    // 新表已去掉列上 UNIQUE，改由「非空才唯一」的部分索引保证真实 69 码仍全局唯一。
+    // 检测依据是新表 SQL 里不含 UNIQUE，所以升级过一次之后就不会再重复迁移。
+    let needs_sku_migration: bool = conn
+        .query_row(
+            "SELECT COALESCE(sql, '') FROM sqlite_master
+             WHERE type = 'table' AND name = 'product_skus'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .map_or(false, |sql| sql.contains("UNIQUE"));
+    if needs_sku_migration {
+        migrate_skus_allow_empty_barcode(conn)?;
+    }
 
     // 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，
     // 所以这里显式补一次（失败说明已经有了，忽略即可）
@@ -1241,6 +1262,43 @@ pub(crate) fn init_products(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 把带列级 UNIQUE 的老 product_skus 换成「69 码可留空、非空码才唯一」的新表。
+/// 整段在一个事务里：建新表 → 按原 id 整行搬数据 → 删旧表 → 改名 → 重建索引。
+/// 任何一步失败整个回滚，旧表原样留着，下次启动会再试一次。
+fn migrate_skus_allow_empty_barcode(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE product_skus_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id  INTEGER NOT NULL,
+            spec_value  REAL NOT NULL DEFAULT 0,
+            spec_unit   TEXT NOT NULL DEFAULT '',
+            spec_pack   TEXT NOT NULL DEFAULT '',
+            barcode69   TEXT NOT NULL,
+            price_cents INTEGER NOT NULL DEFAULT 0,
+            promo       TEXT NOT NULL DEFAULT '',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            rev         INTEGER NOT NULL DEFAULT 0,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+        INSERT INTO product_skus_new
+            (id, product_id, spec_value, spec_unit, spec_pack, barcode69,
+             price_cents, promo, sort_order, enabled, rev, created_at, updated_at)
+        SELECT id, product_id, spec_value, spec_unit, spec_pack, barcode69,
+               price_cents, promo, sort_order, enabled, rev, created_at, updated_at
+        FROM product_skus;
+        DROP TABLE product_skus;
+        ALTER TABLE product_skus_new RENAME TO product_skus;
+        CREATE INDEX idx_skus_pid ON product_skus(product_id);
+        CREATE INDEX idx_skus_rev ON product_skus(rev);
+        CREATE UNIQUE INDEX idx_skus_barcode
+            ON product_skus(barcode69) WHERE barcode69 <> '';",
+    )?;
+    tx.commit()
 }
 
 /// 当前商品库版本（客户端拿它判断要不要更新）
@@ -1427,14 +1485,40 @@ pub struct NewSku<'a> {
     pub sort_order: i64,
 }
 
-/// 69 码是否被**别的**规格占用（同一条自己重存不算冲突）
+/// 69 码是否被**别的**规格占用（同一条自己重存不算冲突）。
+/// 空 69 码不算「占用」：允许一个商品有多条没写码的规格。
 pub fn sku_barcode_taken(conn: &Connection, barcode: &str, except_sku: i64) -> rusqlite::Result<bool> {
+    if barcode.is_empty() {
+        return Ok(false);
+    }
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM product_skus WHERE barcode69 = ?1 AND id <> ?2",
         params![barcode, except_sku],
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+/// 空 69 码的规格靠「数值 + 单位 + 包装」认自己。
+/// 导入时用它找已有行来更新，否则每次导入都会新建一条（导出→导入闭环会越滚越多）。
+pub fn sku_find_blank_by_spec(
+    conn: &Connection,
+    product_id: i64,
+    spec_value: f64,
+    spec_unit: &str,
+    spec_pack: &str,
+) -> rusqlite::Result<Option<SkuRow>> {
+    conn.query_row(
+        &format!(
+            "SELECT {SKU_COLS} FROM product_skus
+             WHERE product_id = ?1 AND barcode69 = ''
+               AND spec_value = ?2 AND spec_unit = ?3 AND spec_pack = ?4
+             ORDER BY id LIMIT 1"
+        ),
+        params![product_id, spec_value, spec_unit, spec_pack],
+        sku_from_row,
+    )
+    .optional()
 }
 
 pub fn sku_save(conn: &Connection, id: Option<i64>, s: &NewSku<'_>) -> rusqlite::Result<i64> {
@@ -1608,6 +1692,10 @@ pub fn product_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option
 }
 
 pub fn sku_by_barcode(conn: &Connection, barcode: &str) -> rusqlite::Result<Option<SkuRow>> {
+    // 空码的规格可能有很多条，不能用空串去「查一条」（query_row 会随便返回第一条）
+    if barcode.is_empty() {
+        return Ok(None);
+    }
     conn.query_row(
         &format!("SELECT {SKU_COLS} FROM product_skus WHERE barcode69 = ?1"),
         params![barcode],

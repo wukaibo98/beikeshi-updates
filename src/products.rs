@@ -382,6 +382,9 @@ pub struct SkuInput {
 
 impl SkuInput {
     fn is_blank(&self) -> bool {
+        // 单位 / 包装是下拉框，新增的空白行也总带着一个默认值，
+        // 所以**不能**把它们算进「有没有填」——否则点一次保存就会凭空多一条空规格。
+        // 用户至少填了数值、售价、促销或 69 码之一，才算真的想建一条规格。
         self.barcode.is_empty()
             && self.price.trim().is_empty()
             && self.promo.trim().is_empty()
@@ -422,26 +425,31 @@ pub fn save_product_with_skus(
 ) -> Result<i64, String> {
     use std::collections::HashSet;
 
-    // 1) 先校验：空行跳过，其余必须有 69 码、价格能转、69 码不重复
+    // 1) 先校验：空行跳过。**69 码选填** —— 只有填了的码才做去重和全局占用检查，
+    //    留空可以有很多条（老商品经常还没申请条码）。报错统一带序号，
+    //    否则没码的规格只会显示「69 码  已被占用」这种看不懂的话。
     let mut seen: HashSet<&str> = HashSet::new();
     let mut clean: Vec<&SkuInput> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         if row.remove || row.is_blank() {
             continue;
         }
-        if row.barcode.is_empty() {
-            return Err(format!("第 {} 条规格没填 69 码", i + 1));
-        }
-        if !seen.insert(row.barcode.as_str()) {
-            return Err(format!("69 码 {} 在这个商品里填了两次", row.barcode));
+        let label = if row.barcode.is_empty() {
+            format!("第 {} 条规格（未填 69 码）", i + 1)
+        } else {
+            format!("69 码 {}", row.barcode)
+        };
+        if !row.barcode.is_empty() && !seen.insert(row.barcode.as_str()) {
+            return Err(format!("{} 在这个商品里填了两次", label));
         }
         if price_to_cents(&row.price).is_none() {
-            return Err(format!("69 码 {} 的售价格式不对（最多两位小数）", row.barcode));
+            return Err(format!("{} 的售价格式不对（最多两位小数）", label));
         }
-        if db::sku_barcode_taken(conn, &row.barcode, row.id.unwrap_or(0))
-            .map_err(|e| format!("校验失败：{e}"))?
+        if !row.barcode.is_empty()
+            && db::sku_barcode_taken(conn, &row.barcode, row.id.unwrap_or(0))
+                .map_err(|e| format!("校验失败：{e}"))?
         {
-            return Err(format!("69 码 {} 已被别的规格占用", row.barcode));
+            return Err(format!("{} 已被别的规格占用", label));
         }
         clean.push(row);
     }
@@ -995,7 +1003,7 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
   <input name="sku_{i}_value" value="{value}" style="width:64px" placeholder="数值">
   <select name="sku_{i}_unit" style="width:76px">{units}</select>
   <select name="sku_{i}_pack" style="width:76px">{packs}</select>
-  <input name="sku_{i}_barcode" value="{barcode}" style="width:132px" placeholder="69 码">
+  <input name="sku_{i}_barcode" value="{barcode}" style="width:132px" placeholder="69 码（选填）">
   <input name="sku_{i}_price" value="{price}" style="width:68px" placeholder="售价">
   <input name="sku_{i}_promo" value="{promo}" style="width:120px" placeholder="促销（可空）">
   <label class="muted" style="display:flex;align-items:center;gap:4px;white-space:nowrap">
@@ -1055,7 +1063,8 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
 
       <tr><th style="vertical-align:top;padding-top:12px">规格</th><td style="padding-top:8px">
         <div class="muted" style="margin-bottom:6px">
-          一个 69 码一条规格；<b>填完直接点最下面的「保存商品」就一起存</b>，不用单独保存
+          一行一条规格，<b>69 码可以留空</b>（没申请条码的商品照常建规格）；
+          <b>填完直接点最下面的「保存商品」就一起存</b>，不用单独保存
         </div>
         <div class="muted" style="margin-bottom:6px">数值 · 单位 · 包装 · 69 码 · 售价(元) · 促销</div>
         <div id="sku-rows">{sku_rows}</div>
@@ -1145,7 +1154,11 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
                         format!(
                             r#"<div class="muted" style="font-size:12px">{} · {} · <b>¥{}</b>{}</div>"#,
                             spec_text(s),
-                            crate::escape(&s.barcode69),
+                            if s.barcode69.is_empty() {
+                                "未填 69 码".to_string()
+                            } else {
+                                crate::escape(&s.barcode69)
+                            },
                             yuan(s.price_cents),
                             promo
                         )
@@ -1241,7 +1254,7 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
     let list = format!(
         r##"{editing}
 <div class="card">
-  <h2>商品<span class="muted">共 {n} 个商品 · 一个 69 码一条规格</span>
+  <h2>商品<span class="muted">共 {n} 个商品 · 69 码选填</span>
     <span class="row" style="float:right">
       <a class="ghost" href="/admin/products/export.xlsx" title="导出成 Excel（和导入模板同一套列）">导出</a>
       <a class="ghost" href="/admin?tab=products&amp;sub=list&amp;new=1">新增商品</a>
@@ -1263,7 +1276,9 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
   <p class="muted" style="line-height:1.8">
     <b>模板就是导出格式</b>（一张表，14 列，完全一致），所以「导出 → 改 → 导入」是闭环。<br>
     ① <b>一行一条规格</b>：同一个商品的几行用<strong>同一个商品名</strong>，类目/剂型/话术这些只写第一行就行，导入时按商品名合并；<br>
-    ② 没写 69 码的行只当商品（不建规格）；69 码已存在就更新，不会重复建；<br>
+    ② <b>69 码选填</b>：规格列（数值/单位/包装/售价/促销）全空的行只当商品、不建规格；
+       填了规格列的就算 69 码留空也建规格。有 69 码按码认人、没码按「数值+单位+包装」认人，
+       已存在就更新、不会重复建（所以导出→改→导入是闭环）；<br>
     ③ <b>图片文件名</b>列导出的是 hash 文件名，多张用 <code>;</code> 分开，<b>第一张是主图</b>；导入时只认服务器上真有的图，留空就沿用原来的；<br>
     ④ <b>图片 zip</b>：文件名用 <code>商品名.jpg</code> 或 <code>69码.jpg</code>；同一商品多张用
        <code>商品名-2.jpg</code>、<code>商品名-3.jpg</code>，或建 <code>商品名/</code> 文件夹放

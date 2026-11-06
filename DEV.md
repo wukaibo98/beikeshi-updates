@@ -1105,19 +1105,58 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 
 ```
 products      商品：名称 / 类目 / 类别 / 剂型(JSON 数组) / 功能(JSON 数组) / 使用方法 / 图片(主图 + 多图数组) / 热度 / rev
-product_skus  规格：所属商品 / 数值 + 单位 + 包装 / 69 码(UNIQUE) / 售价(分) / 促销 / rev
+product_skus  规格：所属商品 / 数值 + 单位 + 包装 / 69 码(1.7.8 起选填，非空才 UNIQUE) / 售价(分) / 促销 / rev
 product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_order
 ```
 
-为什么要拆两层：同一个商品有 500ml 和 1L 两个规格，**69 码不同、价格不同**，
+为什么要拆两层：同一个商品有 500ml 和 1L 两个规格，**价格不同**，
 但图片和话术只有一份。硬塞进一张表就会重复维护图片和话术。
 
-- **69 码全局唯一**：它是出库/对账认货的锚点，允许重复会让「这个码是谁的」变得无解。
-  写入前用 `sku_barcode_taken(barcode, except_sku)` 查，自己重存不算冲突。
+- **非空 69 码全局唯一**（1.7.8 起）：它是出库/对账认货的锚点，允许重复会让
+  「这个码是谁的」变得无解。写入前用 `sku_barcode_taken(barcode, except_sku)` 查，
+  自己重存不算冲突；**空码直接放行**，一个商品可以有很多条没码的规格。详见下一节。
 - **价格存「分」**（`price_cents` INTEGER）：`39.9` 存成 `3990`，避免浮点误差；
   界面输入的「元」由 `products::price_to_cents` 转换，超过两位小数直接拒。
 - **码表出厂种子**只在 `product_dict` 为空时灌一次（`SEED_DICT`），之后完全由管理页维护；
   类目/类别固定不可改（就 4 个组合），剂型/功能/单位/包装可增删、可拖拽排序。
+
+### 69 码选填（1.7.8）
+
+用户要「取消 69 码校验，允许为空」。真正麻烦的不是删掉表单里那行
+`if barcode.is_empty() { return Err(...) }`，而是 `barcode69 TEXT NOT NULL UNIQUE`
+这个**列级约束**：两条空串会直接撞唯一索引，SQLite 又不支持 `DROP CONSTRAINT`，只能整表重建。
+
+新表去掉列上的 `UNIQUE`，改用部分索引：
+
+```sql
+CREATE UNIQUE INDEX idx_skus_barcode
+    ON product_skus(barcode69) WHERE barcode69 <> '';
+```
+
+`init_products` 每次启动查 `sqlite_master` 里 `product_skus` 的建表 SQL，
+**只要还带 `UNIQUE` 字样**就跑 `migrate_skus_allow_empty_barcode()`：
+建新表 → 按原 `id` 整行 `INSERT ... SELECT` → `DROP` 旧表 → `RENAME` → 重建三个索引，
+整段一个事务，失败就回滚、旧表原样留着下次再试。因为 `RENAME` 之后的新表 SQL
+不含 `UNIQUE`，升级过一次就不会重复迁移。`AUTOINCREMENT` 的 `sqlite_sequence`
+会跟着 `RENAME` 一起改名字，新 id 不会从 1 重来撞老行。
+
+四处配套，少一处都会留坑：
+
+- `products.rs`：`save_product_with_skus` 不再要求 69 码；去重和 `sku_barcode_taken`
+  只对非空码做；报错统一带「第 N 条规格（未填 69 码）」，否则没码时错误信息是空的。
+  **`is_blank()` 不能把 `unit` / `pack` 算进去** —— 它们是下拉框，
+  界面上永远留着的空白新增行也带默认值，算进去点一次保存就会凭空多一条空规格。
+- `db.rs`：`sku_barcode_taken("")` 返回 false、`sku_by_barcode("")` 返回 None，
+  免得 `query_row` 随便捞一条空码规格当成「查到了」。
+- `import.rs`：**规格列全空**才当「只写了商品」；有规格列但没码的行照样建规格，
+  用 `sku_find_blank_by_spec(pid, value, unit, pack)` 找已有行来更新，
+  否则每次导入都新建一条，导出→导入闭环会越滚越多。
+- 管理页：输入框占位改成「69 码（选填）」，列表空码显示「未填 69 码」；
+  导入说明写清「有码按码认人、没码按数值+单位+包装认人」。
+
+验证：`cargo test` **77/77**（新增 5 条，含造一张 1.7.7 老表跑迁移）；
+另外把**线上 1.7.7 库的副本**拿回本地连跑两次启动，6 张表逐行比对完全一致、
+2 条规格的 id/rev 不变、能插入两条空码、重复真码仍被唯一索引挡住。
 
 ### 增量同步：rev 计数器
 
@@ -1203,8 +1242,10 @@ HTML 不允许 `<form>` 嵌套，而商品字段本身已经在一个大 form �
    图片文件名(多张用;分隔) / 上架时间 / 规格数值 / 单位 / 包装 / 69码 / 售价(元) / 促销），
    商品名相同的行属于同一个商品，
    商品级字段只写第一行，导入时按商品名合并。这样「导出 → 改 → 导入」在 Excel 里就是一张连续表。
-2. 商品按**商品名** upsert、规格按 **69 码** upsert：已存在就更新，不存在就新建；
-   69 码已挂在**别的**商品上时跳过并在回执里说明；没写 69 码的行只当商品，不建规格。
+2. 商品按**商品名** upsert；规格（**1.7.8 起 69 码选填**）：有码按 69 码认人、
+   没码按「数值 + 单位 + 包装」认人（`sku_find_blank_by_spec`），已存在就更新、不存在就新建；
+   69 码已挂在**别的**商品上时跳过并在回执里说明；
+   **规格列全空**的行才只当商品、不建规格。
 3. 导入模板 = 导出的同一套列（`template()` 直接调 `build_export(&[], &[])`，只有表头）。
 4. **多图（1.7.7）**：「图片文件名」列导出的是 `<hash>.jpg;<hash>.jpg`，第一张是主图；
    导入时用 `split_image_names` 拆开、`has_image` 校验文件真的在磁盘上，

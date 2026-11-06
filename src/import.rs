@@ -352,17 +352,36 @@ fn parse_and_import(
             }
         };
 
-        // ---- 规格：69 码是主键，有则更新无则新建 ----
+        // ---- 规格：69 码选填 ----
+        // 有码按 69 码认人（全局唯一），没码按「数值 + 单位 + 包装」认人，
+        // 否则每次导入都会给空码行新建一条，导出→导入闭环会越滚越多。
         let barcode = cells[11].clone();
-        if barcode.is_empty() {
-            // 这一行只写了商品没写规格：允许（商品可以先没有规格）
+        let value = cells[8].parse::<f64>().unwrap_or(0.0);
+        let unit = cells[9].clone();
+        let pack = cells[10].clone();
+        let price = cells[12].clone();
+        let promo = cells[13].clone();
+        // 规格列全空 = 这一行只写了商品（没有规格的商品导出时就是这种行），不建规格
+        let spec_blank = value == 0.0
+            && unit.is_empty()
+            && pack.is_empty()
+            && barcode.is_empty()
+            && price.is_empty()
+            && promo.is_empty();
+        if spec_blank {
             continue;
         }
-        let Some(price_cents) = products::price_to_cents(&cells[12]) else {
-            warnings.push(format!("第 {line} 行：售价格式不对（{}）", cells[12]));
+        let Some(price_cents) = products::price_to_cents(&price) else {
+            warnings.push(format!("第 {line} 行：售价格式不对（{}）", price));
             continue;
         };
-        let existing = db::sku_by_barcode(&conn, &barcode).ok().flatten();
+        let existing = if barcode.is_empty() {
+            db::sku_find_blank_by_spec(&conn, pid, value, &unit, &pack)
+                .ok()
+                .flatten()
+        } else {
+            db::sku_by_barcode(&conn, &barcode).ok().flatten()
+        };
         let sku_id = existing.as_ref().map(|s| s.id);
         if let Some(s) = &existing {
             if s.product_id != pid {
@@ -370,14 +389,19 @@ fn parse_and_import(
                 continue;
             }
         }
+        let label = if barcode.is_empty() {
+            format!("第 {line} 行规格")
+        } else {
+            format!("69 码 {barcode}")
+        };
         let new = db::NewSku {
             product_id: pid,
-            spec_value: cells[8].parse::<f64>().unwrap_or(0.0),
-            spec_unit: &cells[9],
-            spec_pack: &cells[10],
+            spec_value: value,
+            spec_unit: &unit,
+            spec_pack: &pack,
             barcode69: &barcode,
             price_cents,
-            promo: &cells[13],
+            promo: &promo,
             sort_order: i as i64,
         };
         match db::sku_save(&conn, sku_id, &new) {
@@ -388,7 +412,7 @@ fn parse_and_import(
                     sku_created += 1;
                 }
             }
-            Err(e) => warnings.push(format!("第 {line} 行：69 码 {barcode} 写入失败：{e}")),
+            Err(e) => warnings.push(format!("{} 写入失败：{e}", label)),
         }
     }
 

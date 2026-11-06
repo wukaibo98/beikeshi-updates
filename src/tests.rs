@@ -1388,13 +1388,33 @@ fn 同一次提交里_69码重复要整体拒掉并且不留商品() {
 }
 
 #[test]
-fn 没填69码的规格行要报第几条() {
+fn 没填69码的规格也能保存() {
     let conn = fresh_products();
     let form = form_of(&[("sku_0_value", "500"), ("sku_0_price", "39.9")]);
     let rows = crate::products::parse_sku_rows(&form);
-    let err = crate::products::save_product_with_skus(&conn, None, &new_product("缺码"), &rows)
+    let pid = crate::products::save_product_with_skus(&conn, None, &new_product("缺码"), &rows)
+        .expect("1.7.8 起 69 码选填，不该被拒");
+    let skus = db::skus_of(&conn, pid).unwrap();
+    assert_eq!(skus.len(), 1);
+    assert_eq!(skus[0].barcode69, "");
+    assert_eq!(skus[0].price_cents, 3990);
+}
+
+#[test]
+fn 空码规格价格填错也要说清是第几条() {
+    let conn = fresh_products();
+    let form = form_of(&[
+        ("sku_0_value", "500"),
+        ("sku_0_price", "abc"),
+        ("sku_1_value", "1"),
+        ("sku_1_price", "20"),
+    ]);
+    let rows = crate::products::parse_sku_rows(&form);
+    let err = crate::products::save_product_with_skus(&conn, None, &new_product("坏价格"), &rows)
         .unwrap_err();
-    assert!(err.contains("第 1 条规格没填 69 码"), "{err}");
+    assert!(err.contains("第 1 条规格"), "没码时也要能定位到行：{err}");
+    assert!(err.contains("未填 69 码"), "{err}");
+    assert!(err.contains("售价格式不对"), "{err}");
 }
 
 #[test]
@@ -1636,4 +1656,222 @@ fn 用图清单要包含副图_不然清理会误删() {
     let imgs = vec![img('a'), img('b'), img('c')];
     crate::db::product_set_images(&conn, pid, &imgs).unwrap();
     assert_eq!(crate::db::product_images_used(&conn).unwrap(), imgs);
+}
+
+/* ============================================================ 69 码选填（1.7.8） */
+
+#[test]
+fn 空69码可以有多条_非空码仍然全局唯一() {
+    let conn = fresh_products();
+    let pid = add_product(&conn, "没条码的商品");
+    let a = add_sku(&conn, pid, "", 1990);
+    let b = add_sku(&conn, pid, "", 2990);
+    assert_ne!(a, b, "列级 UNIQUE 已经去掉，两条空码不该撞约束");
+
+    let skus = db::skus_of(&conn, pid).unwrap();
+    assert_eq!(skus.len(), 2);
+    assert!(skus.iter().all(|s| s.barcode69.is_empty()));
+
+    // 空码不参与占用判断，也不能拿空串查出「那一条」
+    assert!(!db::sku_barcode_taken(&conn, "", 0).unwrap());
+    assert!(db::sku_by_barcode(&conn, "").unwrap().is_none());
+
+    let c = add_sku(&conn, pid, "6930000000077", 3990);
+    assert!(db::sku_barcode_taken(&conn, "6930000000077", 0).unwrap());
+    assert!(!db::sku_barcode_taken(&conn, "6930000000077", c).unwrap());
+    let dup = db::sku_save(
+        &conn,
+        None,
+        &db::NewSku {
+            product_id: pid,
+            spec_value: 1.0,
+            spec_unit: "L",
+            spec_pack: "瓶",
+            barcode69: "6930000000077",
+            price_cents: 100,
+            promo: "",
+            sort_order: 0,
+        },
+    );
+    assert!(dup.is_err(), "非空码的部分唯一索引要挡住重复");
+}
+
+#[test]
+fn 表单里多条空码规格能一起保存() {
+    let conn = fresh_products();
+    let form = form_of(&[
+        ("sku_0_value", "500"),
+        ("sku_0_unit", "ml"),
+        ("sku_0_price", "19.9"),
+        ("sku_1_value", "1000"),
+        ("sku_1_unit", "ml"),
+        ("sku_1_price", "29.9"),
+        ("sku_2_barcode", "6930000000088"),
+        ("sku_2_price", "39.9"),
+    ]);
+    let rows = crate::products::parse_sku_rows(&form);
+    let pid = crate::products::save_product_with_skus(
+        &conn,
+        None,
+        &new_product("混合规格"),
+        &rows,
+    )
+    .unwrap();
+    let skus = db::skus_of(&conn, pid).unwrap();
+    assert_eq!(skus.len(), 3);
+    assert_eq!(skus.iter().filter(|s| s.barcode69.is_empty()).count(), 2);
+    assert_eq!(skus[2].barcode69, "6930000000088");
+}
+
+#[test]
+fn 空码规格按三元组认人_导出再导入不会越滚越多() {
+    let conn = fresh_products();
+    let pid = add_product(&conn, "空码商品");
+    let id1 = add_sku(&conn, pid, "", 1990);
+    let id2 = db::sku_save(
+        &conn,
+        None,
+        &db::NewSku {
+            product_id: pid,
+            spec_value: 1000.0,
+            spec_unit: "ml",
+            spec_pack: "瓶",
+            barcode69: "",
+            price_cents: 2990,
+            promo: "",
+            sort_order: 1,
+        },
+    )
+    .unwrap();
+
+    // add_sku 的 500ml / ml / 瓶 是第一条
+    let hit1 = db::sku_find_blank_by_spec(&conn, pid, 500.0, "ml", "瓶")
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit1.id, id1);
+    let hit2 = db::sku_find_blank_by_spec(&conn, pid, 1000.0, "ml", "瓶")
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit2.id, id2);
+    assert!(db::sku_find_blank_by_spec(&conn, pid, 2000.0, "ml", "瓶")
+        .unwrap()
+        .is_none());
+    // 不能串到别的商品
+    let other = add_product(&conn, "别的商品");
+    assert!(db::sku_find_blank_by_spec(&conn, other, 500.0, "ml", "瓶")
+        .unwrap()
+        .is_none());
+
+    // 模拟导入：找到已有行后覆盖更新，条数不变
+    db::sku_save(
+        &conn,
+        Some(id1),
+        &db::NewSku {
+            product_id: pid,
+            spec_value: 500.0,
+            spec_unit: "ml",
+            spec_pack: "瓶",
+            barcode69: "",
+            price_cents: 2590,
+            promo: "",
+            sort_order: 0,
+        },
+    )
+    .unwrap();
+    let skus = db::skus_of(&conn, pid).unwrap();
+    assert_eq!(skus.len(), 2, "导入不能重复建空码规格");
+    assert_eq!(skus[0].price_cents, 2590);
+}
+
+/// 老库的 `barcode69 TEXT NOT NULL UNIQUE` 是列级约束，SQLite 不能 DROP CONSTRAINT，
+/// 只能整表重建。这条测试直接造一张 1.7.7 的老表，走一遍 init_products 验证迁移。
+#[test]
+fn 老库列级UNIQUE会自动迁移_数据不丢且能存多条空码() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE product_skus (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id  INTEGER NOT NULL,
+            spec_value  REAL NOT NULL DEFAULT 0,
+            spec_unit   TEXT NOT NULL DEFAULT '',
+            spec_pack   TEXT NOT NULL DEFAULT '',
+            barcode69   TEXT NOT NULL UNIQUE,
+            price_cents INTEGER NOT NULL DEFAULT 0,
+            promo       TEXT NOT NULL DEFAULT '',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            rev         INTEGER NOT NULL DEFAULT 0,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+        INSERT INTO product_skus
+            (id, product_id, spec_value, spec_unit, spec_pack, barcode69,
+             price_cents, promo, sort_order, enabled, rev, created_at, updated_at)
+        VALUES (7, 1, 500, 'ml', '瓶', '6930000000001', 3990, '买2送1', 0, 1, 3, 100, 100);
+        CREATE INDEX idx_skus_pid ON product_skus(product_id);
+        CREATE INDEX idx_skus_rev ON product_skus(rev);",
+    )
+    .unwrap();
+
+    db::init_products(&conn).unwrap();
+
+    let sql: String = conn
+        .query_row(
+            "SELECT COALESCE(sql, '') FROM sqlite_master
+             WHERE type = 'table' AND name = 'product_skus'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!sql.contains("UNIQUE"), "迁移后不该再有列级 UNIQUE：{sql}");
+    let idx: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_skus_barcode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "非空码的部分唯一索引要建起来");
+
+    let (id, barcode, cents, promo, rev): (i64, String, i64, String, i64) = conn
+        .query_row(
+            "SELECT id, barcode69, price_cents, promo, rev FROM product_skus WHERE id = 7",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (id, barcode.as_str(), cents, promo.as_str(), rev),
+        (7, "6930000000001", 3990, "买2送1", 3),
+        "老数据要连 id / rev 一起原样搬过去"
+    );
+
+    let pid = add_product(&conn, "迁移后的商品");
+    let a = add_sku(&conn, pid, "", 100);
+    let b = add_sku(&conn, pid, "", 200);
+    assert_ne!(a, b);
+    assert!(a > 7 && b > 7, "AUTOINCREMENT 不能从 1 重新开始撞老 id");
+    let dup = db::sku_save(
+        &conn,
+        None,
+        &db::NewSku {
+            product_id: pid,
+            spec_value: 1.0,
+            spec_unit: "L",
+            spec_pack: "瓶",
+            barcode69: "6930000000001",
+            price_cents: 100,
+            promo: "",
+            sort_order: 0,
+        },
+    );
+    assert!(dup.is_err(), "老码的唯一性在迁移后仍然有效");
+
+    // 再初始化一次：不能重复迁移，数据也不能丢
+    db::init_products(&conn).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM product_skus", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 3);
 }
