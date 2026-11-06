@@ -1122,7 +1122,7 @@ product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_
 - **码表出厂种子**只在 `product_dict` 为空时灌一次（`SEED_DICT`），之后完全由管理页维护；
   类目/类别固定不可改（就 4 个组合），剂型/功能/单位/包装可增删、可拖拽排序。
 
-### 商品管理页同款搜索（1.7.9，尚未部署）
+### 商品管理页同款搜索（1.7.9，已部署）
 
 用户要在管理页里也有客户端那套搜索。**规则必须和客户端一致**，见
 `beikeshi-cs-web-gpt/web/assets/product-data.js::filterProducts`：
@@ -1151,7 +1151,10 @@ product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_
 
 验证：`cargo test` **81/81**（新增 4 条）；无头 Chrome 起本地临时服务造 4 个商品，
 跑 **26 条交互断言**全过（含空 69 码商品按名搜、单选替换、多选 OR、组合 AND），
-1000 / 700px 截图确认布局。详见 HANDOVER §8 最前面那条。
+1000 / 700px 截图确认布局。
+**2026-11-06 15:54 已部署 NAS**：线上真实商品库有 265 个商品，抓线上管理页 HTML
+再跑 **11 条交互断言**全过（265 行初始、关键词收窄、无结果、清空恢复、类目筛选），
+8 张表内容哈希部署前后逐表一致。详见 HANDOVER §8 最前面那条。
 
 ### 69 码选填（1.7.8）
 
