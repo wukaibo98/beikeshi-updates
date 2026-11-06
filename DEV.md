@@ -756,7 +756,9 @@ cd /volume1/docker/bkstools && docker compose up -d
   用 `docker cp bks-updates:/data/<文件> /tmp/<文件>` 再挪进备份目录。2026-11-06 停容器后
   WAL 仍有 4.1MB，只拷主库（147KB）等于没备份。
 - **等 healthy 用 `docker compose up -d --wait --wait-timeout 90`**（Compose v5 支持），
-  比手动轮询干净。2026-11-06 部署 1.7.7 走的就是这条路径，实测 5 秒 healthy。
+  比手动轮询干净。2026-11-06 部署 1.7.7 / 1.7.8 走的就是这条路径，两次都实测 5 秒 healthy。
+  1.7.8 那次改成**先把 tar.gz 传完、再停机备份**，把停服窗口压到最短；
+  因为要重建 `product_skus` 表，还额外做了「部署前 8 张表内容哈希基线 → 部署后逐表比对」。
 - **验证公网入口要带 SNI**：Lucky 按域名分发，NAT 回环下直连 `bks.beikeshi.cn:54321`
   或 `https://127.0.0.1:54321` 都会 000；用
   `curl -k --resolve bks.beikeshi.cn:54321:127.0.0.1 https://bks.beikeshi.cn:54321/health`
@@ -1157,6 +1159,9 @@ CREATE UNIQUE INDEX idx_skus_barcode
 验证：`cargo test` **77/77**（新增 5 条，含造一张 1.7.7 老表跑迁移）；
 另外把**线上 1.7.7 库的副本**拿回本地连跑两次启动，6 张表逐行比对完全一致、
 2 条规格的 id/rev 不变、能插入两条空码、重复真码仍被唯一索引挡住。
+**2026-11-06 15:12 已部署 NAS**：线上 8 张表内容哈希与部署前基线逐表一致、
+部分唯一索引就位；用真镜像 + 部署前备份副本起临时容器，
+管理页提交两条空码规格成功（回执「2 条规格」、落库 id 3/4）。详见 HANDOVER §8 第一条。
 
 ### 增量同步：rev 计数器
 
