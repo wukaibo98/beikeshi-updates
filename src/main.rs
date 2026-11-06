@@ -340,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/products/toggle", post(products::toggle))
         .route("/admin/products/delete", post(products::delete))
         .route("/admin/products/image", post(products::image_upload))
+        .route("/admin/products/image/action", post(products::image_action))
         .route("/admin/products/dict/add", post(products::dict_add))
         .route("/admin/products/dict/delete", post(products::dict_delete))
         .route("/admin/products/dict/move", post(products::dict_move))

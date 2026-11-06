@@ -1011,6 +1011,7 @@ fn add_product(conn: &Connection, name: &str) -> i64 {
             funcs_json: r#"["绿叶肥"]"#,
             usage_text: "稀释 1000 倍灌根",
             image: "",
+            listed_at: "2026-11-04",
         },
     )
     .unwrap()
@@ -1208,7 +1209,7 @@ fn 备份包含数据库_密钥_图片和清单() {
     let img_dir = dir.join("products").join("img");
     std::fs::create_dir_all(&img_dir).unwrap();
     let hash = crate::products::store_image_in(&img_dir, &png_of(500, 500, [1, 2, 3])).unwrap();
-    db::product_set_image(&conn, pid, &hash).unwrap();
+    db::product_set_images(&conn, pid, &[hash.clone()]).unwrap();
     std::fs::write(dir.join("secret.key"), b"fake-secret").unwrap();
 
     let (zip_path, size) = crate::backup::build_backup_at(&conn, &dir, "unit-test").unwrap();
@@ -1310,6 +1311,7 @@ fn new_product(name: &str) -> db::NewProduct<'_> {
         funcs_json: r#"["绿叶肥"]"#,
         usage_text: "稀释 1000 倍",
         image: "",
+        listed_at: "",
     }
 }
 
@@ -1436,4 +1438,202 @@ fn 改商品时勾了删的规格会被删掉_其余原样更新() {
     assert_eq!(codes, vec!["6930000000001", "6930000000003"]);
     assert_eq!(skus[0].price_cents, 2600, "改价要生效");
     assert!(!codes.contains(&"6930000000002"), "勾了删的要没了");
+}
+
+/* ------------------------------------------------------------ 上架时间 */
+
+#[test]
+fn 上架时间只收标准日期_空表示不填() {
+    use crate::products::clean_date;
+    assert_eq!(clean_date("2026-11-04"), Some("2026-11-04".to_string()));
+    assert_eq!(clean_date("  2026-11-04 "), Some("2026-11-04".to_string()));
+    assert_eq!(clean_date(""), Some(String::new()));
+    assert_eq!(clean_date("   "), Some(String::new()));
+    // 斜杠、单位数月份、中文日期一律拒 —— 存进去 Excel 里排序会乱
+    assert_eq!(clean_date("2026/11/04"), None);
+    assert_eq!(clean_date("2026-1-4"), None);
+    assert_eq!(clean_date("2026年11月4日"), None);
+    assert_eq!(clean_date("abc"), None);
+}
+
+#[test]
+fn 老库没有上架时间列_启动时会自动补上() {
+    let conn = Connection::open_in_memory().unwrap();
+    // 模拟旧版建的 products 表（没有 listed_at）
+    conn.execute_batch(
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            class_name TEXT NOT NULL DEFAULT '',
+            forms_json TEXT NOT NULL DEFAULT '[]',
+            funcs_json TEXT NOT NULL DEFAULT '[]',
+            usage_text TEXT NOT NULL DEFAULT '',
+            image TEXT NOT NULL DEFAULT '',
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            last_hit_at INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            rev INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO products(name, created_at, updated_at) VALUES('老商品', 0, 0);",
+    )
+    .unwrap();
+
+    db::init_products(&conn).unwrap();
+
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(products)").unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert!(cols.iter().any(|c| c == "listed_at"), "列没补上：{cols:?}");
+
+    // 老数据的这一列是空串，不是 NULL —— 前端直接当字符串用
+    let p = db::product_by_name(&conn, "老商品").unwrap().unwrap();
+    assert_eq!(p.listed_at, "");
+}
+
+#[test]
+fn 上架时间存得住_改商品也不会丢() {
+    let conn = fresh_products();
+    let pid = db::product_save(
+        &conn,
+        None,
+        &db::NewProduct {
+            name: "带日期的商品",
+            category: "园艺",
+            class_name: "园艺肥料",
+            forms_json: "[]",
+            funcs_json: "[]",
+            usage_text: "",
+            image: "",
+            listed_at: "2026-03-15",
+        },
+    )
+    .unwrap();
+
+    let p = db::product_by_id(&conn, pid).unwrap().unwrap();
+    assert_eq!(p.listed_at, "2026-03-15");
+
+    // 只改名字（模拟编辑保存），日期要原样带回去
+    db::product_save(
+        &conn,
+        Some(pid),
+        &db::NewProduct {
+            name: "带日期的商品（改名）",
+            category: "园艺",
+            class_name: "园艺肥料",
+            forms_json: "[]",
+            funcs_json: "[]",
+            usage_text: "",
+            image: "",
+            listed_at: "2026-03-15",
+        },
+    )
+    .unwrap();
+    let p = db::product_by_id(&conn, pid).unwrap().unwrap();
+    assert_eq!(p.name, "带日期的商品（改名）");
+    assert_eq!(p.listed_at, "2026-03-15");
+}
+
+/* ------------------------------------------------------------ 多图（1.7.7） */
+
+fn img(c: char) -> String {
+    c.to_string().repeat(16)
+}
+
+#[test]
+fn 图片列表只留合法hash_去重_最多5张() {
+    use crate::products::{images_to_json, normalize_images, parse_images, valid_hash};
+    assert!(valid_hash("0123456789abcdef"));
+    assert!(!valid_hash("0123456789abcde"), "少一位不行");
+    assert!(!valid_hash("../secret"), "路径穿越不行");
+
+    let list = normalize_images([
+        img('a'), "../evil".to_string(), img('a'), img('b'),
+        img('c'), img('d'), img('e'), img('f'),
+    ]);
+    assert_eq!(list.len(), crate::products::MAX_IMAGES);
+    assert_eq!(list[0], img('a'), "第一张是主图");
+    assert!(!list.contains(&img('f')), "第 6 张不收");
+    assert_eq!(parse_images(&images_to_json(&list)), list);
+    assert_eq!(parse_images("不是 JSON"), Vec::<String>::new(), "坏数据不能让页面崩");
+}
+
+#[test]
+fn 老库没有多图列_启动时补上并回填单张主图() {
+    let conn = Connection::open_in_memory().unwrap();
+    // 模拟 1.7.6 的表：只有 image，没有 images_json
+    conn.execute_batch(
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            class_name TEXT NOT NULL DEFAULT '',
+            forms_json TEXT NOT NULL DEFAULT '[]',
+            funcs_json TEXT NOT NULL DEFAULT '[]',
+            usage_text TEXT NOT NULL DEFAULT '',
+            image TEXT NOT NULL DEFAULT '',
+            listed_at TEXT NOT NULL DEFAULT '',
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            last_hit_at INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            rev INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO products(name, image, created_at, updated_at)
+            VALUES('老商品', 'aaaaaaaaaaaaaaaa', 0, 0);",
+    )
+    .unwrap();
+
+    crate::db::init_products(&conn).unwrap();
+    let p = crate::db::product_by_name(&conn, "老商品").unwrap().unwrap();
+    assert_eq!(
+        crate::products::parse_images(&p.images_json),
+        vec![img('a')],
+        "老商品原来的那张图要变成数组里的唯一一张，不能丢"
+    );
+}
+
+#[test]
+fn 设多图时主图与增量版本一起更新() {
+    let conn = fresh_products();
+    let pid = crate::db::product_save(&conn, None, &new_product("多图商品")).unwrap();
+    let rev0 = crate::db::product_rev(&conn).unwrap();
+    let imgs = vec![img('a'), img('b'), img('c')];
+    crate::db::product_set_images(&conn, pid, &imgs).unwrap();
+
+    let p = crate::db::product_by_id(&conn, pid).unwrap().unwrap();
+    assert_eq!(crate::products::parse_images(&p.images_json), imgs);
+    assert_eq!(p.image, imgs[0], "老客户端读的 image 必须等于第一张");
+    assert!(
+        crate::db::product_rev(&conn).unwrap() > rev0,
+        "改图要推进 rev，客户端才拉得到增量"
+    );
+
+    // 设主图：把第三张挪到开头，老客户端看到的 image 也要跟着变
+    let mut reordered = imgs.clone();
+    let third = reordered.remove(2);
+    reordered.insert(0, third.clone());
+    crate::db::product_set_images(&conn, pid, &reordered).unwrap();
+    let p2 = crate::db::product_by_id(&conn, pid).unwrap().unwrap();
+    assert_eq!(p2.image, third);
+
+    // 删光：两列都要回到空
+    crate::db::product_set_images(&conn, pid, &[]).unwrap();
+    let p3 = crate::db::product_by_id(&conn, pid).unwrap().unwrap();
+    assert_eq!(p3.image, "");
+    assert_eq!(p3.images_json, "[]");
+}
+
+#[test]
+fn 用图清单要包含副图_不然清理会误删() {
+    let conn = fresh_products();
+    let pid = crate::db::product_save(&conn, None, &new_product("多图商品")).unwrap();
+    let imgs = vec![img('a'), img('b'), img('c')];
+    crate::db::product_set_images(&conn, pid, &imgs).unwrap();
+    assert_eq!(crate::db::product_images_used(&conn).unwrap(), imgs);
 }

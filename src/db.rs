@@ -1088,7 +1088,12 @@ pub struct ProductRow {
     pub forms_json: String,
     pub funcs_json: String,
     pub usage_text: String,
+    /// 主图 hash（= `images_json` 的第一张）。留着给老客户端用，别删。
     pub image: String,
+    /// 一个商品最多 5 张图的 hash 数组（JSON）。顺序即展示顺序，第一张是主图。
+    pub images_json: String,
+    /// 上架时间：`YYYY-MM-DD`，空表示没填（老数据就是空）
+    pub listed_at: String,
     pub hit_count: i64,
     pub last_hit_at: i64,
     pub enabled: bool,
@@ -1158,6 +1163,8 @@ pub(crate) fn init_products(conn: &Connection) -> rusqlite::Result<()> {
             funcs_json  TEXT NOT NULL DEFAULT '[]',
             usage_text  TEXT NOT NULL DEFAULT '',
             image       TEXT NOT NULL DEFAULT '',
+            images_json TEXT NOT NULL DEFAULT '[]',
+            listed_at   TEXT NOT NULL DEFAULT '',
             hit_count   INTEGER NOT NULL DEFAULT 0,
             last_hit_at INTEGER NOT NULL DEFAULT 0,
             enabled     INTEGER NOT NULL DEFAULT 1,
@@ -1202,6 +1209,25 @@ pub(crate) fn init_products(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );",
     )?;
+
+    // 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，
+    // 所以这里显式补一次（失败说明已经有了，忽略即可）
+    let _ = conn.execute(
+        "ALTER TABLE products ADD COLUMN listed_at TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE products ADD COLUMN images_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
+    // 老数据只有单张 image：把它升级成「只有一张的数组」。
+    // hash 是 16 位十六进制，拼 JSON 不会有引号/转义问题。
+    // 只回填 images_json 还是默认空数组的行，别把用户后来清空的多图又灌回去。
+    let _ = conn.execute(
+        "UPDATE products SET images_json = '[\"' || image || '\"]'
+         WHERE image <> '' AND images_json = '[]'",
+        [],
+    );
 
     let seeded: i64 = conn.query_row("SELECT COUNT(*) FROM product_dict", [], |r| r.get(0))?;
     if seeded == 0 {
@@ -1249,6 +1275,8 @@ fn product_from_row(row: &Row<'_>) -> rusqlite::Result<ProductRow> {
         funcs_json: row.get("funcs_json")?,
         usage_text: row.get("usage_text")?,
         image: row.get("image")?,
+        images_json: row.get("images_json")?,
+        listed_at: row.get("listed_at")?,
         hit_count: row.get("hit_count")?,
         last_hit_at: row.get("last_hit_at")?,
         enabled: row.get::<_, i64>("enabled")? == 1,
@@ -1273,7 +1301,7 @@ fn sku_from_row(row: &Row<'_>) -> rusqlite::Result<SkuRow> {
 }
 
 const PRODUCT_COLS: &str = "id, name, category, class_name, forms_json, funcs_json, \
-     usage_text, image, hit_count, last_hit_at, enabled, rev";
+     usage_text, image, images_json, listed_at, hit_count, last_hit_at, enabled, rev";
 const SKU_COLS: &str = "id, product_id, spec_value, spec_unit, spec_pack, barcode69, \
      price_cents, promo, sort_order, enabled, rev";
 
@@ -1312,6 +1340,7 @@ pub struct NewProduct<'a> {
     pub funcs_json: &'a str,
     pub usage_text: &'a str,
     pub image: &'a str,
+    pub listed_at: &'a str,
 }
 
 pub fn product_save(conn: &Connection, id: Option<i64>, p: &NewProduct<'_>) -> rusqlite::Result<i64> {
@@ -1321,31 +1350,36 @@ pub fn product_save(conn: &Connection, id: Option<i64>, p: &NewProduct<'_>) -> r
         Some(id) => {
             conn.execute(
                 "UPDATE products SET name=?2, category=?3, class_name=?4, forms_json=?5,
-                     funcs_json=?6, usage_text=?7, image=?8, rev=?9, updated_at=?10 WHERE id=?1",
+                     funcs_json=?6, usage_text=?7, image=?8, listed_at=?9, rev=?10,
+                     updated_at=?11 WHERE id=?1",
                 params![id, p.name, p.category, p.class_name, p.forms_json, p.funcs_json,
-                        p.usage_text, p.image, rev, now],
+                        p.usage_text, p.image, p.listed_at, rev, now],
             )?;
             Ok(id)
         }
         None => {
             conn.execute(
                 "INSERT INTO products(name, category, class_name, forms_json, funcs_json,
-                     usage_text, image, rev, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                     usage_text, image, listed_at, rev, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![p.name, p.category, p.class_name, p.forms_json, p.funcs_json,
-                        p.usage_text, p.image, rev, now],
+                        p.usage_text, p.image, p.listed_at, rev, now],
             )?;
             Ok(conn.last_insert_rowid())
         }
     }
 }
 
-/// 只改图片（上传/替换/清空都走这里），不动其它字段
-pub fn product_set_image(conn: &Connection, id: i64, image: &str) -> rusqlite::Result<()> {
+/// 只改图片（上传/删除/设主图/清空都走这里），不动其它字段。
+/// **两列一起写**：`image` 永远等于 `images_json` 的第一张，老客户端才不会看不到主图。
+pub fn product_set_images(conn: &Connection, id: i64, images: &[String]) -> rusqlite::Result<()> {
+    let list = crate::products::normalize_images(images);
+    let json = crate::products::images_to_json(&list);
+    let first = list.first().cloned().unwrap_or_default();
     let rev = product_next_rev(conn)?;
     conn.execute(
-        "UPDATE products SET image = ?2, rev = ?3, updated_at = ?4 WHERE id = ?1",
-        params![id, image, rev, now()],
+        "UPDATE products SET images_json = ?2, image = ?3, rev = ?4, updated_at = ?5 WHERE id = ?1",
+        params![id, json, first, rev, now()],
     )?;
     Ok(())
 }
@@ -1540,12 +1574,28 @@ pub fn product_sync(conn: &Connection, since: i64) -> rusqlite::Result<ProductSy
     Ok(ProductSync { rev, products, skus, deleted })
 }
 
-/// 商品库里引用了哪些图片（留给之后的「清理孤立图片」，现在还没接页面）
+/// 商品库里引用了哪些图片（留给之后的「清理孤立图片」，现在还没接页面）。
+/// 多图之后要把每个商品的全部 hash 都算上，不然清理会把副图删掉。
 #[allow(dead_code)]
 pub fn product_images_used(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT image FROM products WHERE image <> ''")?;
-    let rows = stmt.query_map([], |r| r.get(0))?;
-    rows.collect()
+    let mut stmt = conn.prepare("SELECT image, images_json FROM products")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out: Vec<String> = Vec::new();
+    for row in rows {
+        let (image, json) = row?;
+        let mut list = crate::products::parse_images(&json);
+        if list.is_empty() && crate::products::valid_hash(&image) {
+            list.push(image);
+        }
+        for h in list {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn product_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<ProductRow>> {

@@ -1095,7 +1095,7 @@ node tools/grid-cdp-test.js <DATA_DIR/secret.key> http://127.0.0.1:18080
 ### 数据模型：两层，不是一个表
 
 ```
-products      商品：名称 / 类目 / 类别 / 剂型(JSON 数组) / 功能(JSON 数组) / 使用方法 / 图片 / 热度 / rev
+products      商品：名称 / 类目 / 类别 / 剂型(JSON 数组) / 功能(JSON 数组) / 使用方法 / 图片(主图 + 多图数组) / 热度 / rev
 product_skus  规格：所属商品 / 数值 + 单位 + 包装 / 69 码(UNIQUE) / 售价(分) / 促销 / rev
 product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_order
 ```
@@ -1132,6 +1132,22 @@ product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_
 - 列表只拉 `?s=thumb`（~8KB），点开才拉 800px（~100KB）——外网模式下这条很关键。
 - 路由 `/product-image/{hash}` 只接受 16 位十六进制，挡掉 `../`。
 
+### 一个商品最多 5 张图（1.7.7）
+
+`products.images_json` 存 hash 数组（JSON），**顺序即展示顺序，第一个是主图**；
+`image` 单列继续保留并始终等于第一张 —— 这是**老客户端的兼容线**，不要删。
+两列由 `db::product_set_images` 一起写（顺带 bump `rev`），其它路径不许单独改 `image`。
+
+- `products::normalize_images` 是所有写入口的闸门：合法 16 位 hex、去重、截到 5 张；
+  `parse_images` 遇到坏 JSON 一律当「没有图」，不让整页 500。
+- 老库：`init_products` 里 `ALTER TABLE ... ADD COLUMN images_json`，
+  再 `UPDATE ... SET images_json='["'||image||'"]' WHERE image<>'' AND images_json='[]'` 回填。
+- 保存商品的表单**不再带 `image` 隐藏字段**：图片是独立动作，隐藏字段会把刚传的图覆盖掉。
+- 管理页两个外部 form：上传（`multiple`）和 `image/action`（按钮的 `name="act"`
+  `value="primary:<hash>"` / `delete:<hash>`），用 `form=` 属性把控件挂过去，没有 JS 也能用。
+- 导入导出：「图片文件名」列多张用 `;` 分隔；导入只认服务器上真有的 hash；
+  zip 里同一商品的多张按文件名排序后**整组替换**。
+
 ### 接口
 
 | 接口 | 鉴权 | 说明 |
@@ -1139,7 +1155,9 @@ product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_
 | `GET /products?since=<rev>` | 客户端 token（`x-bks-form`） | 增量拉取；未登录 401（商品库有售价，不给看） |
 | `POST /products/hit` | 同上 | 热度上报，一次最多 50 个 id |
 | `GET /product-image/{hash}?s=thumb` | 无 | 内容寻址，`Cache-Control: immutable` |
-| `POST /admin/products/{save,sku,sku/delete,image,dict/*}` | 管理 Cookie | 表单提交，303 回列表 |
+| `POST /admin/products/image` | 管理 Cookie | multipart，可一次传多张（追加，总数 ≤ 5） |
+| `POST /admin/products/image/action` | 管理 Cookie | `act=primary:<hash>` 设主图 / `delete:<hash>` 删单张 |
+| `POST /admin/products/{save,sku,sku/delete,dict/*}` | 管理 Cookie | 表单提交，303 回列表 |
 | `POST /admin/products/import` | 管理 Cookie | xlsx + 可选图片 zip |
 | `GET /admin/products/{template,export}.xlsx` | 管理 Cookie | 导入模板 / 导出当前库 |
 
@@ -1149,14 +1167,41 @@ product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_
 排序在**客户端**算：`hit_count / (1 + 距今天数/30)` 降序，热度为 0 的按类目 → 类别 → 名称。
 好处是服务端不需要定时任务；代价是冷启动时所有人都是 0，用一两周才自然浮上来。
 
+### 上架时间（1.7.5）
+
+- `products.listed_at TEXT`（`YYYY-MM-DD`，空 = 没填）。老库由 `init_products` 里的
+  `ALTER TABLE products ADD COLUMN listed_at ...` 自动补列，老数据是空串。
+- 编辑页是 `<input type="date">`；**不替用户默认填今天** —— 这是「产品正式开卖的日期」，
+  不是录入时间（1.7.5 曾默认今天，用户指出语义错了，1.7.6 已去掉）。空着就空着，客户端不显示。
+- 业务上它要显示给客服（客户端列表里是分类标签前面那个「上架 2026-09-01」淡色标签），
+  所以录商品时该填就得填。
+- 只收 `YYYY-MM-DD`（`clean_date`）：`2026/9/1`、`2026年9月1日` 这类一律拒并在页面报错 ——
+  格式不统一的话，Excel 里按这一列排序会乱。
+- 导入导出都有这一列（第 8 列）；**导入时留空 = 沿用原值**，免得二次导入把日期冲掉。
+
+### 图片控件为什么挂在两个外部 form 上
+
+HTML 不允许 `<form>` 嵌套，而商品字段本身已经在一个大 form 里。缩略图、上传控件、
+「设为主图 / 删除」按钮都在主表单**内部**，但通过 HTML5 的 `form` 属性分别关联到
+页面底部的 `image-upload-form`（`enctype=multipart/form-data`）和 `image-action-form`。
+后者只放一个 `product_id` 隐藏字段，具体动作由**提交按钮自己的 `name`/`value`** 带过去，
+所以整页一个 form 就能服务所有图片，不需要 JS、不需要嵌套、不需要每图一张表。
+（1.7.6 时这里只有一个 `image-form`，只能「上传/替换」单张。）
+
 ### 批量导入：一张表，一行一条规格
 
-1. **不用两个 sheet**：13 列排开（商品名 / 类目 / 类别 / 剂型 / 功能 / 使用方法 / 图片文件名 /
-   规格数值 / 单位 / 包装 / 69码 / 售价(元) / 促销），商品名相同的行属于同一个商品，
+1. **不用两个 sheet**：14 列排开（商品名 / 类目 / 类别 / 剂型 / 功能 / 使用方法 /
+   图片文件名(多张用;分隔) / 上架时间 / 规格数值 / 单位 / 包装 / 69码 / 售价(元) / 促销），
+   商品名相同的行属于同一个商品，
    商品级字段只写第一行，导入时按商品名合并。这样「导出 → 改 → 导入」在 Excel 里就是一张连续表。
 2. 商品按**商品名** upsert、规格按 **69 码** upsert：已存在就更新，不存在就新建；
    69 码已挂在**别的**商品上时跳过并在回执里说明；没写 69 码的行只当商品，不建规格。
 3. 导入模板 = 导出的同一套列（`template()` 直接调 `build_export(&[], &[])`，只有表头）。
+4. **多图（1.7.7）**：「图片文件名」列导出的是 `<hash>.jpg;<hash>.jpg`，第一张是主图；
+   导入时用 `split_image_names` 拆开、`has_image` 校验文件真的在磁盘上，
+   留空就沿用原值。图片 zip 三种命名都认：`商品名.jpg`、`商品名-2.jpg`、
+   `商品名/01.jpg`（目录形式按文件名排序，建议 01/02/03…）；
+   同一商品的多张**按商品分组、整组替换、最多 5 张**，重复导入不会越积越多。
 
 > calamine 0.26 和 zip 2.6 不兼容（`ZipFile` 在 2.6 多了个泛型参数导致编不过），
 > `Cargo.lock` 里把 calamine 用的 zip 钉在 **2.2.2**。升级 calamine 前先确认这一点。

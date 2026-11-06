@@ -25,6 +25,49 @@ use crate::{db, is_admin, AppState};
 pub const IMAGE_SIZE: u32 = 800;
 pub const THUMB_SIZE: u32 = 160;
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// 一个商品最多几张图。**第一个就是主图**（列表默认显示它）。
+pub const MAX_IMAGES: usize = 5;
+
+/// 图片 hash 只允许 16 位十六进制：挡掉 `../` 和 Excel 里手填的怪名字。
+pub fn valid_hash(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// 规范化图片列表：过滤非法 hash、去重、最多留 `MAX_IMAGES` 张。
+/// **顺序有意义**：第一个是主图，设主图 = 挪到数组开头。
+pub fn normalize_images<I, S>(list: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for item in list {
+        let s = item.as_ref().trim().to_string();
+        if !valid_hash(&s) || out.contains(&s) {
+            continue;
+        }
+        out.push(s);
+        if out.len() == MAX_IMAGES {
+            break;
+        }
+    }
+    out
+}
+
+/// 数据库里存的是 JSON 数组字符串；坏数据一律当成「没有图」，不让整页 500。
+pub fn parse_images(json: &str) -> Vec<String> {
+    let raw: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+    normalize_images(raw)
+}
+
+pub fn images_to_json(list: &[String]) -> String {
+    serde_json::to_string(&normalize_images(list)).unwrap_or_else(|_| "[]".into())
+}
+
+/// 导入时校验 Excel 里写的图片文件是不是真的在磁盘上（否则客户端会显示一排裂图）。
+pub fn has_image(state: &AppState, hash: &str) -> bool {
+    valid_hash(hash) && image_dir(state).join(format!("{hash}.jpg")).exists()
+}
 
 fn encode_jpeg(img: &image::RgbImage, quality: u8) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -118,7 +161,7 @@ pub async fn image_file(
 ) -> Response {
     // 哈希只允许 16 位十六进制，挡掉 ../ 之类
     let hash = name.trim_end_matches(".jpg");
-    if hash.len() != 16 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !valid_hash(hash) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let thumb = matches!(q.s.as_deref(), Some("thumb"));
@@ -147,6 +190,12 @@ pub struct ImageQuery {
 fn product_json(p: &db::ProductRow) -> Value {
     let forms: Value = serde_json::from_str(&p.forms_json).unwrap_or_else(|_| json!([]));
     let funcs: Value = serde_json::from_str(&p.funcs_json).unwrap_or_else(|_| json!([]));
+    // 老库迁移后 images_json 有值；万一没迁到，退回单张 image，老客户端永远有主图看。
+    let mut images = parse_images(&p.images_json);
+    if images.is_empty() && valid_hash(&p.image) {
+        images.push(p.image.clone());
+    }
+    let main = images.first().cloned().unwrap_or_else(|| p.image.clone());
     json!({
         "id": p.id,
         "name": p.name,
@@ -155,7 +204,10 @@ fn product_json(p: &db::ProductRow) -> Value {
         "forms": forms,
         "functions": funcs,
         "usage": p.usage_text,
-        "image": p.image,
+        // `image` 保留给老客户端（= 主图）；新客户端读 `images` 数组翻多图
+        "image": main,
+        "images": images,
+        "listed_at": p.listed_at,
         "hits": p.hit_count,
         "last_hit_at": p.last_hit_at,
         "enabled": p.enabled,
@@ -258,6 +310,23 @@ fn back(sub: &str, ok: Option<&str>, err: Option<&str>) -> Response {
         url.push_str(&format!("&err={}", crate::admin::encode(m)));
     }
     Redirect::to(&url).into_response()
+}
+
+/// 上架时间只收 `YYYY-MM-DD`（`<input type="date">` 传的就是这个格式）；空 = 不填。
+pub fn clean_date(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Some(String::new());
+    }
+    let ok = v.len() == 10
+        && v.bytes()
+            .enumerate()
+            .all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
+    if ok {
+        Some(v.to_string())
+    } else {
+        None
+    }
 }
 
 /// 存完/存错都停在编辑页：id=0（还没建出来）就回到「新增」那张空表单
@@ -429,7 +498,19 @@ pub async fn save(
     let usage = form.get("usage").map(|s| s.replace("\r\n", "\n")).unwrap_or_default();
     let category = form.get("category").cloned().unwrap_or_default();
     let class_name = form.get("class_name").cloned().unwrap_or_default();
-    let image = form.get("image").cloned().unwrap_or_default();
+    // 图片由独立的上传/删除动作维护。保存商品时**不能**拿表单里的旧值去写 image，
+    // 否则另一个标签刚传的图会被这里的旧隐藏字段覆盖掉。直接从库里读现有主图。
+    let conn = state.conn.get().unwrap();
+    let image = id
+        .and_then(|pid| db::product_by_id(&conn, pid).ok().flatten())
+        .map(|p| parse_images(&p.images_json).first().cloned().unwrap_or(p.image))
+        .unwrap_or_default();
+    let listed_raw = form.get("listed_at").map(String::as_str).unwrap_or("");
+    // 上架时间是**业务上正式开卖的日期**，不是录入时间 —— 不替用户猜，
+    // 空着就空着（客户端不显示这一行），要填由人来填。
+    let Some(listed_at) = clean_date(listed_raw) else {
+        return back_edit(id.unwrap_or(0), None, Some("上架时间格式不对，要 YYYY-MM-DD"));
+    };
     let forms_json = serde_json::to_string(&forms).unwrap_or_else(|_| "[]".into());
     let funcs_json = serde_json::to_string(&funcs).unwrap_or_else(|_| "[]".into());
 
@@ -441,10 +522,10 @@ pub async fn save(
         funcs_json: &funcs_json,
         usage_text: &usage,
         image: &image,
+        listed_at: &listed_at,
     };
     let rows = parse_sku_rows(&form);
 
-    let conn = state.conn.get().unwrap();
     match save_product_with_skus(&conn, id, &new, &rows) {
         // 存完停在编辑页：还能接着改规格
         Ok(pid) => {
@@ -519,7 +600,8 @@ pub fn price_to_cents(raw: &str) -> Option<i64> {
     Some(yuan * 100 + cents)
 }
 
-/// 传图：multipart（product_id + file）。存完只改 `image` 一列。
+/// 传图：multipart（product_id + **多个** file，来自 `<input multiple>`）。
+/// 追加到现有列表后面；总数超过 `MAX_IMAGES` 的部分不收。
 pub async fn image_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -529,7 +611,7 @@ pub async fn image_upload(
         return r;
     }
     let mut product_id: Option<i64> = None;
-    let mut bytes: Option<Vec<u8>> = None;
+    let mut files: Vec<Vec<u8>> = Vec::new();
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name().unwrap_or("") {
@@ -538,40 +620,133 @@ pub async fn image_upload(
             }
             "file" => {
                 if let Ok(data) = field.bytes().await {
-                    bytes = Some(data.to_vec());
+                    // 一次选太多也只处理前 12 张，别让 100 张图把内存吃满
+                    if !data.is_empty() && files.len() < 12 {
+                        files.push(data.to_vec());
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    let Some(pid) = product_id else {
-        return back("list", None, Some("缺少商品 id"));
+    let Some(pid) = product_id.filter(|v| *v > 0) else {
+        return back("list", None, Some("请先保存商品，再上传图片"));
     };
-    let Some(bytes) = bytes else {
-        return back("list", None, Some("没有收到图片文件"));
-    };
-    if bytes.is_empty() {
-        return back("list", None, Some("图片是空文件"));
+    if files.is_empty() {
+        return back_edit(pid, None, Some("没有收到图片文件"));
     }
+
+    let current = {
+        let conn = state.conn.get().unwrap();
+        db::product_by_id(&conn, pid)
+            .ok()
+            .flatten()
+            .map(|p| parse_images(&p.images_json))
+            .unwrap_or_default()
+    };
+    let room = MAX_IMAGES.saturating_sub(current.len());
+    if room == 0 {
+        return back_edit(pid, None, Some("已经有 5 张图了，先删掉一张再传"));
+    }
+    let take = room.min(files.len());
+    let skipped = files.len() - take;
 
     // 图片处理是 CPU 活，别占着运行时线程
     let stored = {
         let state2 = state.clone();
-        match tokio::task::spawn_blocking(move || store_image(&state2, &bytes)).await {
+        let batch: Vec<Vec<u8>> = files[..take].to_vec();
+        match tokio::task::spawn_blocking(move || {
+            let mut hashes = Vec::new();
+            let mut errs = Vec::new();
+            for b in &batch {
+                match store_image(&state2, b) {
+                    Ok(h) => hashes.push(h),
+                    Err(e) => errs.push(e),
+                }
+            }
+            (hashes, errs)
+        })
+        .await
+        {
             Ok(v) => v,
-            Err(e) => Err(format!("处理中断：{e}")),
+            Err(e) => return back_edit(pid, None, Some(&format!("处理中断：{e}"))),
         }
     };
-    match stored {
-        Ok(hash) => {
-            let conn = state.conn.get().unwrap();
-            match db::product_set_image(&conn, pid, &hash) {
-                Ok(_) => back("list", Some("图片已更新"), None),
-                Err(e) => back("list", None, Some(&format!("保存失败：{e}"))),
-            }
-        }
-        Err(msg) => back("list", None, Some(&msg)),
+    let (hashes, errs) = stored;
+
+    let mut merged = current.clone();
+    merged.extend(hashes);
+    let merged = normalize_images(merged);
+    let added = merged.len().saturating_sub(current.len());
+
+    let conn = state.conn.get().unwrap();
+    if let Err(e) = db::product_set_images(&conn, pid, &merged) {
+        return back_edit(pid, None, Some(&format!("保存失败：{e}")));
+    }
+
+    let mut msg = format!(
+        "已上传 {} 张，现有 {} 张（最多 {} 张）",
+        added,
+        merged.len(),
+        MAX_IMAGES
+    );
+    if skipped > 0 {
+        msg.push_str(&format!("；另有 {skipped} 张超出上限没传"));
+    }
+    if !errs.is_empty() {
+        msg.push_str(&format!("；{} 张处理失败：{}", errs.len(), errs.join("、")));
+    }
+    back_edit(pid, Some(&msg), None)
+}
+
+/// 删掉某一张 / 把某一张设为主图。按钮的 name/value 会随外部表单一起提交，
+/// 所以整页一个 form 就够，不需要 JS 也不需要嵌套表单。
+pub async fn image_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if let Some(r) = require_admin(&state, &headers) {
+        return r;
+    }
+    let Some(pid) = form.get("product_id").and_then(|s| s.trim().parse::<i64>().ok()) else {
+        return back("list", None, Some("缺少商品 id"));
+    };
+    let act = form.get("act").map(String::as_str).unwrap_or("");
+    let Some((action, hash)) = act.split_once(':') else {
+        return back_edit(pid, None, Some("不知道要做什么"));
+    };
+    if !valid_hash(hash) {
+        return back_edit(pid, None, Some("图片编号不对"));
+    }
+    if !matches!(action, "delete" | "primary") {
+        return back_edit(pid, None, Some("不支持的操作"));
+    }
+
+    let conn = state.conn.get().unwrap();
+    let Some(p) = db::product_by_id(&conn, pid).ok().flatten() else {
+        return back("list", None, Some("商品不存在"));
+    };
+    let mut images = parse_images(&p.images_json);
+    if !images.iter().any(|h| h == hash) {
+        return back_edit(pid, None, Some("这张图已经不在了"));
+    }
+    images.retain(|h| h != hash);
+    if action == "primary" {
+        images.insert(0, hash.to_string());
+    }
+    match db::product_set_images(&conn, pid, &images) {
+        Ok(_) => back_edit(
+            pid,
+            Some(if action == "primary" {
+                "已把这张设为主图"
+            } else {
+                "已删除这张图"
+            }),
+            None,
+        ),
+        Err(e) => back_edit(pid, None, Some(&format!("保存失败：{e}"))),
     }
 }
 
@@ -720,6 +895,12 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
     let class_name = product.map(|p| p.class_name.clone()).unwrap_or_default();
     let usage = product.map(|p| p.usage_text.clone()).unwrap_or_default();
     let image = product.map(|p| p.image.clone()).unwrap_or_default();
+    // 老库可能只有单张 image、images_json 还是空数组，这里兜一下
+    let mut images = product.map(|p| parse_images(&p.images_json)).unwrap_or_default();
+    if images.is_empty() && valid_hash(&image) {
+        images.push(image.clone());
+    }
+    let listed_at = product.map(|p| p.listed_at.clone()).unwrap_or_default();
     let forms: Vec<String> = product
         .map(|p| serde_json::from_str(&p.forms_json).unwrap_or_default())
         .unwrap_or_default();
@@ -745,13 +926,58 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
     let cats = dict_values(dict, "category");
     let classes = dict_values(dict, "class");
 
-    let image_block = if image.is_empty() {
+    // 每张图一个缩略图 + 「设为主图」/「删除」。按钮用 form 属性挂到页面底部的
+    // 独立表单上，name/value 随表单一并提交 —— 无 JS、也没有嵌套表单。
+    let image_block = if images.is_empty() {
         r#"<span class="muted">还没有图片</span>"#.to_string()
     } else {
+        images
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let label = if i == 0 {
+                    "主图".to_string()
+                } else {
+                    format!("第 {} 张", i + 1)
+                };
+                let primary = if i > 0 {
+                    format!(
+                        r#"<button class="ghost" type="submit" form="image-action-form" name="act" value="primary:{h}" style="padding:2px 7px;font-size:12px">设为主图</button>"#,
+                        h = crate::escape(h)
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    r##"<span style="display:inline-flex;flex-direction:column;align-items:center;gap:4px;margin:0 12px 8px 0;vertical-align:top">
+          <img src="/product-image/{h}?s=thumb" width="72" height="72" alt="" style="object-fit:contain;border-radius:8px;border:1px solid #E2E8D8;background:#fff">
+          <span class="muted" style="font-size:11px">{label}</span>
+          <span class="row" style="gap:4px">
+            {primary}
+            <button class="ghost" type="submit" form="image-action-form" name="act" value="delete:{h}" style="padding:2px 7px;font-size:12px">删除</button>
+          </span>
+        </span>"##,
+                    h = crate::escape(h),
+                    label = label,
+                    primary = primary,
+                )
+            })
+            .collect::<String>()
+    };
+
+    let upload_controls = if pid > 0 {
         format!(
-            r#"<img src="/product-image/{h}?s=thumb" width="72" height="72" alt="" style="border-radius:8px;border:1px solid #E2E8D8;background:#fff">"#,
-            h = crate::escape(&image)
+            r##"<div class="row" style="align-items:center;margin-top:8px">
+          <input type="file" name="file" form="image-upload-form" accept="image/*" multiple required
+                 style="width:auto;max-width:230px;height:auto;padding:4px 6px;background:transparent;border:1px dashed #D8E0CC">
+          <button class="ghost" type="submit" form="image-upload-form">上传图片</button>
+          <span class="muted">一次可选多张，最多 {max} 张；传完立刻生效，不用点保存</span>
+        </div>"##,
+            max = MAX_IMAGES
         )
+    } else {
+        r#"<div class="muted" style="margin-top:8px">先填好上面的信息、点「保存商品」，再回来传图片。</div>"#
+            .to_string()
     };
 
     // 规格行：已有的 + 一条空白（不点任何按钮，直接填完最下面的「保存」就一起存）；
@@ -805,7 +1031,6 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
   <h2>{title}<span class="muted">{sub}</span></h2>
   <form method="post" action="/admin/products/save" id="product-form">
     <input type="hidden" name="id" value="{pid}">
-    <input type="hidden" name="image" value="{image}">
     <table>
       <tr><th style="width:90px">商品名称</th><td><input name="name" value="{name}" required></td></tr>
       <tr><th>类目 / 类别</th><td class="row">
@@ -815,7 +1040,18 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
       <tr><th>剂型（多选）</th><td>{form_checks}</td></tr>
       <tr><th>功能（多选）</th><td>{func_checks}</td></tr>
       <tr><th>使用方法</th><td><textarea name="usage" rows="6" placeholder="客服话术，可长文">{usage}</textarea></td></tr>
-      <tr><th>主图</th><td class="row">{image_block}<span class="muted">上传后自动补成 800×800（白底）</span></td></tr>
+      <tr><th>上架时间</th><td class="row">
+        <input type="date" name="listed_at" value="{listed_at}" style="width:170px">
+        <span class="muted">产品正式上架售卖的日期（不是录入时间）；不填则客户端不显示</span>
+      </td></tr>
+      <tr><th style="vertical-align:top;padding-top:12px">商品图片</th><td style="padding-top:8px">
+        <div class="muted" style="margin-bottom:6px">
+          最多 5 张；<b>第一张是主图</b>（客户端列表默认显示它），点图片可以看全部。
+          上传后自动统一成 800×800（白底补边，不切产品）。
+        </div>
+        <div>{image_block}</div>
+        {upload_controls}
+      </td></tr>
 
       <tr><th style="vertical-align:top;padding-top:12px">规格</th><td style="padding-top:8px">
         <div class="muted" style="margin-bottom:6px">
@@ -835,11 +1071,14 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
     </div>
   </form>
 
-  <form class="row" method="post" action="/admin/products/image" enctype="multipart/form-data" style="margin-top:12px">
+  <!-- 传图 / 删图 / 设主图都是独立动作：控件挂在主表单里，但通过 form 属性
+       关联到这两个外部表单（HTML 不允许 form 嵌套）。按钮的 name/value 会随
+       所属表单一起提交，所以整页只需要各一个 form。 -->
+  <form id="image-upload-form" method="post" action="/admin/products/image" enctype="multipart/form-data">
     <input type="hidden" name="product_id" value="{pid}">
-    <input type="file" name="file" accept="image/*" required style="max-width:280px">
-    <button class="ghost" type="submit">上传 / 替换图片</button>
-    <span class="muted">传完会立刻生效，不用再点保存</span>
+  </form>
+  <form id="image-action-form" method="post" action="/admin/products/image/action">
+    <input type="hidden" name="product_id" value="{pid}">
   </form>
 
   <template id="sku-tpl">{tpl}</template>
@@ -870,12 +1109,13 @@ fn edit_card(state: &AppState, dict: &[db::DictRow], product: Option<&db::Produc
         pid = pid,
         name = crate::escape(&name),
         usage = crate::escape(&usage),
-        image = crate::escape(&image),
         cats = options(&cats, &category),
         classes = options(&classes, &class_name),
         form_checks = checks("form", &forms, "mk-form:"),
         func_checks = checks("function", &funcs, "mk-function:"),
         image_block = image_block,
+        upload_controls = upload_controls,
+        listed_at = crate::escape(&listed_at),
         sku_rows = sku_rows,
         tpl = tpl,
         blank_index = blank_index,
@@ -920,19 +1160,39 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
                 .chain(forms.iter().map(|v| pill(v)))
                 .chain(funcs.iter().map(|v| pill(v)))
                 .collect::<String>();
-            let thumb = if p.image.is_empty() {
+            // 列表只显示第一张（主图），有多张时挂个「N 张」角标
+            let images = parse_images(&p.images_json);
+            let main = images.first().cloned().unwrap_or_else(|| p.image.clone());
+            let thumb = if main.is_empty() {
                 r#"<div style="width:48px;height:48px;border-radius:8px;background:#F1EFE8"></div>"#.to_string()
             } else {
+                let badge = if images.len() > 1 {
+                    format!(
+                        r#"<span style="position:absolute;right:-6px;bottom:-4px;background:#4C6B3C;color:#fff;border-radius:9px;padding:1px 5px;font-size:10px;line-height:14px;white-space:nowrap">{} 张</span>"#,
+                        images.len()
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    r#"<img src="/product-image/{}?s=thumb" width="48" height="48" alt="" style="border-radius:8px;border:1px solid #E2E8D8">"#,
-                    crate::escape(&p.image)
+                    r#"<span style="position:relative;display:inline-block"><img src="/product-image/{}?s=thumb" width="48" height="48" alt="" style="display:block;object-fit:contain;background:#fff;border-radius:8px;border:1px solid #E2E8D8">{badge}</span>"#,
+                    crate::escape(&main),
+                    badge = badge
+                )
+            };
+            let listed = if p.listed_at.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#" <span class="muted" style="font-size:12px">上架 {}</span>"#,
+                    crate::escape(&p.listed_at)
                 )
             };
             let toggle_label = if p.enabled { "停用" } else { "启用" };
             format!(
                 r##"<tr>
   <td>{thumb}</td>
-  <td><b>{name}</b>{off}<div style="margin-top:4px">{tags}</div></td>
+  <td><b>{name}</b>{off}{listed}<div style="margin-top:4px">{tags}</div></td>
   <td>{specs}</td>
   <td style="white-space:nowrap">
     <a class="ghost" href="/admin?tab=products&amp;sub=list&amp;edit={id}">编辑</a>
@@ -950,6 +1210,7 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
                 thumb = thumb,
                 name = crate::escape(&p.name),
                 off = if p.enabled { "" } else { r#" <span class="tag off">已停用</span>"# },
+                listed = listed,
                 tags = tags,
                 specs = spec_lines,
                 id = p.id,
@@ -1000,10 +1261,14 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
     let import = r##"<div class="card">
   <h2>批量导入<span class="muted">Excel 填字 + 图片打包，一次灌几百个</span></h2>
   <p class="muted" style="line-height:1.8">
-    <b>模板就是导出格式</b>（一张表，13 列，完全一致），所以「导出 → 改 → 导入」是闭环。<br>
+    <b>模板就是导出格式</b>（一张表，14 列，完全一致），所以「导出 → 改 → 导入」是闭环。<br>
     ① <b>一行一条规格</b>：同一个商品的几行用<strong>同一个商品名</strong>，类目/剂型/话术这些只写第一行就行，导入时按商品名合并；<br>
     ② 没写 69 码的行只当商品（不建规格）；69 码已存在就更新，不会重复建；<br>
-    ③ 图片打包成 zip，文件名用 <code>商品名.jpg</code> 或 <code>69码.jpg</code>（支持 jpg/png/webp），和 Excel 一起传。
+    ③ <b>图片文件名</b>列导出的是 hash 文件名，多张用 <code>;</code> 分开，<b>第一张是主图</b>；导入时只认服务器上真有的图，留空就沿用原来的；<br>
+    ④ <b>图片 zip</b>：文件名用 <code>商品名.jpg</code> 或 <code>69码.jpg</code>；同一商品多张用
+       <code>商品名-2.jpg</code>、<code>商品名-3.jpg</code>，或建 <code>商品名/</code> 文件夹放
+       <code>01.jpg</code>、<code>02.jpg</code>。<b>一个商品最多 5 张</b>，zip 里给了图就整组替换（支持 jpg/png/webp）；<br>
+    ⑤ <b>上架时间</b>是「产品正式开卖的日期」，留空就沿用原来的（新商品留空），填了就按 <code>2026-11-04</code> 这种格式写。
   </p>
   <div class="row" style="margin-bottom:14px">
     <a class="ghost" href="/admin/products/template.xlsx">下载空模板</a>
