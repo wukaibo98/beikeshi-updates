@@ -1,6 +1,6 @@
 [package]
 name = "bks-updates"
-version = "1.7.8"
+version = "1.7.9"
 edition = "2021"
 rust-version = "1.75"
 description = "贝可施客服小工具 · 更新分发服务"

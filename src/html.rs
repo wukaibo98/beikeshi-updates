@@ -673,6 +673,39 @@ td.ro{background:#F8FAF3;color:#5F5E5A;padding:7px 8px!important}
 .gridfoot{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
 .gsave{background:#EAF3DE;color:#27500A;border-radius:10px;padding:5px 12px;font-size:12px}
 .gerr{background:#FCEBEB;color:#791F1F;border-radius:10px;padding:5px 12px;font-size:12px}
+
+/* 商品库搜索：跟客户端同款的输入即搜 + 分类筛选（products.rs 生成 DOM） */
+.ps{margin:0 0 14px}
+.ps[hidden],.pf-pop[hidden],.ps-active[hidden],#ps-body tr[hidden]{display:none!important}
+.ps-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.ps-row input[type=text]{flex:1 1 260px;max-width:420px;height:32px}
+.ps-count{white-space:nowrap}
+.ps-filters{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.pf{position:relative}
+.pf-btn{display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 11px;
+  border:1px solid #D8E0CC;border-radius:999px;background:#fff;color:#66705C;
+  font-size:12.5px;font-weight:400}
+.pf-btn:hover{border-color:#3E6B1B;color:#3E6B1B;background:#fff}
+.pf-btn.on{background:#EAF3DE;border-color:#3E6B1B;color:#3E6B1B;font-weight:500}
+.pf-n{min-width:15px;height:15px;padding:0 4px;border-radius:999px;background:#3E6B1B;
+  color:#fff;font-size:10.5px;line-height:15px;text-align:center}
+.pf-caret{font-size:9px;opacity:.55}
+.pf-pop{position:absolute;z-index:40;top:calc(100% + 6px);left:0;min-width:150px;
+  max-height:296px;overflow-y:auto;padding:5px;background:#fff;border:1px solid #E2E8D8;
+  border-radius:12px;box-shadow:0 10px 30px rgba(35,43,28,.14)}
+.pf-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;
+  font-size:13px;color:#232B1C;cursor:pointer;white-space:nowrap}
+.pf-item:hover{background:#F1F5E9}
+.pf-item input,.pf-item input[type=checkbox]{width:auto;height:auto;margin:0;accent-color:#3E6B1B}
+.ps-active{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:10px;
+  padding-top:9px;border-top:1px dashed #E2E8D8}
+.ps-chip{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;
+  border:1px solid #C7D9AE;border-radius:999px;background:#EAF3DE;color:#27500A;
+  font-size:12px;font-weight:400}
+.ps-chip:hover{background:#DAE9C4;border-color:#3E6B1B;color:#27500A}
+.ps-chip.clear{background:#fff;border-color:#D8E0CC;color:#66705C}
+.ps-chip.clear:hover{background:#F6F9F0;border-color:#3E6B1B;color:#3E6B1B}
+.ps-chip span{font-size:13px;line-height:1}
 "##;
 
 pub const PAGE: &str = r##"<!DOCTYPE html>

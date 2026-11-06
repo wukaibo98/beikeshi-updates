@@ -841,6 +841,245 @@ pub struct ProductPanes {
     pub dict: String,
 }
 
+/* -------------------------------------------------- 商品库搜索（客户端同款） */
+
+/// 四组筛选维度：`(参数名, 中文名, 是否单选)`。
+/// 前两组跟客户端一样是单选（一个商品只有一个类目 / 类别），后两组多选；
+/// **组内 OR、组间 AND**，规则与 `web/assets/product-data.js::filterProducts` 完全一致。
+/// 管理页字段叫 `class_name` / `funcs_json`，但 data 属性名沿用客户端的 `class` / `function`。
+pub const PRODUCT_FILTER_KINDS: &[(&str, &str, bool)] = &[
+    ("category", "类目", true),
+    ("class", "类别", true),
+    ("form", "剂型", false),
+    ("function", "功能", false),
+];
+
+/// 一行商品的搜索文本：**商品名 + 所有 69 码**，空格分隔。
+/// 客户端只搜这两样，管理页保持同款；别擅自把规格、话术、上架时间也塞进来
+/// —— 两边结果不一致时管理员会以为数据没同步。
+pub fn product_search_blob(name: &str, skus: &[db::SkuRow]) -> String {
+    let mut parts = vec![name.to_string()];
+    for s in skus {
+        if !s.barcode69.is_empty() {
+            parts.push(s.barcode69.clone());
+        }
+    }
+    parts.join(" ")
+}
+
+fn json_attr(raw: &str) -> String {
+    let list: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+}
+
+/// 表格行上的 `data-*`：JS 过滤只读属性，不解析单元格文字（单元格里有 ¥、标签、按钮）。
+/// `escape` 会把 JSON 里的 `"` 变成 `&quot;`，浏览器还原后仍是合法 JSON。
+pub fn product_row_attrs(p: &db::ProductRow, skus: &[db::SkuRow]) -> String {
+    format!(
+        r#" data-ps-row="1" data-search="{}" data-category="{}" data-class="{}" data-form="{}" data-function="{}""#,
+        crate::escape(&product_search_blob(&p.name, skus)),
+        crate::escape(&p.category),
+        crate::escape(&p.class_name),
+        crate::escape(&json_attr(&p.forms_json)),
+        crate::escape(&json_attr(&p.funcs_json)),
+    )
+}
+
+/// 搜索工具条。默认带 `hidden`：没有 JS 时不显示一个点了没反应的输入框，
+/// 表格照常全量展示；JS 初始化成功后才揭开。
+pub fn product_search_toolbar(dict: &[db::DictRow]) -> String {
+    let groups: String = PRODUCT_FILTER_KINDS
+        .iter()
+        .map(|(kind, label, single)| {
+            let items: Vec<&db::DictRow> =
+                dict.iter().filter(|d| d.kind == *kind && d.enabled).collect();
+            if items.is_empty() {
+                return String::new();
+            }
+            let opts: String = items
+                .iter()
+                .map(|d| {
+                    let v = crate::escape(&d.value);
+                    format!(
+                        r#"<label class="pf-item"><input type="checkbox" value="{v}"><span>{v}</span></label>"#,
+                        v = v
+                    )
+                })
+                .collect();
+            format!(
+                r##"<div class="pf" data-kind="{kind}" data-single="{single}">
+  <button type="button" class="pf-btn" data-act="toggle">{label}<span class="pf-n" hidden>0</span><span class="pf-caret">▾</span></button>
+  <div class="pf-pop" hidden>{opts}</div>
+</div>"##,
+                kind = kind,
+                single = if *single { "1" } else { "0" },
+                label = label,
+                opts = opts,
+            )
+        })
+        .collect();
+
+    format!(
+        r##"<div class="ps" id="ps" hidden>
+  <div class="ps-row">
+    <input type="text" id="ps-q" placeholder="搜索商品名称或 69 码" autocomplete="off" spellcheck="false">
+    <span class="muted ps-count" id="ps-count"></span>
+  </div>
+  <div class="ps-filters" id="ps-filters">{groups}</div>
+  <div class="ps-active" id="ps-active" hidden></div>
+</div>"##,
+        groups = groups,
+    )
+}
+
+/// 搜索脚本：独立常量，不进 `format!`，所以花括号不用双写。
+/// 交互跟客户端一致：120ms 防抖、单选/多选规则、已选条件点掉、清空筛选、结果计数。
+const PRODUCT_SEARCH_JS: &str = r##"<script>
+(function () {
+  var ps = document.getElementById('ps');
+  var q = document.getElementById('ps-q');
+  var body = document.getElementById('ps-body');
+  var filtersBox = document.getElementById('ps-filters');
+  var active = document.getElementById('ps-active');
+  if (!ps || !q || !body || !filtersBox || !active) return;
+  var rows = Array.prototype.slice.call(body.querySelectorAll('[data-ps-row]'));
+  var empty = document.getElementById('ps-empty');
+  var count = document.getElementById('ps-count');
+  var labels = { category: '类目', 'class': '类别', form: '剂型', 'function': '功能' };
+  var filters = { category: [], 'class': [], form: [], 'function': [] };
+  var kinds = ['category', 'class', 'form', 'function'];
+  var timer = null;
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function anyFilter() {
+    return kinds.some(function (k) { return filters[k].length > 0; });
+  }
+  function values(row, kind) {
+    if (kind === 'category' || kind === 'class') {
+      return [row.getAttribute('data-' + kind) || ''];
+    }
+    try {
+      var v = JSON.parse(row.getAttribute('data-' + kind) || '[]');
+      return Object.prototype.toString.call(v) === '[object Array]' ? v : [];
+    } catch (e) { return []; }
+  }
+  function matches(row) {
+    var needle = q.value.trim().toLowerCase();
+    if (needle && (row.getAttribute('data-search') || '').toLowerCase().indexOf(needle) < 0) {
+      return false;
+    }
+    for (var i = 0; i < kinds.length; i++) {
+      var picked = filters[kinds[i]];
+      if (!picked.length) continue;
+      var have = values(row, kinds[i]);
+      var hit = picked.some(function (v) { return have.indexOf(v) >= 0; });
+      if (!hit) return false;
+    }
+    return true;
+  }
+  function closePops() {
+    filtersBox.querySelectorAll('.pf-pop').forEach(function (p) { p.hidden = true; });
+  }
+  function updateButtons() {
+    filtersBox.querySelectorAll('.pf').forEach(function (box) {
+      var n = filters[box.getAttribute('data-kind')].length;
+      var btn = box.querySelector('.pf-btn');
+      var badge = box.querySelector('.pf-n');
+      if (btn) btn.classList.toggle('on', n > 0);
+      if (badge) { badge.textContent = String(n); badge.hidden = n === 0; }
+    });
+  }
+  function syncChecks() {
+    filtersBox.querySelectorAll('.pf').forEach(function (box) {
+      var picked = filters[box.getAttribute('data-kind')];
+      box.querySelectorAll('input[type="checkbox"]').forEach(function (cb) {
+        cb.checked = picked.indexOf(cb.value) >= 0;
+      });
+    });
+  }
+  function renderActive() {
+    var html = '';
+    kinds.forEach(function (kind) {
+      filters[kind].forEach(function (v) {
+        html += '<button type="button" class="ps-chip" data-kind="' + kind +
+          '" data-value="' + esc(v) + '">' + labels[kind] + '：' + esc(v) +
+          ' <span>×</span></button>';
+      });
+    });
+    if (anyFilter()) html += '<button type="button" class="ps-chip clear" data-act="clear">清空筛选</button>';
+    active.innerHTML = html;
+    active.hidden = !html;
+  }
+  function apply() {
+    var n = 0;
+    rows.forEach(function (row) {
+      var ok = matches(row);
+      row.hidden = !ok;
+      if (ok) n++;
+    });
+    var filtering = !!q.value.trim() || anyFilter();
+    if (count) count.textContent = filtering
+      ? '共 ' + rows.length + ' 个商品 · 符合条件 ' + n + ' 个'
+      : '共 ' + rows.length + ' 个商品';
+    if (empty) empty.hidden = !(n === 0 && filtering);
+    renderActive();
+    updateButtons();
+  }
+
+  q.addEventListener('input', function () {
+    clearTimeout(timer);
+    timer = setTimeout(apply, 120);
+  });
+  filtersBox.addEventListener('click', function (e) {
+    var toggle = e.target.closest && e.target.closest('[data-act="toggle"]');
+    if (!toggle) return;
+    var pop = toggle.closest('.pf').querySelector('.pf-pop');
+    var willOpen = pop.hidden;
+    closePops();
+    pop.hidden = !willOpen;
+  });
+  filtersBox.addEventListener('change', function (e) {
+    var cb = e.target;
+    if (!cb || cb.type !== 'checkbox') return;
+    var box = cb.closest('.pf');
+    var kind = box.getAttribute('data-kind');
+    var val = cb.value;
+    if (box.getAttribute('data-single') === '1') {
+      var wasOn = filters[kind].indexOf(val) >= 0;
+      filters[kind] = wasOn ? [] : [val];
+      syncChecks();
+    } else if (cb.checked) {
+      if (filters[kind].indexOf(val) < 0) filters[kind].push(val);
+    } else {
+      filters[kind] = filters[kind].filter(function (v) { return v !== val; });
+    }
+    apply();
+  });
+  active.addEventListener('click', function (e) {
+    var chip = e.target.closest && e.target.closest('.ps-chip');
+    if (!chip) return;
+    if (chip.getAttribute('data-act') === 'clear') {
+      kinds.forEach(function (k) { filters[k] = []; });
+    } else {
+      var kind = chip.getAttribute('data-kind');
+      var val = chip.getAttribute('data-value');
+      filters[kind] = filters[kind].filter(function (v) { return v !== val; });
+    }
+    syncChecks();
+    apply();
+  });
+  document.addEventListener('click', function (e) {
+    if (!(e.target.closest && e.target.closest('.pf'))) closePops();
+  });
+
+  ps.hidden = false;
+  apply();
+})();
+</script>"##;
+
 fn pill(text: &str) -> String {
     if text.is_empty() {
         String::new()
@@ -1202,8 +1441,10 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
                 )
             };
             let toggle_label = if p.enabled { "停用" } else { "启用" };
+            // 搜索用的 data-* 打在行上，JS 不解析单元格（里面有 ¥、标签、按钮）
+            let attrs = product_row_attrs(p, &skus);
             format!(
-                r##"<tr>
+                r##"<tr{attrs}>
   <td>{thumb}</td>
   <td><b>{name}</b>{off}{listed}<div style="margin-top:4px">{tags}</div></td>
   <td>{specs}</td>
@@ -1229,6 +1470,7 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
                 id = p.id,
                 next_enabled = if p.enabled { "0" } else { "1" },
                 toggle_label = toggle_label,
+                attrs = attrs,
             )
         })
         .collect::<Vec<_>>()
@@ -1251,23 +1493,43 @@ pub fn panes(state: &AppState, q: &ProductQuery) -> ProductPanes {
         String::new()
     };
 
+    // 没有商品时不渲染工具条和脚本：一个空搜索框没意义，JS 也不该对着空表跑
+    let has_products = !products.is_empty();
+    let toolbar = if has_products {
+        product_search_toolbar(&dict)
+    } else {
+        String::new()
+    };
+    let search_script = if has_products { PRODUCT_SEARCH_JS } else { "" };
+    let empty_row = if has_products {
+        r##"<tr class="ps-empty" id="ps-empty" hidden><td colspan="4" class="muted">没有符合条件的商品，换个关键词试试。</td></tr>"##
+    } else {
+        ""
+    };
+
     let list = format!(
         r##"{editing}
 <div class="card">
-  <h2>商品<span class="muted">共 {n} 个商品 · 69 码选填</span>
+  <h2>商品<span class="muted">69 码选填 · 图片最多 5 张</span>
     <span class="row" style="float:right">
       <a class="ghost" href="/admin/products/export.xlsx" title="导出成 Excel（和导入模板同一套列）">导出</a>
       <a class="ghost" href="/admin?tab=products&amp;sub=list&amp;new=1">新增商品</a>
     </span>
   </h2>
+  {toolbar}
   <table>
-    <tr><th style="width:60px">图</th><th>商品</th><th>规格 · 69 码 · 售价</th><th style="width:180px">操作</th></tr>
+    <thead><tr><th style="width:60px">图</th><th>商品</th><th>规格 · 69 码 · 售价</th><th style="width:180px">操作</th></tr></thead>
+    <tbody id="ps-body">
     {rows}
+    {empty_row}
+    </tbody>
   </table>
-</div>"##,
+</div>{search_script}"##,
         editing = editing,
-        n = products.len(),
+        toolbar = toolbar,
         rows = rows,
+        empty_row = empty_row,
+        search_script = search_script,
     );
 
     /* ---- 批量导入 ---- */

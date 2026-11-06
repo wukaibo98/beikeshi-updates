@@ -1122,6 +1122,37 @@ product_dict  码表：kind = category|class|form|function|unit|pack，带 sort_
 - **码表出厂种子**只在 `product_dict` 为空时灌一次（`SEED_DICT`），之后完全由管理页维护；
   类目/类别固定不可改（就 4 个组合），剂型/功能/单位/包装可增删、可拖拽排序。
 
+### 商品管理页同款搜索（1.7.9，尚未部署）
+
+用户要在管理页里也有客户端那套搜索。**规则必须和客户端一致**，见
+`beikeshi-cs-web-gpt/web/assets/product-data.js::filterProducts`：
+搜商品名 / 69 码（小写包含）、`category`/`class` 单选、`form`/`function` 多选、
+组内 OR / 组间 AND、120ms 防抖、已选 chip、结果计数。
+
+实现选了**服务端渲染全量 + 前端即时过滤**（`products.rs` 的
+`product_search_toolbar` / `product_row_attrs` / `PRODUCT_SEARCH_JS`）：
+
+- 每行 `<tr>` 带 `data-search`（商品名 + 所有非空 69 码）、`data-category`、
+  `data-class`、`data-form` / `data-function`（JSON 数组）。JS 只读属性，
+  不解析单元格 —— 单元格里有 ¥、标签、按钮，解析必错。
+- 工具条由服务端按 `product_dict` 里 **enabled** 的值生成；值一律 `escape`。
+  `data-form="[&quot;液体&quot;]"` 经浏览器还原后仍是合法 JSON，`JSON.parse` 能直接吃。
+- 工具条默认带 `hidden`，脚本初始化完才 `ps.hidden = false`。**没有 JS 时表格照常全量显示**，
+  不会留下一个点了没反应的输入框；商品数为 0 时连工具条和脚本都不渲染。
+- 为什么不做成 `?q=&category=...` 的服务端查询：管理页「编辑 / 停用 / 删除」都是 POST 后
+  重定向，URL 上的筛选条件每次操作都会丢；`serde_urlencoded` 同名参数只留最后一个，
+  多选筛选得自己解 raw query；而「输入即搜」本来就该零请求。管理页商品量级和客户端一样
+  是一次全量下拉几百行，DOM 过滤足够快。
+
+⚠️ 别把规格文本、使用方法、上架时间加进 `product_search_blob`：
+客户端只认名称 + 69 码，两边搜出的结果不一致时管理员会以为数据没同步。
+⚠️ `.ps[hidden]` / `#ps-body tr[hidden]` 在 `html.rs` 里都写了 `display:none!important` ——
+管理页 CSS 给表格和按钮设过 display，不加强规则 `[hidden]` 会被盖掉（客户端踩过同一个坑）。
+
+验证：`cargo test` **81/81**（新增 4 条）；无头 Chrome 起本地临时服务造 4 个商品，
+跑 **26 条交互断言**全过（含空 69 码商品按名搜、单选替换、多选 OR、组合 AND），
+1000 / 700px 截图确认布局。详见 HANDOVER §8 最前面那条。
+
 ### 69 码选填（1.7.8）
 
 用户要「取消 69 码校验，允许为空」。真正麻烦的不是删掉表单里那行

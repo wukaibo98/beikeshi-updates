@@ -1875,3 +1875,115 @@ fn 老库列级UNIQUE会自动迁移_数据不丢且能存多条空码() {
         .unwrap();
     assert_eq!(n, 3);
 }
+
+/* ------------------------------------------------------------ 商品库搜索（管理页同款） */
+
+fn fake_product(name: &str) -> db::ProductRow {
+    db::ProductRow {
+        id: 1,
+        name: name.to_string(),
+        category: "园艺".into(),
+        class_name: "园艺肥料".into(),
+        forms_json: r#"["液体","颗粒"]"#.into(),
+        funcs_json: r#"["绿叶肥"]"#.into(),
+        usage_text: String::new(),
+        image: String::new(),
+        images_json: "[]".into(),
+        listed_at: String::new(),
+        hit_count: 0,
+        last_hit_at: 0,
+        enabled: true,
+        rev: 0,
+    }
+}
+
+fn fake_sku(barcode: &str) -> db::SkuRow {
+    db::SkuRow {
+        id: 1,
+        product_id: 1,
+        spec_value: 500.0,
+        spec_unit: "ml".into(),
+        spec_pack: "瓶".into(),
+        barcode69: barcode.to_string(),
+        price_cents: 1990,
+        promo: String::new(),
+        sort_order: 0,
+        enabled: true,
+        rev: 0,
+    }
+}
+
+fn fake_dict(kind: &str, value: &str, enabled: bool) -> db::DictRow {
+    db::DictRow {
+        id: 1,
+        kind: kind.to_string(),
+        value: value.to_string(),
+        sort_order: 0,
+        enabled,
+    }
+}
+
+#[test]
+fn 搜索文本只含商品名和69码_空码不掺脏字() {
+    let skus = vec![fake_sku("6930000000001"), fake_sku(""), fake_sku("6930000000002")];
+    let blob = crate::products::product_search_blob("贝可施营养液", &skus);
+    assert_eq!(blob, "贝可施营养液 6930000000001 6930000000002");
+    assert!(!blob.contains("  "), "空 69 码不该留下双空格：{blob}");
+}
+
+#[test]
+fn 行data属性含名称与码_且JSON和引号都安全转义() {
+    let mut p = fake_product("贝可施\"浓缩\"<液>");
+    let attrs = crate::products::product_row_attrs(&p, &[fake_sku("6930000000001")]);
+    assert!(attrs.contains(r#"data-ps-row="1""#), "{attrs}");
+    assert!(attrs.contains("6930000000001"), "{attrs}");
+    assert!(attrs.contains("&quot;浓缩&quot;"), "双引号必须转义：{attrs}");
+    assert!(attrs.contains("&lt;液&gt;"), "尖括号必须转义：{attrs}");
+    assert!(
+        attrs.contains(r#"data-form="[&quot;液体&quot;,&quot;颗粒&quot;]""#),
+        "剂型 JSON 要能被浏览器还原：{attrs}"
+    );
+    assert!(attrs.contains(r#"data-function="[&quot;绿叶肥&quot;]""#), "{attrs}");
+    assert!(attrs.contains(r#"data-category="园艺""#), "{attrs}");
+
+    // 坏数据不能让整页 500，退化成空数组
+    p.forms_json = "不是 JSON".into();
+    let broken = crate::products::product_row_attrs(&p, &[]);
+    assert!(broken.contains(r#"data-form="[]""#), "{broken}");
+}
+
+#[test]
+fn 工具条只列启用的码表值_并转义HTML() {
+    let dict = vec![
+        fake_dict("category", "园艺", true),
+        fake_dict("category", "停用的类目", false),
+        fake_dict("class", "园艺肥料", true),
+        fake_dict("form", "<script>", true),
+        fake_dict("function", "绿叶肥", true),
+    ];
+    let html = crate::products::product_search_toolbar(&dict);
+    assert!(html.contains("搜索商品名称或 69 码"), "{html}");
+    assert!(html.contains(r#"data-kind="category""#), "{html}");
+    assert!(html.contains(r#"data-kind="class""#), "{html}");
+    assert!(html.contains(r#"data-kind="form""#), "{html}");
+    assert!(html.contains(r#"data-kind="function""#), "{html}");
+    assert!(html.contains("&lt;script&gt;"), "码表值必须转义：{html}");
+    assert!(!html.contains("<script>"), "不能把标签注进页面：{html}");
+    assert!(!html.contains("停用的类目"), "停用值不该出现在筛选里：{html}");
+    assert!(html.contains("id=\"ps\""), "{html}");
+}
+
+#[test]
+fn 筛选维度与客户端一致_前两组单选后两组多选() {
+    let kinds = crate::products::PRODUCT_FILTER_KINDS;
+    let keys: Vec<&str> = kinds.iter().map(|(k, _, _)| *k).collect();
+    assert_eq!(keys, vec!["category", "class", "form", "function"]);
+    let singles: Vec<bool> = kinds.iter().map(|(_, _, s)| *s).collect();
+    assert_eq!(singles, vec![true, true, false, false]);
+
+    // 某一维没值就不渲染空面板
+    let html = crate::products::product_search_toolbar(&[fake_dict("category", "园艺", true)]);
+    assert!(html.contains(r#"data-kind="category""#), "{html}");
+    assert!(!html.contains(r#"data-kind="form""#), "{html}");
+    assert!(html.contains(r#"data-single="1""#), "{html}");
+}
