@@ -752,6 +752,15 @@ cd /volume1/docker/bkstools && docker compose up -d
   `docker compose up -d` 就会用本地镜像（默认 `pull_policy: missing`，本地有就不拉）。
 - **先 `docker compose stop` 再 load**，让 SQLite 正常 checkpoint（别删 wal，那个坑踩过）。
 - 每次升级前备份 `data/updates.db` 和 `data/secret.key` 到 `backup/`。
+- **备份其实是四个文件**：`updates.db` + `updates.db-wal` + `updates.db-shm` + `secret.key`，
+  用 `docker cp bks-updates:/data/<文件> /tmp/<文件>` 再挪进备份目录。2026-11-06 停容器后
+  WAL 仍有 4.1MB，只拷主库（147KB）等于没备份。
+- **等 healthy 用 `docker compose up -d --wait --wait-timeout 90`**（Compose v5 支持），
+  比手动轮询干净。2026-11-06 部署 1.7.7 走的就是这条路径，实测 5 秒 healthy。
+- **验证公网入口要带 SNI**：Lucky 按域名分发，NAT 回环下直连 `bks.beikeshi.cn:54321`
+  或 `https://127.0.0.1:54321` 都会 000；用
+  `curl -k --resolve bks.beikeshi.cn:54321:127.0.0.1 https://bks.beikeshi.cn:54321/health`
+  才是真实的外部模式链路（200）。
 
 ## 8. 构建与镜像
 
